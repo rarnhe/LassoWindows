@@ -1,4 +1,4 @@
-﻿# CMakeList.txt: LassoWindows 的 CMake 项目，在此处包括源代码并定义
+# CMakeList.txt: LassoWindows 的 CMake 项目，在此处包括源代码并定义
 # 项目特定的逻辑。
 #
 cmake_minimum_required (VERSION 3.10)
@@ -19,3 +19,11 @@ if (CMAKE_VERSION VERSION_GREATER 3.12)
 endif()
 
 # TODO: 如有需要，请添加测试并安装目标。
+
+if(MSVC)
+  target_compile_options(LassoWindows PRIVATE /utf-8)
+endif()
+include(CTest)
+if(BUILD_TESTING)
+  add_subdirectory(test)
+endif()
