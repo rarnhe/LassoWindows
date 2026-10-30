@@ -1,0 +1,69 @@
+name: C++ Windows Tests
+on:
+  push:
+    branches: [main]
+    paths-ignore: [test_report.md]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cpp-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        id: configure
+        run: |
+          cmake -S . -B out/test -A x64 -DBUILD_TESTING=ON
+          exit $LASTEXITCODE
+      - name: Build application and tests
+        id: build
+        run: |
+          cmake --build out/test --config Release --parallel
+          exit $LASTEXITCODE
+      - name: Run CTest
+        id: ctest
+        run: |
+          ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
+          exit $LASTEXITCODE
+      - name: Write Markdown report and Actions summary
+        if: always()
+        run: |
+          ./test/write_report.ps1 -Configure '${{ steps.configure.outcome }}' -Build '${{ steps.build.outcome }}' -Test '${{ steps.ctest.outcome }}'
+      - name: Preserve report and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-windows-test-report
+          if-no-files-found: error
+          path: |
+            test_report.md
+            out/test/test-results.xml
+            out/test/Testing/Temporary/
+            out/test/CMakeFiles/CMakeConfigureLog.yaml
+      # Follow xlsx2md: only main pushes commit the report; PRs use Summary/artifacts.
+      - name: Commit report on main
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if (!(Test-Path test_report.md)) { throw 'Report missing' }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- test_report.md
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 1) {
+            git commit -m "docs: update Windows test report [skip ci]"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git push origin HEAD:main
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
