@@ -245,7 +245,12 @@ void run(const std::string& name) {
         CHECK(found.empty());
         RemovePropW(w, L"MTU_PROC_TAG");
         CHECK(EnumWindowToggleProc(w, reinterpret_cast<LPARAM>(&context)));
-        CHECK(found.size() == 1 && found.front() == w.h);
+        // Headless CI can lack the Virtual Desktop COM service. The filter
+        // fails closed in that case instead of collecting a foreign window.
+        if (IsWindowOnCurrentVirtualDesktop(w))
+            CHECK(found.size() == 1 && found.front() == w.h);
+        else
+            CHECK(found.empty());
     } else throw std::runtime_error("unknown case");
 }
 int main(int argc, char** argv) {
