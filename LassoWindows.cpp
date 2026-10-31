@@ -1272,124 +1272,55 @@ void ExecuteCollectRestore() {
 // 3. 核心钩子回调函数
 // ============================================================================
 
+// Low-level hooks must never enumerate windows or wait on Shell/DWM.
+// The coordinator thread owns window state; the hook only posts commands.
+#define WM_LASSO_HIDE_CURRENT (WM_APP + 11)
+#define WM_LASSO_HIDE_OTHERS  (WM_APP + 12)
+#define WM_LASSO_ALT_TAB      (WM_APP + 13)
+#define WM_LASSO_ALT_UP       (WM_APP + 14)
+#define WM_LASSO_ALT_DOWN     (WM_APP + 15)
+#define WM_LASSO_ESCAPE       (WM_APP + 16)
+#define WM_LASSO_TOGGLE_PRIMARY (WM_APP + 17)
+
 LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
-	if (nCode != HC_ACTION) {
-		return CallNextHookEx(NULL, nCode, wParam, lParam);
-	}
+    if (nCode != HC_ACTION)
+        return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+    const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+    const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+    const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+    HWND coordinator = g_hLassoCoordinator;
+    if (!coordinator) return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
 
-	KBDLLHOOKSTRUCT* pKeyStruct = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+    // Injected Tab is allowed through so the native Alt+Tab UI handles it.
+    if (key->vkCode == VK_TAB && (key->flags & LLKHF_ALTDOWN) && down) {
+        if (key->flags & LLKHF_INJECTED)
+            return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+        if (PostMessageW(coordinator, WM_LASSO_ALT_TAB, 0, 0)) return 1;
+    }
+    if (key->vkCode == VK_ESCAPE && down)
+        PostMessageW(coordinator, WM_LASSO_ESCAPE, 0, 0);
 
-	// 1. 物理 Alt 键状态复位
-	if (!(GetAsyncKeyState(VK_MENU) & 0x8000)) {
-		g_AltLogicActive = false;
-	}
+    if (key->vkCode == VK_MENU || key->vkCode == VK_LMENU || key->vkCode == VK_RMENU) {
+        if (down) PostMessageW(coordinator, WM_LASSO_ALT_DOWN, 0, 0);
+        if (up) PostMessageW(coordinator, WM_LASSO_ALT_UP, 0, 0);
+    }
 
-	// --- Cancel 机制：拦截 Esc 键 ---
-	if (g_InSnapWindows && pKeyStruct->vkCode == VK_ESCAPE) {
-		if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-			ExecuteCollectRestore(); // 立即收网，恢复最小化隐匿状态
-		}
-	}
-
-	// --- 分支 A：处理 Alt + Tab (反隐藏逻辑) ---
-	if (pKeyStruct->vkCode == VK_TAB && (pKeyStruct->flags & LLKHF_ALTDOWN)) {
-		if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-
-			if (pKeyStruct->flags & LLKHF_INJECTED) {
-				return CallNextHookEx(NULL, nCode, wParam, lParam);
-			}
-
-			// 执行过滤反隐藏，恢复图标与视口以供 Alt+Tab 预览
-			if (TryUnHideWindowsForAltTab()) {
-				TriggerTabKeyModern();
-				return 1;
-			}
-		}
-	}
-
-	// --- 分支 B：处理 Alt 键生命周期 ---
-	if (pKeyStruct->vkCode == VK_MENU || pKeyStruct->vkCode == VK_LMENU || pKeyStruct->vkCode == VK_RMENU) {
-		if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-			g_AltLogicActive = true;
-		}
-		else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-			g_AltLogicActive = false;
-			// Alt 抬起，延迟 150ms 触发收网
-			SetTimer(NULL, TIMER_ID_COLLECT, 150, reinterpret_cast<TIMERPROC>(OnCollectTimer));
-		}
-	}
-
-	// 提取 Win 与 Shift 按键状态
-	bool winPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
-	bool shiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000);
-
-	// --- 分支 D：Shift + Win + C (独占模式) ---
-	if (winPressed && shiftPressed && pKeyStruct->vkCode == 'C' && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-		HWND hCurr = GetForegroundWindow();
-		if (hCurr) {
-			HWND hRoot = GetAncestor(hCurr, GA_ROOT);
-			wchar_t className[256];
-			if (GetClassNameW(hRoot, className, 256)) {
-				if (wcscmp(className, L"Progman") == 0 ||
-					wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
-					wcscmp(className, L"Shell_TrayWnd") == 0) {
-					SuppressWinKeyMenuModern();
-					return 1;
-				}
-			}
-
-			std::wstring currentAppProcName = GetRealProcessName(hRoot);
-			EnumWindows(EnumHideOthersProc, reinterpret_cast<LPARAM>(&currentAppProcName));
-		}
-		SuppressWinKeyMenuModern();
-		return 1;
-	}
-
-	// --- 分支 C：Win + C (隐藏当前应用) ---
-	if (winPressed && pKeyStruct->vkCode == 'C' && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-		HWND hCurr = GetForegroundWindow();
-		if (hCurr) {
-			HWND hRoot = GetAncestor(hCurr, GA_ROOT);
-
-			wchar_t className[256];
-			if (GetClassNameW(hRoot, className, 256)) {
-				if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
-					CloseFilter filter;
-					wcscpy_s(filter.targetClassName, className);
-					filter.targetRealProcName = GetRealProcessName(hRoot);
-
-					EnumWindows(EnumCloseApplicationFrameWindowProc, reinterpret_cast<LPARAM>(&filter));
-					SuppressWinKeyMenuModern();
-					return 1;
-				}
-
-				if (wcscmp(className, L"Progman") == 0 ||
-					wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
-					wcscmp(className, L"Shell_TrayWnd") == 0 ||
-					wcscmp(className, L"XamlExplorerHostIslandWindow") == 0) {
-					SuppressWinKeyMenuModern();
-					return 1;
-				}
-			}
-
-			std::wstring procName = GetRealProcessName(hRoot);
-
-			if (IsWindow(g_hLassoCoordinator)) {
-				wcsncpy_s(g_SharedProcName, procName.c_str(), _TRUNCATE);
-				SendMessageW(g_hLassoCoordinator, WM_LASSO_SYNC_PROCESS, reinterpret_cast<WPARAM>(hRoot), 0);
-			}
-
-			EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&procName));
-		}
-
-		SuppressWinKeyMenuModern();
-		return 1;
-	}
-
-	return CallNextHookEx(NULL, nCode, wParam, lParam);
+    if (down && key->vkCode == 'C' && !(key->flags & LLKHF_INJECTED)) {
+        bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+                   (GetAsyncKeyState(VK_RWIN) & 0x8000);
+        if (win) {
+            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            HWND foreground = GetForegroundWindow();
+            UINT message = shift ? WM_LASSO_HIDE_OTHERS : WM_LASSO_HIDE_CURRENT;
+            if (PostMessageW(coordinator, message,
+                    reinterpret_cast<WPARAM>(foreground), 0)) {
+                SuppressWinKeyMenuModern();
+                return 1;
+            }
+        }
+    }
+    return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
 }
-
-
 
 // 主桌面右下角点击后显示桌面图标，这里做一个鼠标左键点击劫持
 // 表现为只将主桌面窗口隐藏，附加桌面不影响。
