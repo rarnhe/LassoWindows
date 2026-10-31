@@ -1671,193 +1671,47 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 	std::wstring className = cls;
 	std::wstring windowTitle = title;
 
-	// --- 1.5 继续尝试通过打开关联文件反隐藏之前的隐藏窗口 ---
-	// 1. 获取当前的虚拟桌面名称与命令行纯文件名
-	std::wstring forWhichPurpose = L"显示之前被隐藏的窗口";
-	std::wstring currentVd = GetCurrentVirtualDesktopName(forWhichPurpose);
+    // Reopening an application may unseal its existing windows, but only if
+    // the event is on the active desktop AND the stored desktop GUID agrees.
+    // Do not call ShowWindow, SetForegroundWindow, SetFocus, or HWND_TOP here.
+    if ((event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE ||
+         event == EVENT_OBJECT_FOCUS || event == EVENT_SYSTEM_FOREGROUND) &&
+        idC == CHILDID_SELF && !g_InSnapWindows &&
+        className != L"XamlExplorerHostIslandWindow" &&
+        IsWindowOnCurrentVirtualDesktop(hwnd)) {
 
-	if (((event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE ||
-		event == EVENT_OBJECT_FOCUS || event == EVENT_SYSTEM_FOREGROUND)) && idC == CHILDID_SELF) {
-
-		if (className == L"XamlExplorerHostIslandWindow") {
-			return;
-		}
-
-		// 检查当前触发事件的窗口自身是否带有 MTU 属性标签
-		HANDLE hSelfProcTag = GetPropW(hwnd, L"MTU_PROC_TAG");
-
-		// 情况 A：新开一个 App 窗口 (满足前提 2)
-		// 特征：触发了 SHOW 或 CREATE，且它是一个新窗口，绝对不应该带有标签。
-		if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE) {
-			if (hSelfProcTag != NULL) {
-				return; // 兜底防御
-			}
-		}
-
-		DWORD pid = 0;
-		GetWindowThreadProcessId(hwnd, &pid);
-
-		// 排除管理工具自身的进程，只监控外部程序
-		if (pid != 0 && pid != GetCurrentProcessId()) {
-			std::wstring newProcName = GetProcessNameByPid(pid);
-
-			if (newProcName == L"explorer.exe") {
-				if (className != L"CabinetWClass") {
-					newProcName.clear(); // 【成功修复】：清空字符串，替代非法的 NULL 赋值
-				}
-			}
-
-			if (!newProcName.empty()) {
-
-				// 【标记机制】(满足前提 3)：记录是否找到了因双击文件被外部暗中唤醒的特定隐藏老窗口
-				HWND hSpecificWindow = NULL;
-				if (hSelfProcTag != NULL && (event == EVENT_OBJECT_FOCUS || event == EVENT_SYSTEM_FOREGROUND)) {
-					hSpecificWindow = hwnd;
-				}
-
-				// =========================================================================
-				// 【一阶段 - 快照脱钩】：瞬间清理全局缓存 g_HiddenWindowsCache
-				// =========================================================================
-				std::vector<HWND> pMatchesToRestore;
-
-				for (auto it = g_HiddenWindowsCache.begin(); it != g_HiddenWindowsCache.end(); /* 内部自增 */) {
-					HWND hHidden = *it;
-					bool isErased = false;
-
-					if (IsWindow(hHidden)) {
-						if (hSpecificWindow != NULL && hHidden == hSpecificWindow) {
-							++it;
-							continue;
-						}
-
-						HANDLE hProc = GetPropW(hHidden, L"MTU_PROC_TAG");
-						HANDLE hVd = GetPropW(hHidden, L"MTU_VD_TAG");
-						if (hProc && hVd) {
-							wchar_t pName[MAX_PATH], vName[MAX_PATH];
-							GlobalGetAtomNameW((ATOM)(UINT_PTR)hProc, pName, MAX_PATH);
-							GlobalGetAtomNameW((ATOM)(UINT_PTR)hVd, vName, MAX_PATH);
-
-							if (_wcsicmp(newProcName.c_str(), pName) == 0 && wcscmp(currentVd.c_str(), vName) == 0) {
-								pMatchesToRestore.push_back(hHidden);
-								it = g_HiddenWindowsCache.erase(it);
-								isErased = true;
-							}
-						}
-					}
-
-					if (!isErased) {
-						++it;
-					}
-				}
-
-				// =========================================================================
-				// 【二阶段 - 动态消费与显示状态断后校验】
-				// =========================================================================
-				while (!pMatchesToRestore.empty()) {
-					// 1. 始终获取当前队列末尾的 hwnd 进行处理
-					HWND hHidden = pMatchesToRestore.back();
-
-					if (IsWindow(hHidden)) {
-
-						// 只有当窗口带有标签时，才需要做这一整套反隐藏动作（防止死循环重复执行业务）
-						if (GetPropW(hHidden, L"MTU_PROC_TAG") != NULL) {
-
-							// --- A. 还原标题 (去掉前缀 🕸) ---
-							wchar_t currentTitle[512] = { 0 };
-							if (GetWindowTextW(hHidden, currentTitle, 512) > 0) {
-								std::wstring t = currentTitle;
-								std::wstring prefix = L"🕸";
-								size_t pos = t.find(prefix);
-								if (pos == 0) {
-									t.erase(0, prefix.length());
-									SetWindowTextW(hHidden, t.c_str());
-								}
-							}
-
-							// --- B. 移除并清理 Atom 标签属性 ---
-							HANDLE hProcRemove = RemovePropW(hHidden, L"MTU_PROC_TAG");
-							if (hProcRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hProcRemove);
-
-							HANDLE hVdRemove = RemovePropW(hHidden, L"MTU_VD_TAG");
-							if (hVdRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hVdRemove);
-
-							// --- C. 执行实际的反隐藏与置顶动作 ---
-							ShowWindowAndShowTaskbarIcon(hHidden);
-							SetForegroundWindow(hHidden);
-							SetFocus(hHidden);
-							SetWindowPos(hHidden, HWND_TOP, 0, 0, 0, 0,
-								SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_DRAWFRAME);
-						}
-					}
-
-					// =====================================================================
-					// 【满足你的核心需求】：
-					// 只有当窗口因为某些不可控外部原因意外关闭了 (!IsWindow)，
-					// 或者我们自定义的 IsHiddenWindowReallyVisiable(hHidden) 明确返回 true（确保彻底脱离隐藏），
-					// 才会执行 pop_back() 将其移出队列！
-					// =====================================================================
-					// Always leave the callback; do not busy-loop if a window refuses
-                    // restoration. A future WinEvent may retry a failed operation.
-                    pMatchesToRestore.pop_back();
-					// 如果不满足（即窗口还在隐藏中），由于没有 pop_back，
-					// 下一次 while 循环会继续卡住它，但因为上面的 GetPropW 已经变成了 NULL，
-					// 它不会重复去改标题和调 ShowWindow，而是安全地走入 IsHiddenWindowReallyVisiable 进行下一次等待校验。
-				}
-
-				// =========================================================================
-				// 【二阶段顺利完成点】：此时 pMatchesToRestore 严格为空，大部队全部物理反隐藏成功！
-				// =========================================================================
-
-				// =========================================================================
-				// 【三阶段 - 延后处理特定窗口】
-				// =========================================================================
-				if (hSpecificWindow != NULL && IsWindow(hSpecificWindow)) {
-
-					HANDLE hProc = GetPropW(hSpecificWindow, L"MTU_PROC_TAG");
-					HANDLE hVd = GetPropW(hSpecificWindow, L"MTU_VD_TAG");
-					if (hProc && hVd) {
-						wchar_t pName[MAX_PATH], vName[MAX_PATH];
-						GlobalGetAtomNameW((ATOM)(UINT_PTR)hProc, pName, MAX_PATH);
-						GlobalGetAtomNameW((ATOM)(UINT_PTR)hVd, vName, MAX_PATH);
-
-						if (_wcsicmp(newProcName.c_str(), pName) == 0 && wcscmp(currentVd.c_str(), vName) == 0) {
-
-							for (auto it = g_HiddenWindowsCache.begin(); it != g_HiddenWindowsCache.end(); ++it) {
-								if (*it == hSpecificWindow) {
-									g_HiddenWindowsCache.erase(it);
-									break;
-								}
-							}
-
-							wchar_t currentTitle[512] = { 0 };
-							if (GetWindowTextW(hSpecificWindow, currentTitle, 512) > 0) {
-								std::wstring t = currentTitle;
-								std::wstring prefix = L"🕸";
-								size_t pos = t.find(prefix);
-								if (pos == 0) {
-									t.erase(0, prefix.length());
-									SetWindowTextW(hSpecificWindow, t.c_str());
-								}
-							}
-
-							HANDLE hProcRemove = RemovePropW(hSpecificWindow, L"MTU_PROC_TAG");
-							if (hProcRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hProcRemove);
-
-							HANDLE hVdRemove = RemovePropW(hSpecificWindow, L"MTU_VD_TAG");
-							if (hVdRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hVdRemove);
-
-							ShowWindowAndShowTaskbarIcon(hSpecificWindow);
-							SetForegroundWindow(hSpecificWindow);
-							SetFocus(hSpecificWindow);
-							SetWindowPos(hSpecificWindow, HWND_TOP, 0, 0, 0, 0,
-								SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_DRAWFRAME);
-						}
-					}
-				} // 结束特定窗口处理
-
-			}
-		}
-	}
+        // A show/create event for an already tagged window must not trigger
+        // a recursive reactivation as we change its styles.
+        const bool tagged = GetPropW(hwnd, L"MTU_PROC_TAG") != nullptr;
+        if (!tagged || (event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_CREATE)) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid && pid != GetCurrentProcessId()) {
+                std::wstring process = GetRealProcessName(hwnd);
+                if (_wcsicmp(process.c_str(), L"explorer.exe") == 0 &&
+                    className != L"CabinetWClass") process.clear();
+                if (!process.empty() && process != L"Unknown" &&
+                    !g_sealedWindowStates.empty()) {
+                    RefreshWindowCache();
+                    g_HiddenWindowsCache.erase(
+                        std::remove_if(g_HiddenWindowsCache.begin(),
+                            g_HiddenWindowsCache.end(),
+                            [&](HWND h) {
+                                if (!IsWindow(h)) return true;
+                                if (!CanUnsealOnCurrentDesktop(h)) return false;
+                                HANDLE prop = GetPropW(h, L"MTU_PROC_TAG");
+                                wchar_t taggedName[MAX_PATH]{};
+                                if (!prop || !GlobalGetAtomNameW(
+                                    static_cast<ATOM>(reinterpret_cast<UINT_PTR>(prop)),
+                                    taggedName, MAX_PATH)) return false;
+                                if (_wcsicmp(process.c_str(), taggedName) != 0) return false;
+                                ShowWindowAndShowTaskbarIcon(h);
+                                return true;
+                            }), g_HiddenWindowsCache.end());
+                }
+            }
+        }
+    }
 
 	// --- 2. 最小化/恢复监控 (仅针对窗口自身 idC == CHILDID_SELF) ---
 	if (idC == CHILDID_SELF) {
