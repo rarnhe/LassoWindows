@@ -9,6 +9,8 @@
 #include <propkey.h>
 #include <propvarutil.h>
 #include <filesystem>
+#include <unordered_map>
+#include <algorithm>
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
@@ -644,77 +646,113 @@ HWINEVENTHOOK g_hObjHook = NULL;
 // 建议：句柄缓存 - 避免频繁 EnumWindows 带来的性能开销
 std::vector<HWND> g_HiddenWindowsCache;
 
-// ============================================================================
-// 1. HideWindowAndHideTaskbarIcon (使用透明化窗口的方法视觉上隐藏窗口)
-// ============================================================================
-void HideWindowAndHideTaskbarIcon(HWND h) {
-	if (!IsWindow(h)) return;
+// Snapshot state once; a temporary Alt+Tab preview must not overwrite it.
+struct SealedWindowState {
+    LONG_PTR exStyle = 0;
+    WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+    HWND previous = nullptr;
+    BYTE alpha = 255;
+    COLORREF colorKey = 0;
+    DWORD layerFlags = 0;
+    bool hasLayerAttributes = false;
+    bool wasVisible = false;
+};
+static std::unordered_map<HWND, SealedWindowState> g_sealedWindowStates;
 
-	// 1. 如果窗口处于最小化，先还原
-	if (IsIconic(h)) {
-		ShowWindow(h, SW_RESTORE);
-	}
-
-	// 2. 修正扩展样式：
-	//    - 剥离 WS_EX_APPWINDOW，追加 WS_EX_TOOLWINDOW (隐藏任务栏与 Alt+Tab)
-	//    - 追加 WS_EX_LAYERED (开启透明度支持)
-	//    - 追加 WS_EX_TRANSPARENT (开启鼠标点击穿透)
-	LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
-	exStyle &= ~WS_EX_APPWINDOW;
-	exStyle |= (WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT);
-	SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
-
-	// 3. 将 Alpha 值设为 0 (完全透明)
-	SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-
-	// 4. 刷新 Frame 状态并压入 Z 轴底层
-	SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0,
-		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-
-	// 5. 显式从任务栏剥离 Tab 节点
-	ITaskbarList* pTaskbarList = NULL;
-	HRESULT hr = CoCreateInstance(
-		CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER, IID_ITaskbarList, reinterpret_cast<void**>(&pTaskbarList));
-	if (SUCCEEDED(hr) && pTaskbarList) {
-		pTaskbarList->HrInit();
-		pTaskbarList->DeleteTab(h);
-		pTaskbarList->Release();
-	}
+static bool SnapshotWindowState(HWND h) {
+    if (!IsWindow(h)) return false;
+    if (g_sealedWindowStates.contains(h)) return true;
+    SealedWindowState state;
+    state.exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    state.previous = GetWindow(h, GW_HWNDPREV);
+    state.wasVisible = IsWindowVisible(h) != FALSE;
+    if (!GetWindowPlacement(h, &state.placement)) return false;
+    // Do not alter a pre-existing layered window if its original alpha is
+    // unavailable: no lossless restoration would be possible.
+    if (state.exStyle & WS_EX_LAYERED) {
+        if (!GetLayeredWindowAttributes(h, &state.colorKey, &state.alpha, &state.layerFlags))
+            return false;
+        state.hasLayerAttributes = true;
+    }
+    g_sealedWindowStates.emplace(h, state);
+    return true;
 }
 
-// ============================================================================
-// 2. ShowWindowAndShowTaskbarIcon (反透明化 + 取消穿透版)
-// ============================================================================
-void ShowWindowAndShowTaskbarIcon(HWND h) {
-	if (!IsWindow(h)) return;
+// An actual (non-preview) restore also cleans the persistent window markers.
+static void ClearSealMarkers(HWND h) {
+    HANDLE p = RemovePropW(h, L"MTU_PROC_TAG");
+    if (p) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(p)));
+    HANDLE vd = RemovePropW(h, L"MTU_VD_TAG");
+    if (vd) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(vd)));
+    wchar_t title[512]{};
+    if (GetWindowTextW(h, title, 512) > 0) {
+        const std::wstring prefix = L"🕸";
+        if (wcsncmp(title, prefix.c_str(), prefix.length()) == 0)
+            SetWindowTextW(h, title + prefix.length());
+    }
+}
 
-	// 1. 还原扩展样式：
-	//    - 剥离 WS_EX_TOOLWINDOW、WS_EX_LAYERED、WS_EX_TRANSPARENT
-	//    - 恢复 WS_EX_APPWINDOW
-	LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
-	exStyle &= ~(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT);
-	exStyle |= WS_EX_APPWINDOW;
-	SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
+// preview=true retains the original snapshot for a later re-seal.
+void ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
+    auto it = g_sealedWindowStates.find(h);
+    if (it == g_sealedWindowStates.end()) return;
+    if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return; }
+    const SealedWindowState original = it->second;
 
-	// 2. 将 Alpha 还原为 255 (完全不透明)
-	SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+    SetWindowLongPtrW(h, GWL_EXSTYLE, original.exStyle);
+    if (original.hasLayerAttributes) {
+        SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
+    }
+    HWND after = (original.previous && IsWindow(original.previous))
+        ? original.previous : HWND_TOP;
+    SetWindowPos(h, after, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (!original.wasVisible) ShowWindow(h, SW_HIDE);
+    else if (original.placement.showCmd == SW_SHOWMINIMIZED ||
+             original.placement.showCmd == SW_MINIMIZE ||
+             original.placement.showCmd == SW_SHOWMINNOACTIVE)
+        ShowWindow(h, SW_SHOWMINNOACTIVE);
+    else ShowWindow(h, SW_SHOWNOACTIVATE);
 
-	// 3. 原位唤醒：置顶、显示并刷新 Frame 状态
-	SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
-		SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    ITaskbarList* taskbar = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITaskbarList, reinterpret_cast<void**>(&taskbar))) && taskbar) {
+        taskbar->HrInit();
+        if (original.wasVisible && !(original.exStyle & WS_EX_TOOLWINDOW))
+            taskbar->AddTab(h);
+        taskbar->Release();
+    }
+    InvalidateRect(h, nullptr, TRUE);
+    if (!preview) {
+        ClearSealMarkers(h);
+        g_sealedWindowStates.erase(it);
+    }
+}
 
-	// 4. 重绘视口
-	InvalidateRect(h, NULL, TRUE);
+void HideWindowAndHideTaskbarIcon(HWND h) {
+    if (!SnapshotWindowState(h)) return;
+    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    exStyle &= ~WS_EX_APPWINDOW;
+    exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+    SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
+    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    ITaskbarList* taskbar = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITaskbarList, reinterpret_cast<void**>(&taskbar))) && taskbar) {
+        taskbar->HrInit();
+        taskbar->DeleteTab(h);
+        taskbar->Release();
+    }
+}
 
-	// 5. 显式补回任务栏图标
-	ITaskbarList* pTaskbarList = NULL;
-	HRESULT hr = CoCreateInstance(
-		CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER, IID_ITaskbarList, reinterpret_cast<void**>(&pTaskbarList));
-	if (SUCCEEDED(hr) && pTaskbarList) {
-		pTaskbarList->HrInit();
-		pTaskbarList->AddTab(h);
-		pTaskbarList->Release();
-	}
+static void RestoreAllSealedWindows() {
+    while (!g_sealedWindowStates.empty()) {
+        HWND h = g_sealedWindowStates.begin()->first;
+        ShowWindowAndShowTaskbarIcon(h);
+    }
 }
 
 // --- 逻辑 1：全局压制逻辑 ---
@@ -853,7 +891,7 @@ std::wstring GetRealProcessName(HWND hwnd) {
 }
 
 void CALLBACK OnCollectTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-	KillTimer(NULL, idEvent);
+	KillTimer(hwnd, idEvent);
 
 	HWND hForeground = GetForegroundWindow();
 	if (!hForeground) return;
@@ -869,7 +907,7 @@ void CALLBACK OnCollectTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
 		wcscmp(windowTitle, L"任务切换") == 0)
 	{
 		// 还没退出任务视图，用户可能还在选，续命定时器
-		SetTimer(NULL, idEvent, 100, OnCollectTimer);
+		SetTimer(hwnd, idEvent, 100, NULL);
 		return;
 	}
 
@@ -967,38 +1005,8 @@ void CALLBACK OnCollectTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
 
 //realname一致的同类窗口处理
 struct CloseFilter {
-	wchar_t targetClassName[256] = { 0 }; // 前台窗口类名
-	std::wstring targetRealProcName; // 【关键】：前台窗口穿透后的真实进程名 (如 L"SystemSettings.exe")
+    std::wstring currentAppProcName;
 };
-
-BOOL CALLBACK EnumCloseApplicationFrameWindowProc(HWND hwnd, LPARAM lParam) {
-	CloseFilter* filter = reinterpret_cast<CloseFilter*>(lParam);
-	if (!filter) return FALSE;
-
-	// 只处理当前有效的、可见的顶级窗口
-	if (IsWindow(hwnd) && IsWindowVisible(hwnd)) {
-		wchar_t className[256] = { 0 };
-		if (GetClassNameW(hwnd, className, 256)) {
-
-			// =========================================================================
-			// 1. 针对 UWP 应用 (ApplicationFrameWindow) 的完美穿透判定
-			// =========================================================================
-			if (wcscmp(filter->targetClassName, L"ApplicationFrameWindow") == 0) {
-				if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
-
-					// 使用你写好的穿透函数，获取当前正在被遍历的这个 UWP 窗口的真实底层进程名
-					std::wstring currentRealName = GetRealProcessName(hwnd);
-
-					// 只有【真实业务进程名】完全一致时，才执行关闭 (例如都是 SystemSettings.exe)
-					if (_wcsicmp(currentRealName.c_str(), filter->targetRealProcName.c_str()) == 0) {
-						PostMessageW(hwnd, WM_CLOSE, 0, 0);
-					}
-				}
-			}
-		}
-	}
-	return TRUE;
-}
 
 // 隐藏指定 App 进程名对应的窗口
 BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
@@ -1029,6 +1037,9 @@ BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
 				}
 			}
 		}
+
+		// Reject windows that cannot safely be restored before changing any title/tags.
+		if (!SnapshotWindowState(hWnd)) return TRUE;
 
 		// --- A. 添加 “🕸” 蛛网标 ---
 		wchar_t originalTitle[512] = { 0 };
@@ -1071,7 +1082,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 	CloseFilter* filter = reinterpret_cast<CloseFilter*>(lParam);
 	if (!filter) return FALSE;
 
-	const std::wstring& currentAppProcName = *(reinterpret_cast<std::wstring*>(lParam));
+	const std::wstring& currentAppProcName = filter->currentAppProcName;
 
 	// 1. 基础过滤：跳过不可见窗口、子窗口、以及我们自己的管理窗口
 	if (!IsWindowVisible(hWnd) || GetParent(hWnd) != NULL) {
@@ -1088,7 +1099,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 	std::wstring otherWndProcName = GetRealProcessName(hWnd);
 
 	// 3. 核心逻辑：如果这个窗口【不属于】当前正在使用的 App
-	if (otherWndProcName != currentAppProcName) {
+	if (_wcsicmp(otherWndProcName.c_str(), currentAppProcName.c_str()) != 0) {
 
 		// --- 关键修正：仿照 EnumHideWindowsProc 的安全过滤 ---
 
@@ -1114,20 +1125,11 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 			// 分支 B：处理 UWP 托管进程 (ApplicationFrameHost.exe / ApplicationFrameWindow)
 			// 核心修正：将其移出 explorer 作用域，在外层进行平级判定
 			// ---------------------------------------------------------------------
-			if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
-
-				if (IsWindow(hWnd)) {
-					//📌 提示：如果你希望保持跟上一步一样的“只关同类 UWP（比如前台是设置，就只关设置）”，
-					//则需要配合前面的 filter 过滤：
-					std::wstring curRealName = GetRealProcessName(hWnd);
-					if (_wcsicmp(curRealName.c_str(), filter->targetRealProcName.c_str()) == 0) {
-						PostMessageW(hWnd, WM_CLOSE, 0, 0);
-					}
-
-				}
-				return TRUE;
-			}
+			// UWP windows use the same reversible seal; never send WM_CLOSE.
 		}
+
+		// Validate reversible state before writing marker properties.
+		if (!SnapshotWindowState(hWnd)) return TRUE;
 
 		// --- 1. 获取并修改标题文字 ---
 		wchar_t originalTitle[512];
@@ -1239,7 +1241,7 @@ bool TryUnHideWindowsForAltTab() {
 			if (wcscmp(savedVdName, currentVd.c_str()) == 0) {
 
 				// A. 直接解封：剥离 WS_EX_TOOLWINDOW，恢复 WS_EX_APPWINDOW 与窗口渲染
-				ShowWindowAndShowTaskbarIcon(h);
+				ShowWindowAndShowTaskbarIcon(h, true);
 
 				// B. 记录到快照暂存列表，用于后续精确收网
 				g_snapUnhiddenWindows.push_back(h);
@@ -1254,7 +1256,7 @@ bool TryUnHideWindowsForAltTab() {
 
 	if (didShowAny) {
 		g_InSnapWindows = true;
-		KillTimer(NULL, TIMER_ID_COLLECT);
+		KillTimer(g_hLassoCoordinator, TIMER_ID_COLLECT);
 
 		// 阻塞等待 DWM 合成最新视口纹理，确保 Alt+Tab 捕捉到不黑屏的缩略图
 		DwmFlush();
@@ -1285,131 +1287,62 @@ void ExecuteCollectRestore() {
 	g_AltLogicActive = false;
 
 	// 4. 销毁定时器
-	KillTimer(NULL, TIMER_ID_COLLECT);
+	KillTimer(g_hLassoCoordinator, TIMER_ID_COLLECT);
 }
 
 // ============================================================================
 // 3. 核心钩子回调函数
 // ============================================================================
 
+// Low-level hooks must never enumerate windows or wait on Shell/DWM.
+// The coordinator thread owns window state; the hook only posts commands.
+#define WM_LASSO_HIDE_CURRENT (WM_APP + 11)
+#define WM_LASSO_HIDE_OTHERS  (WM_APP + 12)
+#define WM_LASSO_ALT_TAB      (WM_APP + 13)
+#define WM_LASSO_ALT_UP       (WM_APP + 14)
+#define WM_LASSO_ALT_DOWN     (WM_APP + 15)
+#define WM_LASSO_ESCAPE       (WM_APP + 16)
+#define WM_LASSO_TOGGLE_PRIMARY (WM_APP + 17)
+
 LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
-	if (nCode != HC_ACTION) {
-		return CallNextHookEx(NULL, nCode, wParam, lParam);
-	}
+    if (nCode != HC_ACTION)
+        return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+    const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+    const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+    const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+    HWND coordinator = g_hLassoCoordinator;
+    if (!coordinator) return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
 
-	KBDLLHOOKSTRUCT* pKeyStruct = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+    // Injected Tab is allowed through so the native Alt+Tab UI handles it.
+    if (key->vkCode == VK_TAB && (key->flags & LLKHF_ALTDOWN) && down) {
+        if (key->flags & LLKHF_INJECTED)
+            return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+        if (PostMessageW(coordinator, WM_LASSO_ALT_TAB, 0, 0)) return 1;
+    }
+    if (key->vkCode == VK_ESCAPE && down)
+        PostMessageW(coordinator, WM_LASSO_ESCAPE, 0, 0);
 
-	// 1. 物理 Alt 键状态复位
-	if (!(GetAsyncKeyState(VK_MENU) & 0x8000)) {
-		g_AltLogicActive = false;
-	}
+    if (key->vkCode == VK_MENU || key->vkCode == VK_LMENU || key->vkCode == VK_RMENU) {
+        if (down) PostMessageW(coordinator, WM_LASSO_ALT_DOWN, 0, 0);
+        if (up) PostMessageW(coordinator, WM_LASSO_ALT_UP, 0, 0);
+    }
 
-	// --- Cancel 机制：拦截 Esc 键 ---
-	if (g_InSnapWindows && pKeyStruct->vkCode == VK_ESCAPE) {
-		if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-			ExecuteCollectRestore(); // 立即收网，恢复最小化隐匿状态
-		}
-	}
-
-	// --- 分支 A：处理 Alt + Tab (反隐藏逻辑) ---
-	if (pKeyStruct->vkCode == VK_TAB && (pKeyStruct->flags & LLKHF_ALTDOWN)) {
-		if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-
-			if (pKeyStruct->flags & LLKHF_INJECTED) {
-				return CallNextHookEx(NULL, nCode, wParam, lParam);
-			}
-
-			// 执行过滤反隐藏，恢复图标与视口以供 Alt+Tab 预览
-			if (TryUnHideWindowsForAltTab()) {
-				TriggerTabKeyModern();
-				return 1;
-			}
-		}
-	}
-
-	// --- 分支 B：处理 Alt 键生命周期 ---
-	if (pKeyStruct->vkCode == VK_MENU || pKeyStruct->vkCode == VK_LMENU || pKeyStruct->vkCode == VK_RMENU) {
-		if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-			g_AltLogicActive = true;
-		}
-		else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-			g_AltLogicActive = false;
-			// Alt 抬起，延迟 150ms 触发收网
-			SetTimer(NULL, TIMER_ID_COLLECT, 150, reinterpret_cast<TIMERPROC>(OnCollectTimer));
-		}
-	}
-
-	// 提取 Win 与 Shift 按键状态
-	bool winPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
-	bool shiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000);
-
-	// --- 分支 D：Shift + Win + C (独占模式) ---
-	if (winPressed && shiftPressed && pKeyStruct->vkCode == 'C' && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-		HWND hCurr = GetForegroundWindow();
-		if (hCurr) {
-			HWND hRoot = GetAncestor(hCurr, GA_ROOT);
-			wchar_t className[256];
-			if (GetClassNameW(hRoot, className, 256)) {
-				if (wcscmp(className, L"Progman") == 0 ||
-					wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
-					wcscmp(className, L"Shell_TrayWnd") == 0) {
-					SuppressWinKeyMenuModern();
-					return 1;
-				}
-			}
-
-			std::wstring currentAppProcName = GetRealProcessName(hRoot);
-			EnumWindows(EnumHideOthersProc, reinterpret_cast<LPARAM>(&currentAppProcName));
-		}
-		SuppressWinKeyMenuModern();
-		return 1;
-	}
-
-	// --- 分支 C：Win + C (隐藏当前应用) ---
-	if (winPressed && pKeyStruct->vkCode == 'C' && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-		HWND hCurr = GetForegroundWindow();
-		if (hCurr) {
-			HWND hRoot = GetAncestor(hCurr, GA_ROOT);
-
-			wchar_t className[256];
-			if (GetClassNameW(hRoot, className, 256)) {
-				if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
-					CloseFilter filter;
-					wcscpy_s(filter.targetClassName, className);
-					filter.targetRealProcName = GetRealProcessName(hRoot);
-
-					EnumWindows(EnumCloseApplicationFrameWindowProc, reinterpret_cast<LPARAM>(&filter));
-					SuppressWinKeyMenuModern();
-					return 1;
-				}
-
-				if (wcscmp(className, L"Progman") == 0 ||
-					wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
-					wcscmp(className, L"Shell_TrayWnd") == 0 ||
-					wcscmp(className, L"XamlExplorerHostIslandWindow") == 0) {
-					SuppressWinKeyMenuModern();
-					return 1;
-				}
-			}
-
-			std::wstring procName = GetRealProcessName(hRoot);
-
-			if (IsWindow(g_hLassoCoordinator)) {
-				wcsncpy_s(g_SharedProcName, procName.c_str(), _TRUNCATE);
-				SendMessageW(g_hLassoCoordinator, WM_LASSO_SYNC_PROCESS, reinterpret_cast<WPARAM>(hRoot), 0);
-			}
-
-			EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&procName));
-		}
-
-		SuppressWinKeyMenuModern();
-		return 1;
-	}
-
-	return CallNextHookEx(NULL, nCode, wParam, lParam);
+    if (down && key->vkCode == 'C' && !(key->flags & LLKHF_INJECTED)) {
+        bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+                   (GetAsyncKeyState(VK_RWIN) & 0x8000);
+        if (win) {
+            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            HWND foreground = GetForegroundWindow();
+            UINT message = shift ? WM_LASSO_HIDE_OTHERS : WM_LASSO_HIDE_CURRENT;
+            if (PostMessageW(coordinator, message,
+                    reinterpret_cast<WPARAM>(foreground), 0)) {
+                SuppressWinKeyMenuModern();
+                return 1;
+            }
+        }
+    }
+    return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
 }
-
-
 
 // 主桌面右下角点击后显示桌面图标，这里做一个鼠标左键点击劫持
 // 表现为只将主桌面窗口隐藏，附加桌面不影响。
@@ -1524,60 +1457,42 @@ BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
 // =========================================================================
 // 2. 极致纯粹的全局低级鼠标钩子（状态完全依赖外部监测同步）
 // =========================================================================
+// All collection and minimize/restore work runs on the coordinator thread.
+static void TogglePrimaryWindows() {
+    g_lastTrayClickTime = GetTickCount64();
+    if (g_minimizedPrimaryWindows.empty()) {
+        POINT origin{0, 0};
+        HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        ToggleContext context{&g_minimizedPrimaryWindows, primary};
+        EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
+        for (HWND h : g_minimizedPrimaryWindows) {
+            if (IsWindow(h)) PostMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+        }
+    } else {
+        for (HWND h : g_minimizedPrimaryWindows) {
+            if (IsWindow(h) && IsIconic(h)) ShowWindowAsync(h, SW_RESTORE);
+        }
+        g_minimizedPrimaryWindows.clear();
+    }
+}
+
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-	if (nCode >= 0 && (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)) {
-		PMSLLHOOKSTRUCT pMouse = reinterpret_cast<PMSLLHOOKSTRUCT>(lParam);
-
-		HWND hMainTray = FindWindowW(L"Shell_TrayWnd", NULL);
-		if (hMainTray != NULL) {
-			RECT trayRect;
-			if (GetPhysicalRect(hMainTray, &trayRect)) {
-
-				// 精准碰撞主屏任务栏右下角热区
-				if (pMouse->pt.x >= (trayRect.right - TARGET_ZONE_WIDTH) && pMouse->pt.x <= trayRect.right &&
-					pMouse->pt.y >= trayRect.top && pMouse->pt.y <= trayRect.bottom) {
-
-					// 仅在按下时触发业务，抬起时静默拦截，彻底打断系统原生的 Show Desktop 消息链路
-					if (wParam == WM_LBUTTONDOWN) {
-						// 🟢 触发了显示桌面/隐藏操作，立即上锁！
-						g_lastTrayClickTime = GetTickCount64();
-						// 🟢 状态 A：历史记录为空 -> 执行“隐藏”
-						if (g_minimizedPrimaryWindows.empty()) {
-							POINT ptZero = { 0, 0 };
-							HMONITOR hPrimary = MonitorFromPoint(ptZero, MONITOR_DEFAULTTOPRIMARY);
-
-							ToggleContext ctx = { &g_minimizedPrimaryWindows, hPrimary };
-
-							// 1. 去主屏搜集【无 MTU_PROC_TAG】的窗口
-							EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&ctx));
-
-							// 2. 批量异步最小化
-							for (HWND hWnd : g_minimizedPrimaryWindows) {
-								if (IsWindow(hWnd)) {
-									PostMessage(hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-								}
-							}
-						}
-						// 🟢 状态 B：历史记录不为空 -> 执行“恢复”
-						else {
-							for (HWND hWnd : g_minimizedPrimaryWindows) {
-								// 确认句柄有效且当前仍处于最小化状态（避免误操作已被用户手动放大的窗口）
-								if (IsWindow(hWnd) && IsIconic(hWnd)) {
-									//RestoreWindowAppId(hWnd); // 恢复原始图标
-									ShowWindowAsync(hWnd, SW_RESTORE); // 异步恢复，零阻塞
-								}
-							}
-							g_minimizedPrimaryWindows.clear();
-						}
-					}
-
-					// 🔴 完全吃掉该区域的 LBUTTONDOWN 与 LBUTTONUP 消息，阻止 Shell 响应
-					return 1;
-				}
-			}
-		}
-	}
-	return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+    if (nCode == HC_ACTION &&
+        (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) &&
+        g_hLassoCoordinator) {
+        const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+        RECT bounds{};
+        if (tray && GetPhysicalRect(tray, &bounds) &&
+            mouse->pt.x >= bounds.right - TARGET_ZONE_WIDTH &&
+            mouse->pt.x <= bounds.right &&
+            mouse->pt.y >= bounds.top && mouse->pt.y <= bounds.bottom) {
+            if (wParam == WM_LBUTTONUP) return 1;
+            if (PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0))
+                return 1;
+        }
+    }
+    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
 
 // 辅助调试函数
@@ -1688,6 +1603,18 @@ bool IsHiddenWindowReallyVisiable(HWND hwnd) {
 void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
+    if (event == EVENT_OBJECT_DESTROY) {
+        // A HWND can be recycled after destruction; never restore stale state
+        // onto a different window that later receives the same handle value.
+        g_sealedWindowStates.erase(hwnd);
+        auto forget = [hwnd](std::vector<HWND>& v) {
+            v.erase(std::remove(v.begin(), v.end(), hwnd), v.end());
+        };
+        forget(g_HiddenWindowsCache);
+        forget(g_snapUnhiddenWindows);
+        forget(g_minimizedPrimaryWindows);
+        return;
+    }
 
 	// 捕获插拔显示器、分辨率切换、桌面重建事件
 	if (event == EVENT_SYSTEM_DESKTOPSWITCH) {
@@ -1901,7 +1828,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 							if (hVdRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hVdRemove);
 
 							// --- C. 执行实际的反隐藏与置顶动作 ---
-							ShowWindow(hHidden, SW_SHOW);
+							ShowWindowAndShowTaskbarIcon(hHidden);
 							SetForegroundWindow(hHidden);
 							SetFocus(hHidden);
 							SetWindowPos(hHidden, HWND_TOP, 0, 0, 0, 0,
@@ -1915,9 +1842,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 					// 或者我们自定义的 IsHiddenWindowReallyVisiable(hHidden) 明确返回 true（确保彻底脱离隐藏），
 					// 才会执行 pop_back() 将其移出队列！
 					// =====================================================================
-					if (!IsWindow(hHidden) || IsHiddenWindowReallyVisiable(hHidden)) {
-						pMatchesToRestore.pop_back(); // 顺利通关，安全弹出
-					}
+					// Always leave the callback; do not busy-loop if a window refuses
+                    // restoration. A future WinEvent may retry a failed operation.
+                    pMatchesToRestore.pop_back();
 					// 如果不满足（即窗口还在隐藏中），由于没有 pop_back，
 					// 下一次 while 循环会继续卡住它，但因为上面的 GetPropW 已经变成了 NULL，
 					// 它不会重复去改标题和调 ShowWindow，而是安全地走入 IsHiddenWindowReallyVisiable 进行下一次等待校验。
@@ -1965,7 +1892,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 							HANDLE hVdRemove = RemovePropW(hSpecificWindow, L"MTU_VD_TAG");
 							if (hVdRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hVdRemove);
 
-							ShowWindow(hSpecificWindow, SW_SHOW);
+							ShowWindowAndShowTaskbarIcon(hSpecificWindow);
 							SetForegroundWindow(hSpecificWindow);
 							SetFocus(hSpecificWindow);
 							SetWindowPos(hSpecificWindow, HWND_TOP, 0, 0, 0, 0,
@@ -2091,77 +2018,195 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 	}
 }
 
-int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE hPrev, _In_ LPSTR lpCmd, _In_ int nShow) {
-	// =========================================================================
-	// 【核心新增】：使用唯一的命名 Mutex 实现单实例检测
-	// =========================================================================
-	// 名字可以自己换，加 L"Global\\" 前缀可以确保即使在多用户切换或管理员权限下也是全局唯一的
-	HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\MyWindowManagerUniqueMutex_12345");
+// A message-only window on a separate worker thread serializes COM, WinEvent,
+// taskbar and hide/restore work. Hook callbacks live on the main message thread.
+static void HideCurrentApplication(HWND foreground) {
+    if (!IsWindow(foreground)) return;
+    HWND root = GetAncestor(foreground, GA_ROOT);
+    if (!root) return;
+    wchar_t className[256]{};
+    if (!GetClassNameW(root, className, 256)) return;
+    // Never seal the Desktop, Shell/taskbar, or task-view UI.
+    if (wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
+        wcscmp(className, L"XamlExplorerHostIslandWindow") == 0) return;
 
-	// 如果创建失败，或者系统返回 ERROR_ALREADY_EXISTS，说明已有实例在运行
-	if (hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
-		if (hMutex) {
-			CloseHandle(hMutex); // 安全释放句柄
-		}
-		// 发现多开，直接静默退出（也可以在此处加一个 MessageBoxW 弹窗提示用户）
-		return 0;
-	}
-	// =========================================================================
+    // ApplicationFrameWindow is treated like any other window:
+    // keeping its content alive matters more than hiding a special class.
+    const std::wstring name = GetRealProcessName(root);
+    if (name != L"Unknown" && !name.empty())
+        EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&name));
+}
 
-	// 1. 初始化 WinRT 环境 (用于原生通知)
-	winrt::init_apartment();
-	// 2. 注册应用快捷方式
-	RegisterAppShortcut();
-	// 3. 挂载低级别钩子
-	g_hKeyHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyProc, hInst, 0);
+static void HideOtherApplications(HWND foreground) {
+    if (!IsWindow(foreground)) return;
+    HWND root = GetAncestor(foreground, GA_ROOT);
+    if (!root) return;
+    wchar_t className[256]{};
+    if (!GetClassNameW(root, className, 256)) return;
+    if (wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0) return;
+    CloseFilter filter;
+    filter.currentAppProcName = GetRealProcessName(root);
+    if (filter.currentAppProcName != L"Unknown" &&
+        !filter.currentAppProcName.empty())
+        EnumWindows(EnumHideOthersProc, reinterpret_cast<LPARAM>(&filter));
+}
 
-	SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-	g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hInst, 0);
-	//if (!g_hMouseHook) {
-	//	return 1;
-	//}
+static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_LASSO_HIDE_CURRENT:
+        HideCurrentApplication(reinterpret_cast<HWND>(wp));
+        return 0;
+    case WM_LASSO_HIDE_OTHERS:
+        HideOtherApplications(reinterpret_cast<HWND>(wp));
+        return 0;
+    case WM_LASSO_ALT_TAB:
+        TryUnHideWindowsForAltTab();
+        // If Alt was released before the queued command ran, reproduce
+        // the complete key chord rather than sending an orphaned Tab.
+        if (!(GetAsyncKeyState(VK_MENU) & 0x8000)) {
+            INPUT input[4]{};
+            input[0].type = INPUT_KEYBOARD;
+            input[0].ki.wVk = VK_MENU;
+            input[1].type = INPUT_KEYBOARD;
+            input[1].ki.wVk = VK_TAB;
+            input[2].type = INPUT_KEYBOARD;
+            input[2].ki.wVk = VK_TAB;
+            input[2].ki.dwFlags = KEYEVENTF_KEYUP;
+            input[3].type = INPUT_KEYBOARD;
+            input[3].ki.wVk = VK_MENU;
+            input[3].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(4, input, sizeof(INPUT));
+        } else TriggerTabKeyModern();
+        return 0;
+    case WM_LASSO_ALT_DOWN:
+        g_AltLogicActive = true;
+        return 0;
+    case WM_LASSO_ALT_UP:
+        g_AltLogicActive = false;
+        if (g_InSnapWindows)
+            SetTimer(hwnd, TIMER_ID_COLLECT, 150, nullptr);
+        return 0;
+    case WM_LASSO_ESCAPE:
+        if (g_InSnapWindows) ExecuteCollectRestore();
+        return 0;
+    case WM_LASSO_TOGGLE_PRIMARY:
+        TogglePrimaryWindows();
+        return 0;
+    case WM_TIMER:
+        if (wp == TIMER_ID_COLLECT) {
+            OnCollectTimer(hwnd, msg, wp, GetTickCount());
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        RestoreAllSealedWindows();
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
 
-	g_hSysHook = SetWinEventHook(
-		EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-		NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-	);
-	// Hook 2: 监控对象显示 (0x8002)
-	g_hObjHook = SetWinEventHook(
-		EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
-		NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-	);
+static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
+    HANDLE ready = static_cast<HANDLE>(readyPtr);
+    try { winrt::init_apartment(winrt::apartment_type::single_threaded); }
+    catch (...) { SetEvent(ready); return 1; }
 
-	//监控屏幕切换
-	HWINEVENTHOOK g_hDesktopHook = NULL; // 注意类型是 HWINEVENTHOOK，不是 HHOOK
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = CoordinatorWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"LassoWindowsCoordinator";
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        SetEvent(ready);
+        winrt::uninit_apartment();
+        return 1;
+    }
+    g_hLassoCoordinator = CreateWindowExW(0, wc.lpszClassName, L"",
+        0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    if (!g_hLassoCoordinator) {
+        SetEvent(ready);
+        winrt::uninit_apartment();
+        return 1;
+    }
+    UpdateSystemDpiScalingStatus();
+    RegisterAppShortcut();
+    g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    g_hObjHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
+        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    HWINEVENTHOOK desktopHook = SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH,
+        EVENT_SYSTEM_DESKTOPSWITCH, nullptr, WinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-	g_hDesktopHook = SetWinEventHook(
-		EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH,
-		NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-	);
+    SetEvent(ready);
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (g_hSysHook) UnhookWinEvent(g_hSysHook);
+    if (g_hObjHook) UnhookWinEvent(g_hObjHook);
+    if (desktopHook) UnhookWinEvent(desktopHook);
+    RestoreAllSealedWindows();
+    g_hLassoCoordinator = nullptr;
+    winrt::uninit_apartment();
+    return 0;
+}
 
-	if (g_hDesktopHook) UnhookWinEvent(g_hDesktopHook);
+int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Global\\MyWindowManagerUniqueMutex_12345");
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (mutex) CloseHandle(mutex);
+        return 0;
+    }
+    // Initialize DPI before any UI-dependent work.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-	// 7. 标准消息循环 (驱动 WinEventProc 的核心)
-	MSG msg;
-	while (GetMessageW(&msg, NULL, 0, 0)) {
-		TranslateMessage(&msg);
-		DispatchMessageW(&msg);
-	}
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE worker = ready ? CreateThread(nullptr, 0, CoordinatorThreadProc, ready, 0, nullptr) : nullptr;
+    if (!worker || WaitForSingleObject(ready, 15000) != WAIT_OBJECT_0 || !g_hLassoCoordinator) {
+        if (worker) {
+            WaitForSingleObject(worker, INFINITE);
+            CloseHandle(worker);
+        }
+        if (ready) CloseHandle(ready);
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return 1;
+    }
+    CloseHandle(ready);
 
-	// 8. 退出清理 (仅清理本进程的事件钩子)
-	if (g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
-	if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
-	if (g_hSysHook) UnhookWinEvent(g_hSysHook);
-	if (g_hObjHook) UnhookWinEvent(g_hObjHook);
+    g_hKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyProc, hInst, 0);
+    g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hInst, 0);
+    if (!g_hKeyHook || !g_hMouseHook) {
+        if (g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
+        if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
+        PostMessageW(g_hLassoCoordinator, WM_CLOSE, 0, 0);
+        WaitForSingleObject(worker, INFINITE);
+        CloseHandle(worker);
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return 1;
+    }
 
-	// =========================================================================
-	// 【核心新增】：程序退出时释放并关闭互斥量句柄
-	// =========================================================================
-	ReleaseMutex(hMutex);
-	CloseHandle(hMutex);
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
 
-	// 【核心改造】程序退出前，优雅释放、销毁当前主线程的 COM 环境
-	winrt::uninit_apartment();
-
-	return 0;
+    UnhookWindowsHookEx(g_hKeyHook);
+    UnhookWindowsHookEx(g_hMouseHook);
+    if (g_hLassoCoordinator) PostMessageW(g_hLassoCoordinator, WM_CLOSE, 0, 0);
+    WaitForSingleObject(worker, INFINITE);
+    CloseHandle(worker);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return 0;
 }

@@ -94,6 +94,61 @@ void run(const std::string& name) {
         CHECK(style & WS_EX_APPWINDOW); CHECK(!(style & mask));
         CHECK(IsWindowVisible(w));
         HideWindowAndHideTaskbarIcon(nullptr); ShowWindowAndShowTaskbarIcon(nullptr);
+    } else if (name == "seal_idempotent") {
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(g_sealedWindowStates.contains(w.h));
+        const size_t count = g_sealedWindowStates.size();
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(g_sealedWindowStates.size() == count);
+        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == original);
+        CHECK(!g_sealedWindowStates.contains(w.h));
+    } else if (name == "restore_tool_style") {
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        SetWindowLongPtrW(w, GWL_EXSTYLE, (original & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
+        const LONG_PTR tool = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        HideWindowAndHideTaskbarIcon(w);
+        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == tool);
+        CHECK(!g_sealedWindowStates.contains(w.h));
+    } else if (name == "restore_layered_alpha") {
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        LONG_PTR style = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        SetWindowLongPtrW(w, GWL_EXSTYLE, style | WS_EX_LAYERED);
+        CHECK(SetLayeredWindowAttributes(w, RGB(13, 42, 71), 173, LWA_ALPHA));
+        const LONG_PTR initial = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        HideWindowAndHideTaskbarIcon(w);
+        ShowWindowAndShowTaskbarIcon(w);
+        BYTE alpha = 0; COLORREF color{}; DWORD flags = 0;
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == initial);
+        CHECK(GetLayeredWindowAttributes(w, &color, &alpha, &flags));
+        CHECK(alpha == 173 && (flags & LWA_ALPHA));
+        CHECK(!g_sealedWindowStates.contains(w.h));
+    } else if (name == "preview_preserves_snapshot") {
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        const LONG_PTR initial = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(g_sealedWindowStates.contains(w.h));
+        ShowWindowAndShowTaskbarIcon(w, true);
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == initial);
+        CHECK(g_sealedWindowStates.contains(w.h));
+        HideWindowAndHideTaskbarIcon(w);
+        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == initial);
+        CHECK(!g_sealedWindowStates.contains(w.h));
+    } else if (name == "hide_others_context") {
+        CloseFilter filter;
+        filter.currentAppProcName = L"nonexistent_test_process.exe";
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        CHECK(EnumHideOthersProc(w, reinterpret_cast<LPARAM>(&filter)));
+        if (g_sealedWindowStates.contains(w.h)) ShowWindowAndShowTaskbarIcon(w);
+    } else if (name == "untracked_restore") {
+        const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == original);
     } else if (name == "suppress") {
         CHECK(SetPropW(w, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(1)));
         g_InSnapWindows = true;
