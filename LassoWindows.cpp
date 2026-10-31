@@ -950,117 +950,49 @@ std::wstring GetRealProcessName(HWND hwnd) {
 	return result;
 }
 
-void CALLBACK OnCollectTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-	KillTimer(hwnd, idEvent);
+// Alt release collects only locally tagged windows. Other desktops are never
+// activated or shown as a side-effect of choosing an application.
+void CALLBACK OnCollectTimer(HWND hwnd, UINT, UINT_PTR idEvent, DWORD) {
+    KillTimer(hwnd, idEvent);
+    if (!g_InSnapWindows) return;
 
-	HWND hForeground = GetForegroundWindow();
-	if (!hForeground) return;
+    HWND foreground = GetForegroundWindow();
+    wchar_t className[256]{}, title[256]{};
+    if (foreground) {
+        GetClassNameW(foreground, className, 256);
+        GetWindowTextW(foreground, title, 256);
+    }
+    if (wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 &&
+        wcscmp(title, L"任务切换") == 0) {
+        SetTimer(hwnd, idEvent, 100, nullptr);
+        return;
+    }
+    g_InSnapWindows = false;
 
-	// --- 1. 核心防御：如果还在任务切换界面，绝对不收网 ---
-	wchar_t className[256] = { 0 };
-	wchar_t windowTitle[256] = { 0 };
-	GetClassNameW(hForeground, className, 256);
-	GetWindowTextW(hForeground, windowTitle, 256);
+    HWND winner = foreground ? GetAncestor(foreground, GA_ROOTOWNER) : nullptr;
+    const std::wstring chosenProc = (winner && IsWindowOnCurrentVirtualDesktop(winner))
+        ? GetRealProcessName(winner) : L"";
 
-	// 排除任务视图、Alt+Tab 界面、以及开始菜单等干扰
-	if (wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 &&
-		wcscmp(windowTitle, L"任务切换") == 0)
-	{
-		// 还没退出任务视图，用户可能还在选，续命定时器
-		SetTimer(hwnd, idEvent, 100, NULL);
-		return;
-	}
-
-	g_InSnapWindows = false;
-
-	// --- 2. 判定真正的胜出者 ---
-	HWND hWinner = GetAncestor(hForeground, GA_ROOTOWNER);
-
-	// 优先读取前台窗口的进程 Atom 标记；若没有，则实时提取真实进程名匹配
-	HANDLE hTargetProp = GetPropW(hWinner, L"MTU_PROC_TAG");
-	std::wstring targetProcName;
-
-	if (hTargetProp) {
-		wchar_t buf[MAX_PATH];
-		GlobalGetAtomNameW(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(hTargetProp)), buf, MAX_PATH);
-		targetProcName = buf;
-	}
-	else {
-		targetProcName = GetRealProcessName(hWinner);
-	}
-
-	// 如果前台窗口既无 Tag 也非被隐匿的目标进程，说明用户选中了无关窗口：全数压制回隐藏缓存
-	if (targetProcName.empty()) {
-		for (HWND h : g_HiddenWindowsCache) {
-			if (IsWindow(h) && IsWindowVisible(h)) HideWindowAndHideTaskbarIcon(h);
-		}
-		return;
-	}
-
-	std::wstring currentVd = GetCurrentVirtualDesktopName(L"等待器");
-
-	// --- 3. 精准收网：遍历缓存，同进程且同桌面的所有窗口统一解封，其余继续压制 ---
-	g_HiddenWindowsCache.erase(
-		std::remove_if(g_HiddenWindowsCache.begin(), g_HiddenWindowsCache.end(),
-			[&](HWND h) {
-				if (!IsWindow(h)) return true;
-
-				HANDLE hProc = GetPropW(h, L"MTU_PROC_TAG");
-				HANDLE hVd = GetPropW(h, L"MTU_VD_TAG");
-
-				wchar_t pName[MAX_PATH] = { 0 };
-				wchar_t vName[MAX_PATH] = { 0 };
-
-				if (hProc) GlobalGetAtomNameW(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(hProc)), pName, MAX_PATH);
-				if (hVd) GlobalGetAtomNameW(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(hVd)), vName, MAX_PATH);
-
-				// 判断是否为同一进程
-				bool isSameProc = (!hProc && GetRealProcessName(h) == targetProcName) ||
-					(hProc && wcscmp(targetProcName.c_str(), pName) == 0);
-
-				// 判断是否处于同一虚拟桌面
-				bool isSameVd = (hVd && wcscmp(currentVd.c_str(), vName) == 0) ||
-					IsWindowOnCurrentVirtualDesktop(h);
-
-				// 【同进程 + 同桌面】统一完全还原解封
-				if (isSameProc && isSameVd) {
-
-					// A. 还原标题 (去掉前缀 🕸)
-					wchar_t currentTitle[512];
-					if (GetWindowTextW(h, currentTitle, 512) > 0) {
-						std::wstring t = currentTitle;
-						std::wstring prefix = L"🕸";
-
-						if (t.find(prefix) == 0) {
-							t.erase(0, prefix.length());
-							SetWindowTextW(h, t.c_str());
-						}
-					}
-
-					// B. 清理附加 Atom
-					if (hProc) {
-						RemovePropW(h, L"MTU_PROC_TAG");
-						GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(hProc)));
-					}
-					if (hVd) {
-						RemovePropW(h, L"MTU_VD_TAG");
-						GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(hVd)));
-					}
-
-					// C. 完全恢复任务栏图标与可见性
-					ShowWindowAndShowTaskbarIcon(h);
-
-					return true; // 从隐藏缓存列表中移除
-				}
-
-				// 未选中的同桌面窗口继续维持压制
-				if (IsWindowOnCurrentVirtualDesktop(h)) {
-					HideWindowAndHideTaskbarIcon(h);
-				}
-				return false;
-			}),
-		g_HiddenWindowsCache.end()
-	);
+    g_HiddenWindowsCache.erase(
+        std::remove_if(g_HiddenWindowsCache.begin(), g_HiddenWindowsCache.end(),
+            [&](HWND h) {
+                if (!IsWindow(h)) return true;
+                if (!CanUnsealOnCurrentDesktop(h)) return false;
+                HANDLE tag = GetPropW(h, L"MTU_PROC_TAG");
+                wchar_t taggedProc[MAX_PATH]{};
+                if (!tag || !GlobalGetAtomNameW(
+                        static_cast<ATOM>(reinterpret_cast<UINT_PTR>(tag)),
+                        taggedProc, MAX_PATH)) return false;
+                if (!chosenProc.empty() && chosenProc != L"Unknown" &&
+                    _wcsicmp(chosenProc.c_str(), taggedProc) == 0) {
+                    ShowWindowAndShowTaskbarIcon(h);
+                    return true;
+                }
+                // Re-seal all other windows without changing iconic, show,
+                // focus, Z-order, or virtual-desktop membership.
+                HideWindowAndHideTaskbarIcon(h);
+                return false;
+            }), g_HiddenWindowsCache.end());
 }
 
 //realname一致的同类窗口处理
