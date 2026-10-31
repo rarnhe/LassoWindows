@@ -1199,51 +1199,24 @@ void SuppressWinKeyMenuModern() {
 // ============================================================================
 
 bool TryUnHideWindowsForAltTab() {
-	RefreshWindowCache();
-	if (g_HiddenWindowsCache.empty()) return false;
+    RefreshWindowCache();
+    if (g_HiddenWindowsCache.empty()) return false;
+    g_snapUnhiddenWindows.clear();
 
-	bool didShowAny = false;
-	std::wstring currentVd = GetCurrentVirtualDesktopName(L"键盘钩子");
+    for (HWND h : g_HiddenWindowsCache) {
+        // Both tests are mandatory: process/desktop tags alone must never
+        // cause another desktop's window to become visible.
+        if (!CanUnsealOnCurrentDesktop(h) ||
+            !IsOriginalWindowEligibleForPreview(h)) continue;
+        ShowWindowAndShowTaskbarIcon(h, true);
+        g_snapUnhiddenWindows.push_back(h);
+    }
+    if (g_snapUnhiddenWindows.empty()) return false;
 
-	// 每次重新快照前清空快照暂存列表
-	g_snapUnhiddenWindows.clear();
-
-	for (HWND h : g_HiddenWindowsCache) {
-		if (!IsWindow(h)) continue;
-
-		// 【关键防御】：检查虚拟桌面匹配
-		HANDLE hVdProp = GetPropW(h, L"MTU_VD_TAG");
-		if (!hVdProp) continue;
-
-		ATOM vdAtom = static_cast<ATOM>(reinterpret_cast<UINT_PTR>(hVdProp));
-		wchar_t savedVdName[MAX_PATH];
-
-		if (GlobalGetAtomNameW(vdAtom, savedVdName, MAX_PATH)) {
-			if (wcscmp(savedVdName, currentVd.c_str()) == 0) {
-
-				// A. 直接解封：剥离 WS_EX_TOOLWINDOW，恢复 WS_EX_APPWINDOW 与窗口渲染
-				ShowWindowAndShowTaskbarIcon(h, true);
-
-				// B. 记录到快照暂存列表，用于后续精确收网
-				g_snapUnhiddenWindows.push_back(h);
-				didShowAny = true;
-			}
-			else {
-				// 不在当前虚拟桌面的窗口，继续维持最小化与任务栏隐匿
-				HideWindowAndHideTaskbarIcon(h);
-			}
-		}
-	}
-
-	if (didShowAny) {
-		g_InSnapWindows = true;
-		KillTimer(g_hLassoCoordinator, TIMER_ID_COLLECT);
-
-		// 阻塞等待 DWM 合成最新视口纹理，确保 Alt+Tab 捕捉到不黑屏的缩略图
-		DwmFlush();
-	}
-
-	return didShowAny;
+    g_InSnapWindows = true;
+    KillTimer(g_hLassoCoordinator, TIMER_ID_COLLECT);
+    DwmFlush(); // Wait for composition without moving/activating HWNDs.
+    return true;
 }
 
 /**
