@@ -94,6 +94,59 @@ void run(const std::string& name) {
         CHECK(style & WS_EX_APPWINDOW); CHECK(!(style & mask));
         CHECK(IsWindowVisible(w));
         HideWindowAndHideTaskbarIcon(nullptr); ShowWindowAndShowTaskbarIcon(nullptr);
+    } else if (name == "desktop_guid_atom") {
+        GUID expected{};
+        CHECK(SUCCEEDED(CLSIDFromString(
+            L"{4fd230e8-260c-4fa9-9234-151155a7b739}", &expected)));
+        ATOM atom = GlobalAddAtomW(L"{4fd230e8-260c-4fa9-9234-151155a7b739}");
+        CHECK(atom != 0);
+        CHECK(SetPropW(w, L"MTU_VD_TAG", reinterpret_cast<HANDLE>((UINT_PTR)atom)));
+        GUID actual{};
+        CHECK(ReadTaggedDesktopGuid(w, actual));
+        CHECK(IsEqualGUID(expected, actual));
+        CHECK(TaggedDesktopMatches(w, expected));
+        ClearSealMarkers(w);
+        CHECK(!GetPropW(w, L"MTU_VD_TAG"));
+    } else if (name == "legacy_desktop_name_rejected") {
+        ATOM atom = GlobalAddAtomW(L"My Custom Desktop");
+        CHECK(atom != 0);
+        CHECK(SetPropW(w, L"MTU_VD_TAG", reinterpret_cast<HANDLE>((UINT_PTR)atom)));
+        GUID actual{};
+        CHECK(!ReadTaggedDesktopGuid(w, actual));
+        CHECK(!CanUnsealOnCurrentDesktop(w));
+        ClearSealMarkers(w);
+    } else if (name == "wrong_desktop_guid_rejected") {
+        // Even if the system desktop manager is unavailable in CI,
+        // an invalid desktop identity must fail closed.
+        ATOM atom = GlobalAddAtomW(L"{00000000-0000-0000-0000-000000000001}");
+        CHECK(atom != 0);
+        CHECK(SetPropW(w, L"MTU_VD_TAG", reinterpret_cast<HANDLE>((UINT_PTR)atom)));
+        GUID unexpected{};
+        CHECK(SUCCEEDED(CLSIDFromString(
+            L"{00000000-0000-0000-0000-000000000002}", &unexpected)));
+        CHECK(!TaggedDesktopMatches(w, unexpected));
+        CHECK(!CanUnsealOnCurrentDesktop(w));
+        ClearSealMarkers(w);
+    } else if (name == "minimized_stays_minimized") {
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        ShowWindow(w, SW_MINIMIZE);
+        CHECK(IsIconic(w));
+        const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(IsIconic(w));
+        CHECK(!IsOriginalWindowEligibleForPreview(w));
+        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(IsIconic(w));
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == original);
+    } else if (name == "hidden_stays_hidden") {
+        CHECK(!IsWindowVisible(w));
+        const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(!IsWindowVisible(w));
+        CHECK(!IsOriginalWindowEligibleForPreview(w));
+        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(!IsWindowVisible(w));
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == original);
     } else if (name == "seal_idempotent") {
         ShowWindow(w, SW_SHOWNOACTIVATE);
         const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
@@ -157,10 +210,10 @@ void run(const std::string& name) {
         g_InSnapWindows = false;
         SuppressHiddenWindows(w, EVENT_OBJECT_FOCUS);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        // Process tag alone must NOT override virtual desktop isolation.
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
-        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
         RemovePropW(w, L"MTU_PROC_TAG");
-        ShowWindowAndShowTaskbarIcon(w);
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     } else if (name == "collect") {
@@ -192,7 +245,12 @@ void run(const std::string& name) {
         CHECK(found.empty());
         RemovePropW(w, L"MTU_PROC_TAG");
         CHECK(EnumWindowToggleProc(w, reinterpret_cast<LPARAM>(&context)));
-        CHECK(found.size() == 1 && found.front() == w.h);
+        // Headless CI can lack the Virtual Desktop COM service. The filter
+        // fails closed in that case instead of collecting a foreign window.
+        if (IsWindowOnCurrentVirtualDesktop(w))
+            CHECK(found.size() == 1 && found.front() == w.h);
+        else
+            CHECK(found.empty());
     } else throw std::runtime_error("unknown case");
 }
 int main(int argc, char** argv) {
