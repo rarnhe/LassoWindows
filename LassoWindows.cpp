@@ -677,6 +677,20 @@ static bool SnapshotWindowState(HWND h) {
     return true;
 }
 
+// An actual (non-preview) restore also cleans the persistent window markers.
+static void ClearSealMarkers(HWND h) {
+    HANDLE p = RemovePropW(h, L"MTU_PROC_TAG");
+    if (p) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(p)));
+    HANDLE vd = RemovePropW(h, L"MTU_VD_TAG");
+    if (vd) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(vd)));
+    wchar_t title[512]{};
+    if (GetWindowTextW(h, title, 512) > 0) {
+        const std::wstring prefix = L"🕸";
+        if (wcsncmp(title, prefix.c_str(), prefix.length()) == 0)
+            SetWindowTextW(h, title + prefix.length());
+    }
+}
+
 // preview=true retains the original snapshot for a later re-seal.
 void ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     auto it = g_sealedWindowStates.find(h);
@@ -708,7 +722,10 @@ void ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
         taskbar->Release();
     }
     InvalidateRect(h, nullptr, TRUE);
-    if (!preview) g_sealedWindowStates.erase(it);
+    if (!preview) {
+        ClearSealMarkers(h);
+        g_sealedWindowStates.erase(it);
+    }
 }
 
 void HideWindowAndHideTaskbarIcon(HWND h) {
@@ -1020,6 +1037,9 @@ BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
 			}
 		}
 
+		// Reject windows that cannot safely be restored before changing any title/tags.
+		if (!SnapshotWindowState(hWnd)) return TRUE;
+
 		// --- A. 添加 “🕸” 蛛网标 ---
 		wchar_t originalTitle[512] = { 0 };
 		if (GetWindowTextW(hWnd, originalTitle, 512) > 0) {
@@ -1107,7 +1127,10 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 			// UWP windows use the same reversible seal; never send WM_CLOSE.
 		}
 
-				// --- 1. 获取并修改标题文字 ---
+		// Validate reversible state before writing marker properties.
+		if (!SnapshotWindowState(hWnd)) return TRUE;
+
+		// --- 1. 获取并修改标题文字 ---
 		wchar_t originalTitle[512];
 		if (GetWindowTextW(hWnd, originalTitle, 512) > 0) {
 			std::wstring titleStr = originalTitle;
