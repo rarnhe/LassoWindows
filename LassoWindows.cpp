@@ -1435,60 +1435,42 @@ BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
 // =========================================================================
 // 2. 极致纯粹的全局低级鼠标钩子（状态完全依赖外部监测同步）
 // =========================================================================
+// All collection and minimize/restore work runs on the coordinator thread.
+static void TogglePrimaryWindows() {
+    g_lastTrayClickTime = GetTickCount64();
+    if (g_minimizedPrimaryWindows.empty()) {
+        POINT origin{0, 0};
+        HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        ToggleContext context{&g_minimizedPrimaryWindows, primary};
+        EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
+        for (HWND h : g_minimizedPrimaryWindows) {
+            if (IsWindow(h)) PostMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+        }
+    } else {
+        for (HWND h : g_minimizedPrimaryWindows) {
+            if (IsWindow(h) && IsIconic(h)) ShowWindowAsync(h, SW_RESTORE);
+        }
+        g_minimizedPrimaryWindows.clear();
+    }
+}
+
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-	if (nCode >= 0 && (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)) {
-		PMSLLHOOKSTRUCT pMouse = reinterpret_cast<PMSLLHOOKSTRUCT>(lParam);
-
-		HWND hMainTray = FindWindowW(L"Shell_TrayWnd", NULL);
-		if (hMainTray != NULL) {
-			RECT trayRect;
-			if (GetPhysicalRect(hMainTray, &trayRect)) {
-
-				// 精准碰撞主屏任务栏右下角热区
-				if (pMouse->pt.x >= (trayRect.right - TARGET_ZONE_WIDTH) && pMouse->pt.x <= trayRect.right &&
-					pMouse->pt.y >= trayRect.top && pMouse->pt.y <= trayRect.bottom) {
-
-					// 仅在按下时触发业务，抬起时静默拦截，彻底打断系统原生的 Show Desktop 消息链路
-					if (wParam == WM_LBUTTONDOWN) {
-						// 🟢 触发了显示桌面/隐藏操作，立即上锁！
-						g_lastTrayClickTime = GetTickCount64();
-						// 🟢 状态 A：历史记录为空 -> 执行“隐藏”
-						if (g_minimizedPrimaryWindows.empty()) {
-							POINT ptZero = { 0, 0 };
-							HMONITOR hPrimary = MonitorFromPoint(ptZero, MONITOR_DEFAULTTOPRIMARY);
-
-							ToggleContext ctx = { &g_minimizedPrimaryWindows, hPrimary };
-
-							// 1. 去主屏搜集【无 MTU_PROC_TAG】的窗口
-							EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&ctx));
-
-							// 2. 批量异步最小化
-							for (HWND hWnd : g_minimizedPrimaryWindows) {
-								if (IsWindow(hWnd)) {
-									PostMessage(hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-								}
-							}
-						}
-						// 🟢 状态 B：历史记录不为空 -> 执行“恢复”
-						else {
-							for (HWND hWnd : g_minimizedPrimaryWindows) {
-								// 确认句柄有效且当前仍处于最小化状态（避免误操作已被用户手动放大的窗口）
-								if (IsWindow(hWnd) && IsIconic(hWnd)) {
-									//RestoreWindowAppId(hWnd); // 恢复原始图标
-									ShowWindowAsync(hWnd, SW_RESTORE); // 异步恢复，零阻塞
-								}
-							}
-							g_minimizedPrimaryWindows.clear();
-						}
-					}
-
-					// 🔴 完全吃掉该区域的 LBUTTONDOWN 与 LBUTTONUP 消息，阻止 Shell 响应
-					return 1;
-				}
-			}
-		}
-	}
-	return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+    if (nCode == HC_ACTION &&
+        (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) &&
+        g_hLassoCoordinator) {
+        const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+        RECT bounds{};
+        if (tray && GetPhysicalRect(tray, &bounds) &&
+            mouse->pt.x >= bounds.right - TARGET_ZONE_WIDTH &&
+            mouse->pt.x <= bounds.right &&
+            mouse->pt.y >= bounds.top && mouse->pt.y <= bounds.bottom) {
+            if (wParam == WM_LBUTTONUP) return 1;
+            if (PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0))
+                return 1;
+        }
+    }
+    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
 
 // 辅助调试函数
