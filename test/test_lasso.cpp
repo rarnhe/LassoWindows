@@ -94,6 +94,17 @@ void run(const std::string& name) {
         CHECK(style & WS_EX_APPWINDOW); CHECK(!(style & mask));
         CHECK(IsWindowVisible(w));
         HideWindowAndHideTaskbarIcon(nullptr); ShowWindowAndShowTaskbarIcon(nullptr);
+    } else if (name == "seal_idempotent") {
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(g_sealedWindowStates.contains(w.h));
+        const size_t count = g_sealedWindowStates.size();
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(g_sealedWindowStates.size() == count);
+        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == original);
+        CHECK(!g_sealedWindowStates.contains(w.h));
     } else if (name == "restore_tool_style") {
         ShowWindow(w, SW_SHOWNOACTIVATE);
         const LONG_PTR original = GetWindowLongPtrW(w, GWL_EXSTYLE);
