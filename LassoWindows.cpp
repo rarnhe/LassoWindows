@@ -633,6 +633,63 @@ bool IsWindowOnCurrentVirtualDesktop(HWND hWnd) {
 	return (SUCCEEDED(hr) && isOnCurrent);
 }
 
+// Desktop membership is an identity, not a user-editable desktop name.
+// We store the official GUID as a string Atom in MTU_VD_TAG. Existing name
+// tags intentionally fail closed: an unrecognized desktop is never unsealed.
+static bool GetWindowDesktopGuid(HWND h, GUID& id, bool requireCurrent = false) {
+    if (!IsWindow(h)) return false;
+    IVirtualDesktopManager* manager = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_VirtualDesktopManager, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&manager));
+    if (FAILED(hr) || !manager) return false;
+    BOOL onCurrent = FALSE;
+    if (requireCurrent)
+        hr = manager->IsWindowOnCurrentVirtualDesktop(h, &onCurrent);
+    if (SUCCEEDED(hr) && (!requireCurrent || onCurrent))
+        hr = manager->GetWindowDesktopId(h, &id);
+    manager->Release();
+    return SUCCEEDED(hr) && (!requireCurrent || onCurrent);
+}
+
+static bool ReadTaggedDesktopGuid(HWND h, GUID& id) {
+    HANDLE prop = GetPropW(h, L"MTU_VD_TAG");
+    if (!prop) return false;
+    wchar_t value[64]{};
+    ATOM atom = static_cast<ATOM>(reinterpret_cast<UINT_PTR>(prop));
+    if (!GlobalGetAtomNameW(atom, value, static_cast<int>(std::size(value))))
+        return false;
+    return SUCCEEDED(CLSIDFromString(value, &id));
+}
+
+static bool TaggedDesktopMatches(HWND h, const GUID& expected) {
+    GUID tag{};
+    return ReadTaggedDesktopGuid(h, tag) && IsEqualGUID(tag, expected);
+}
+
+static bool TagCurrentVirtualDesktop(HWND h) {
+    GUID actual{};
+    if (!GetWindowDesktopGuid(h, actual, true)) return false;
+    if (GetPropW(h, L"MTU_VD_TAG")) return TaggedDesktopMatches(h, actual);
+    wchar_t text[64]{};
+    if (!StringFromGUID2(actual, text, static_cast<int>(std::size(text)))) return false;
+    ATOM atom = GlobalAddAtomW(text);
+    if (!atom) return false;
+    if (!SetPropW(h, L"MTU_VD_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(atom)))) {
+        GlobalDeleteAtom(atom);
+        return false;
+    }
+    return true;
+}
+
+// Fail closed if either the saved GUID, actual GUID or current-desktop check
+// is unavailable. Never use a matching process name alone for unsealing.
+static bool CanUnsealOnCurrentDesktop(HWND h) {
+    GUID actual{};
+    return ReadTaggedDesktopGuid(h, actual) &&
+        GetWindowDesktopGuid(h, actual, true) &&
+        TaggedDesktopMatches(h, actual);
+}
+
 // 事件监控相关
 // --- 全局配置与状态 ---
 #define TIMER_ID_COLLECT 1001
