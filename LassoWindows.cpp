@@ -1032,6 +1032,7 @@ BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
 
 		// Reject windows that cannot safely be restored before changing any title/tags.
 		if (!SnapshotWindowState(hWnd)) return TRUE;
+		if (!TagCurrentVirtualDesktop(hWnd)) return TRUE;
 
 		// --- A. 添加 “🕸” 蛛网标 ---
 		wchar_t originalTitle[512] = { 0 };
@@ -1053,14 +1054,7 @@ BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
 			SetPropW(hWnd, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(procAtom)));
 		}
 
-		// --- C. 挂载虚拟桌面 Atom (MTU_VD_TAG) ---
-		if (!GetPropW(hWnd, L"MTU_VD_TAG")) {
-			std::wstring vDesktopName = GetCurrentVirtualDesktopName(L"隐藏当前程序窗口");
-			if (!vDesktopName.empty()) {
-				ATOM vdAtom = GlobalAddAtomW(vDesktopName.c_str());
-				SetPropW(hWnd, L"MTU_VD_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(vdAtom)));
-			}
-		}
+		// MTU_VD_TAG already contains the official virtual desktop GUID.
 
 		// --- D. 执行隐匿 ---
 		HideWindowAndHideTaskbarIcon(hWnd);
@@ -1122,6 +1116,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 
 		// Validate reversible state before writing marker properties.
 		if (!SnapshotWindowState(hWnd)) return TRUE;
+		if (!TagCurrentVirtualDesktop(hWnd)) return TRUE;
 
 		// --- 1. 获取并修改标题文字 ---
 		wchar_t originalTitle[512];
@@ -1150,13 +1145,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 			SetPropW(hWnd, L"MTU_PROC_TAG", (HANDLE)(UINT_PTR)procAtom);
 		}
 
-		// 2. 设置虚拟桌面名称标签 (新增逻辑)
-		std::wstring forWhichPurpose = L"隐藏其它窗口";
-		std::wstring vDesktopName = GetCurrentVirtualDesktopName(forWhichPurpose); // 这里替换为你获取名称的逻辑
-		if (!GetPropW(hWnd, L"MTU_VD_TAG")) {
-			ATOM vdAtom = GlobalAddAtomW(vDesktopName.c_str());
-			SetPropW(hWnd, L"MTU_VD_TAG", (HANDLE)(UINT_PTR)vdAtom);
-		}
+		// MTU_VD_TAG already contains the official virtual desktop GUID.
 
 		// --- 执行隐藏 ---
 		HideWindowAndHideTaskbarIcon(hWnd);
