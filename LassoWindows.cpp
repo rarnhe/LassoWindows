@@ -1107,9 +1107,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 			// UWP windows use the same reversible seal; never send WM_CLOSE.
 		}
 
-		// --- 1. 获取并修改标题文字 ---		}
-
-		// --- 1. 获取并修改标题文字 ---
+				// --- 1. 获取并修改标题文字 ---
 		wchar_t originalTitle[512];
 		if (GetWindowTextW(hWnd, originalTitle, 512) > 0) {
 			std::wstring titleStr = originalTitle;
