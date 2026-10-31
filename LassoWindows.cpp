@@ -576,47 +576,6 @@ void RestoreWindowAppId(HWND hwnd) {
 }
 
 
-//Todolist：窗口自动随桌面切换，避免 win+tab 时窗口被拉回原桌面
-// win+tab 将有关联窗口拉取到当前桌面
-// 获取虚拟桌面名称
-#include <rpc.h>
-#pragma comment(lib, "Rpcrt4.lib")
-std::wstring GetCurrentVirtualDesktopName(std::wstring forWhichPurpose) {
-	HKEY hKey;
-	BYTE guid[16];
-	DWORD size = sizeof(guid);
-	std::wstring result = L"";
-	bool bNameFound = false;
-	const wchar_t* rootPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
-	if (RegOpenKeyExW(HKEY_CURRENT_USER, rootPath, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-		if (RegQueryValueExW(hKey, L"CurrentVirtualDesktop", NULL, NULL, guid, &size) == ERROR_SUCCESS) {
-			RPC_WSTR guidStr;
-			if (UuidToStringW((UUID*)guid, &guidStr) == RPC_S_OK) {
-				std::wstring subKeyPath = std::wstring(rootPath) + L"\\Desktops\\{" + (wchar_t*)guidStr + L"}";
-				RpcStringFreeW(&guidStr);
-				HKEY hSubKey;
-				if (RegOpenKeyExW(HKEY_CURRENT_USER, subKeyPath.c_str(), 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
-					wchar_t nameBuffer[512] = { 0 };
-					DWORD nameSize = sizeof(nameBuffer);
-					if (RegQueryValueExW(hSubKey, L"Name", NULL, NULL, (LPBYTE)nameBuffer, &nameSize) == ERROR_SUCCESS) {
-						result = nameBuffer;
-						bNameFound = true; // 只有真正读到用户定义的名称，才算成功
-					}
-					RegCloseKey(hSubKey);
-				}
-			}
-		}
-		RegCloseKey(hKey);
-	}
-	// 6. 严密拦截：如果没有成功获取到桌面名称，触发你的原生通知窗口
-	if (!bNameFound) {
-		// 此时由于没有获取到真实桌面名，传入通知的 currentVd 暂时用提示语代替
-		ShowWin11NativeNotification(L"未命名或未识别的虚拟桌面", forWhichPurpose.c_str());
-	}
-
-	return result;
-}
-
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
