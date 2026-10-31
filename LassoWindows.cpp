@@ -703,16 +703,18 @@ HWINEVENTHOOK g_hObjHook = NULL;
 // 建议：句柄缓存 - 避免频繁 EnumWindows 带来的性能开销
 std::vector<HWND> g_HiddenWindowsCache;
 
-// Snapshot state once; a temporary Alt+Tab preview must not overwrite it.
+// Original window presentation must survive repeated seals and Alt+Tab previews.
+// Most importantly, sealing/unsealing never calls ShowWindow, moves Z-order,
+// changes activation, or moves a window between virtual desktops.
 struct SealedWindowState {
     LONG_PTR exStyle = 0;
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
-    HWND previous = nullptr;
     BYTE alpha = 255;
     COLORREF colorKey = 0;
     DWORD layerFlags = 0;
     bool hasLayerAttributes = false;
     bool wasVisible = false;
+    bool wasIconic = false;
 };
 static std::unordered_map<HWND, SealedWindowState> g_sealedWindowStates;
 
@@ -721,11 +723,11 @@ static bool SnapshotWindowState(HWND h) {
     if (g_sealedWindowStates.contains(h)) return true;
     SealedWindowState state;
     state.exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
-    state.previous = GetWindow(h, GW_HWNDPREV);
     state.wasVisible = IsWindowVisible(h) != FALSE;
+    state.wasIconic = IsIconic(h) != FALSE;
     if (!GetWindowPlacement(h, &state.placement)) return false;
-    // Do not alter a pre-existing layered window if its original alpha is
-    // unavailable: no lossless restoration would be possible.
+    // If an existing layered window does not expose its original attributes,
+    // leave it alone rather than rewriting its alpha and losing its content.
     if (state.exStyle & WS_EX_LAYERED) {
         if (!GetLayeredWindowAttributes(h, &state.colorKey, &state.alpha, &state.layerFlags))
             return false;
@@ -735,7 +737,6 @@ static bool SnapshotWindowState(HWND h) {
     return true;
 }
 
-// An actual (non-preview) restore also cleans the persistent window markers.
 static void ClearSealMarkers(HWND h) {
     HANDLE p = RemovePropW(h, L"MTU_PROC_TAG");
     if (p) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(p)));
@@ -749,27 +750,29 @@ static void ClearSealMarkers(HWND h) {
     }
 }
 
-// preview=true retains the original snapshot for a later re-seal.
+static bool IsOriginalWindowEligibleForPreview(HWND h) {
+    auto it = g_sealedWindowStates.find(h);
+    // A minimized or already-hidden window must not be shown by the manager.
+    return it != g_sealedWindowStates.end() &&
+           it->second.wasVisible && !it->second.wasIconic &&
+           !IsIconic(h) && IsWindowVisible(h);
+}
+
+// preview=true retains the original snapshot for subsequent re-sealing.
 void ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     auto it = g_sealedWindowStates.find(h);
     if (it == g_sealedWindowStates.end()) return;
     if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return; }
     const SealedWindowState original = it->second;
 
+    // Restoring style/alpha alone does not change WS_VISIBLE, iconic state,
+    // focus, activation, window placement, or virtual desktop association.
     SetWindowLongPtrW(h, GWL_EXSTYLE, original.exStyle);
-    if (original.hasLayerAttributes) {
+    if (original.hasLayerAttributes)
         SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
-    }
-    HWND after = (original.previous && IsWindow(original.previous))
-        ? original.previous : HWND_TOP;
-    SetWindowPos(h, after, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    if (!original.wasVisible) ShowWindow(h, SW_HIDE);
-    else if (original.placement.showCmd == SW_SHOWMINIMIZED ||
-             original.placement.showCmd == SW_MINIMIZE ||
-             original.placement.showCmd == SW_SHOWMINNOACTIVE)
-        ShowWindow(h, SW_SHOWMINNOACTIVE);
-    else ShowWindow(h, SW_SHOWNOACTIVATE);
+    SetWindowPos(h, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
 
     ITaskbarList* taskbar = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
@@ -788,14 +791,16 @@ void ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
 
 void HideWindowAndHideTaskbarIcon(HWND h) {
     if (!SnapshotWindowState(h)) return;
-    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    // Do not SW_RESTORE an iconified window: that may activate it and cause
+    // Shell to switch desks or move the window. Alpha is orthogonal to iconic.
     LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
     exStyle &= ~WS_EX_APPWINDOW;
     exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
     SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
     SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-    SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    SetWindowPos(h, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     ITaskbarList* taskbar = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
             IID_ITaskbarList, reinterpret_cast<void**>(&taskbar))) && taskbar) {
@@ -805,6 +810,8 @@ void HideWindowAndHideTaskbarIcon(HWND h) {
     }
 }
 
+// On graceful shutdown, restore only style and alpha for *all* sealed windows.
+// Never show, activate, restore or move an off-desktop window.
 static void RestoreAllSealedWindows() {
     while (!g_sealedWindowStates.empty()) {
         HWND h = g_sealedWindowStates.begin()->first;
