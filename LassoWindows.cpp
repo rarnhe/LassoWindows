@@ -9,6 +9,7 @@
 #include <propkey.h>
 #include <propvarutil.h>
 #include <filesystem>
+#include <unordered_map>
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
@@ -644,77 +645,96 @@ HWINEVENTHOOK g_hObjHook = NULL;
 // 建议：句柄缓存 - 避免频繁 EnumWindows 带来的性能开销
 std::vector<HWND> g_HiddenWindowsCache;
 
-// ============================================================================
-// 1. HideWindowAndHideTaskbarIcon (使用透明化窗口的方法视觉上隐藏窗口)
-// ============================================================================
-void HideWindowAndHideTaskbarIcon(HWND h) {
-	if (!IsWindow(h)) return;
+// Snapshot state once; a temporary Alt+Tab preview must not overwrite it.
+struct SealedWindowState {
+    LONG_PTR exStyle = 0;
+    WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+    HWND previous = nullptr;
+    BYTE alpha = 255;
+    COLORREF colorKey = 0;
+    DWORD layerFlags = 0;
+    bool hasLayerAttributes = false;
+    bool wasVisible = false;
+};
+static std::unordered_map<HWND, SealedWindowState> g_sealedWindowStates;
 
-	// 1. 如果窗口处于最小化，先还原
-	if (IsIconic(h)) {
-		ShowWindow(h, SW_RESTORE);
-	}
-
-	// 2. 修正扩展样式：
-	//    - 剥离 WS_EX_APPWINDOW，追加 WS_EX_TOOLWINDOW (隐藏任务栏与 Alt+Tab)
-	//    - 追加 WS_EX_LAYERED (开启透明度支持)
-	//    - 追加 WS_EX_TRANSPARENT (开启鼠标点击穿透)
-	LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
-	exStyle &= ~WS_EX_APPWINDOW;
-	exStyle |= (WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT);
-	SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
-
-	// 3. 将 Alpha 值设为 0 (完全透明)
-	SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-
-	// 4. 刷新 Frame 状态并压入 Z 轴底层
-	SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0,
-		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-
-	// 5. 显式从任务栏剥离 Tab 节点
-	ITaskbarList* pTaskbarList = NULL;
-	HRESULT hr = CoCreateInstance(
-		CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER, IID_ITaskbarList, reinterpret_cast<void**>(&pTaskbarList));
-	if (SUCCEEDED(hr) && pTaskbarList) {
-		pTaskbarList->HrInit();
-		pTaskbarList->DeleteTab(h);
-		pTaskbarList->Release();
-	}
+static bool SnapshotWindowState(HWND h) {
+    if (!IsWindow(h)) return false;
+    if (g_sealedWindowStates.contains(h)) return true;
+    SealedWindowState state;
+    state.exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    state.previous = GetWindow(h, GW_HWNDPREV);
+    state.wasVisible = IsWindowVisible(h) != FALSE;
+    if (!GetWindowPlacement(h, &state.placement)) return false;
+    // Do not alter a pre-existing layered window if its original alpha is
+    // unavailable: no lossless restoration would be possible.
+    if (state.exStyle & WS_EX_LAYERED) {
+        if (!GetLayeredWindowAttributes(h, &state.colorKey, &state.alpha, &state.layerFlags))
+            return false;
+        state.hasLayerAttributes = true;
+    }
+    g_sealedWindowStates.emplace(h, state);
+    return true;
 }
 
-// ============================================================================
-// 2. ShowWindowAndShowTaskbarIcon (反透明化 + 取消穿透版)
-// ============================================================================
-void ShowWindowAndShowTaskbarIcon(HWND h) {
-	if (!IsWindow(h)) return;
+// preview=true retains the original snapshot for a later re-seal.
+void ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
+    auto it = g_sealedWindowStates.find(h);
+    if (it == g_sealedWindowStates.end()) return;
+    if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return; }
+    const SealedWindowState original = it->second;
 
-	// 1. 还原扩展样式：
-	//    - 剥离 WS_EX_TOOLWINDOW、WS_EX_LAYERED、WS_EX_TRANSPARENT
-	//    - 恢复 WS_EX_APPWINDOW
-	LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
-	exStyle &= ~(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT);
-	exStyle |= WS_EX_APPWINDOW;
-	SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
+    SetWindowLongPtrW(h, GWL_EXSTYLE, original.exStyle);
+    if (original.hasLayerAttributes) {
+        SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
+    }
+    HWND after = (original.previous && IsWindow(original.previous))
+        ? original.previous : HWND_TOP;
+    SetWindowPos(h, after, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (!original.wasVisible) ShowWindow(h, SW_HIDE);
+    else if (original.placement.showCmd == SW_SHOWMINIMIZED ||
+             original.placement.showCmd == SW_MINIMIZE ||
+             original.placement.showCmd == SW_SHOWMINNOACTIVE)
+        ShowWindow(h, SW_SHOWMINNOACTIVE);
+    else ShowWindow(h, SW_SHOWNOACTIVATE);
 
-	// 2. 将 Alpha 还原为 255 (完全不透明)
-	SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+    ITaskbarList* taskbar = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITaskbarList, reinterpret_cast<void**>(&taskbar))) && taskbar) {
+        taskbar->HrInit();
+        if (original.wasVisible && !(original.exStyle & WS_EX_TOOLWINDOW))
+            taskbar->AddTab(h);
+        taskbar->Release();
+    }
+    InvalidateRect(h, nullptr, TRUE);
+    if (!preview) g_sealedWindowStates.erase(it);
+}
 
-	// 3. 原位唤醒：置顶、显示并刷新 Frame 状态
-	SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
-		SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+void HideWindowAndHideTaskbarIcon(HWND h) {
+    if (!SnapshotWindowState(h)) return;
+    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    exStyle &= ~WS_EX_APPWINDOW;
+    exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+    SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
+    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    ITaskbarList* taskbar = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITaskbarList, reinterpret_cast<void**>(&taskbar))) && taskbar) {
+        taskbar->HrInit();
+        taskbar->DeleteTab(h);
+        taskbar->Release();
+    }
+}
 
-	// 4. 重绘视口
-	InvalidateRect(h, NULL, TRUE);
-
-	// 5. 显式补回任务栏图标
-	ITaskbarList* pTaskbarList = NULL;
-	HRESULT hr = CoCreateInstance(
-		CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER, IID_ITaskbarList, reinterpret_cast<void**>(&pTaskbarList));
-	if (SUCCEEDED(hr) && pTaskbarList) {
-		pTaskbarList->HrInit();
-		pTaskbarList->AddTab(h);
-		pTaskbarList->Release();
-	}
+static void RestoreAllSealedWindows() {
+    while (!g_sealedWindowStates.empty()) {
+        HWND h = g_sealedWindowStates.begin()->first;
+        ShowWindowAndShowTaskbarIcon(h);
+    }
 }
 
 // --- 逻辑 1：全局压制逻辑 ---
@@ -967,38 +987,8 @@ void CALLBACK OnCollectTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
 
 //realname一致的同类窗口处理
 struct CloseFilter {
-	wchar_t targetClassName[256] = { 0 }; // 前台窗口类名
-	std::wstring targetRealProcName; // 【关键】：前台窗口穿透后的真实进程名 (如 L"SystemSettings.exe")
+    std::wstring currentAppProcName;
 };
-
-BOOL CALLBACK EnumCloseApplicationFrameWindowProc(HWND hwnd, LPARAM lParam) {
-	CloseFilter* filter = reinterpret_cast<CloseFilter*>(lParam);
-	if (!filter) return FALSE;
-
-	// 只处理当前有效的、可见的顶级窗口
-	if (IsWindow(hwnd) && IsWindowVisible(hwnd)) {
-		wchar_t className[256] = { 0 };
-		if (GetClassNameW(hwnd, className, 256)) {
-
-			// =========================================================================
-			// 1. 针对 UWP 应用 (ApplicationFrameWindow) 的完美穿透判定
-			// =========================================================================
-			if (wcscmp(filter->targetClassName, L"ApplicationFrameWindow") == 0) {
-				if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
-
-					// 使用你写好的穿透函数，获取当前正在被遍历的这个 UWP 窗口的真实底层进程名
-					std::wstring currentRealName = GetRealProcessName(hwnd);
-
-					// 只有【真实业务进程名】完全一致时，才执行关闭 (例如都是 SystemSettings.exe)
-					if (_wcsicmp(currentRealName.c_str(), filter->targetRealProcName.c_str()) == 0) {
-						PostMessageW(hwnd, WM_CLOSE, 0, 0);
-					}
-				}
-			}
-		}
-	}
-	return TRUE;
-}
 
 // 隐藏指定 App 进程名对应的窗口
 BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
@@ -1071,7 +1061,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 	CloseFilter* filter = reinterpret_cast<CloseFilter*>(lParam);
 	if (!filter) return FALSE;
 
-	const std::wstring& currentAppProcName = *(reinterpret_cast<std::wstring*>(lParam));
+	const std::wstring& currentAppProcName = filter->currentAppProcName;
 
 	// 1. 基础过滤：跳过不可见窗口、子窗口、以及我们自己的管理窗口
 	if (!IsWindowVisible(hWnd) || GetParent(hWnd) != NULL) {
@@ -1088,7 +1078,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 	std::wstring otherWndProcName = GetRealProcessName(hWnd);
 
 	// 3. 核心逻辑：如果这个窗口【不属于】当前正在使用的 App
-	if (otherWndProcName != currentAppProcName) {
+	if (_wcsicmp(otherWndProcName.c_str(), currentAppProcName.c_str()) != 0) {
 
 		// --- 关键修正：仿照 EnumHideWindowsProc 的安全过滤 ---
 
@@ -1114,20 +1104,10 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 			// 分支 B：处理 UWP 托管进程 (ApplicationFrameHost.exe / ApplicationFrameWindow)
 			// 核心修正：将其移出 explorer 作用域，在外层进行平级判定
 			// ---------------------------------------------------------------------
-			if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
-
-				if (IsWindow(hWnd)) {
-					//📌 提示：如果你希望保持跟上一步一样的“只关同类 UWP（比如前台是设置，就只关设置）”，
-					//则需要配合前面的 filter 过滤：
-					std::wstring curRealName = GetRealProcessName(hWnd);
-					if (_wcsicmp(curRealName.c_str(), filter->targetRealProcName.c_str()) == 0) {
-						PostMessageW(hWnd, WM_CLOSE, 0, 0);
-					}
-
-				}
-				return TRUE;
-			}
+			// UWP windows use the same reversible seal; never send WM_CLOSE.
 		}
+
+		// --- 1. 获取并修改标题文字 ---		}
 
 		// --- 1. 获取并修改标题文字 ---
 		wchar_t originalTitle[512];
