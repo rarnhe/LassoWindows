@@ -644,6 +644,7 @@ static bool TagCurrentVirtualDesktop(HWND h) {
 // Fail closed if either the saved GUID, actual GUID or current-desktop check
 // is unavailable. Never use a matching process name alone for unsealing.
 static bool CanUnsealOnCurrentDesktop(HWND h) {
+    if (!GetPropW(h, L"MTU_PROC_TAG")) return false;
     GUID actual{};
     return ReadTaggedDesktopGuid(h, actual) &&
         GetWindowDesktopGuid(h, actual, true) &&
@@ -990,8 +991,12 @@ BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
 		}
 
 		// Reject windows that cannot safely be restored before changing any title/tags.
+		const bool alreadyTracked = g_sealedWindowStates.contains(hWnd);
 		if (!SnapshotWindowState(hWnd)) return TRUE;
-		if (!TagCurrentVirtualDesktop(hWnd)) return TRUE;
+		if (!TagCurrentVirtualDesktop(hWnd)) {
+			if (!alreadyTracked) g_sealedWindowStates.erase(hWnd);
+			return TRUE;
+		}
 
 		// --- A. 添加 “🕸” 蛛网标 ---
 		wchar_t originalTitle[512] = { 0 };
@@ -1074,8 +1079,12 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 		}
 
 		// Validate reversible state before writing marker properties.
+		const bool alreadyTracked = g_sealedWindowStates.contains(hWnd);
 		if (!SnapshotWindowState(hWnd)) return TRUE;
-		if (!TagCurrentVirtualDesktop(hWnd)) return TRUE;
+		if (!TagCurrentVirtualDesktop(hWnd)) {
+			if (!alreadyTracked) g_sealedWindowStates.erase(hWnd);
+			return TRUE;
+		}
 
 		// --- 1. 获取并修改标题文字 ---
 		wchar_t originalTitle[512];
@@ -1795,7 +1804,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 static void HideCurrentApplication(HWND foreground) {
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root) return;
+    if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;
     wchar_t className[256]{};
     if (!GetClassNameW(root, className, 256)) return;
     // Never seal the Desktop, Shell/taskbar, or task-view UI.
@@ -1814,7 +1823,7 @@ static void HideCurrentApplication(HWND foreground) {
 static void HideOtherApplications(HWND foreground) {
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root) return;
+    if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;
     wchar_t className[256]{};
     if (!GetClassNameW(root, className, 256)) return;
     if (wcscmp(className, L"Progman") == 0 ||
