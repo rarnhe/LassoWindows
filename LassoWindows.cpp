@@ -873,7 +873,7 @@ std::wstring GetRealProcessName(HWND hwnd) {
 }
 
 void CALLBACK OnCollectTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-	KillTimer(NULL, idEvent);
+	KillTimer(hwnd, idEvent);
 
 	HWND hForeground = GetForegroundWindow();
 	if (!hForeground) return;
@@ -889,7 +889,7 @@ void CALLBACK OnCollectTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
 		wcscmp(windowTitle, L"任务切换") == 0)
 	{
 		// 还没退出任务视图，用户可能还在选，续命定时器
-		SetTimer(NULL, idEvent, 100, OnCollectTimer);
+		SetTimer(hwnd, idEvent, 100, NULL);
 		return;
 	}
 
@@ -1219,7 +1219,7 @@ bool TryUnHideWindowsForAltTab() {
 			if (wcscmp(savedVdName, currentVd.c_str()) == 0) {
 
 				// A. 直接解封：剥离 WS_EX_TOOLWINDOW，恢复 WS_EX_APPWINDOW 与窗口渲染
-				ShowWindowAndShowTaskbarIcon(h);
+				ShowWindowAndShowTaskbarIcon(h, true);
 
 				// B. 记录到快照暂存列表，用于后续精确收网
 				g_snapUnhiddenWindows.push_back(h);
@@ -1234,7 +1234,7 @@ bool TryUnHideWindowsForAltTab() {
 
 	if (didShowAny) {
 		g_InSnapWindows = true;
-		KillTimer(NULL, TIMER_ID_COLLECT);
+		KillTimer(g_hLassoCoordinator, TIMER_ID_COLLECT);
 
 		// 阻塞等待 DWM 合成最新视口纹理，确保 Alt+Tab 捕捉到不黑屏的缩略图
 		DwmFlush();
@@ -1265,7 +1265,7 @@ void ExecuteCollectRestore() {
 	g_AltLogicActive = false;
 
 	// 4. 销毁定时器
-	KillTimer(NULL, TIMER_ID_COLLECT);
+	KillTimer(g_hLassoCoordinator, TIMER_ID_COLLECT);
 }
 
 // ============================================================================
@@ -1881,7 +1881,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 							if (hVdRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hVdRemove);
 
 							// --- C. 执行实际的反隐藏与置顶动作 ---
-							ShowWindow(hHidden, SW_SHOW);
+							ShowWindowAndShowTaskbarIcon(hHidden);
 							SetForegroundWindow(hHidden);
 							SetFocus(hHidden);
 							SetWindowPos(hHidden, HWND_TOP, 0, 0, 0, 0,
@@ -1895,9 +1895,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 					// 或者我们自定义的 IsHiddenWindowReallyVisiable(hHidden) 明确返回 true（确保彻底脱离隐藏），
 					// 才会执行 pop_back() 将其移出队列！
 					// =====================================================================
-					if (!IsWindow(hHidden) || IsHiddenWindowReallyVisiable(hHidden)) {
-						pMatchesToRestore.pop_back(); // 顺利通关，安全弹出
-					}
+					// Always leave the callback; do not busy-loop if a window refuses
+                    // restoration. A future WinEvent may retry a failed operation.
+                    pMatchesToRestore.pop_back();
 					// 如果不满足（即窗口还在隐藏中），由于没有 pop_back，
 					// 下一次 while 循环会继续卡住它，但因为上面的 GetPropW 已经变成了 NULL，
 					// 它不会重复去改标题和调 ShowWindow，而是安全地走入 IsHiddenWindowReallyVisiable 进行下一次等待校验。
@@ -1945,7 +1945,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 							HANDLE hVdRemove = RemovePropW(hSpecificWindow, L"MTU_VD_TAG");
 							if (hVdRemove) GlobalDeleteAtom((ATOM)(UINT_PTR)hVdRemove);
 
-							ShowWindow(hSpecificWindow, SW_SHOW);
+							ShowWindowAndShowTaskbarIcon(hSpecificWindow);
 							SetForegroundWindow(hSpecificWindow);
 							SetFocus(hSpecificWindow);
 							SetWindowPos(hSpecificWindow, HWND_TOP, 0, 0, 0, 0,
