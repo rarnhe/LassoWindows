@@ -10,6 +10,7 @@
 #include <propvarutil.h>
 #include <filesystem>
 #include <unordered_map>
+#include <algorithm>
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
@@ -1602,6 +1603,18 @@ bool IsHiddenWindowReallyVisiable(HWND hwnd) {
 void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
+    if (event == EVENT_OBJECT_DESTROY) {
+        // A HWND can be recycled after destruction; never restore stale state
+        // onto a different window that later receives the same handle value.
+        g_sealedWindowStates.erase(hwnd);
+        auto forget = [hwnd](std::vector<HWND>& v) {
+            v.erase(std::remove(v.begin(), v.end(), hwnd), v.end());
+        };
+        forget(g_HiddenWindowsCache);
+        forget(g_snapUnhiddenWindows);
+        forget(g_minimizedPrimaryWindows);
+        return;
+    }
 
 	// 捕获插拔显示器、分辨率切换、桌面重建事件
 	if (event == EVENT_SYSTEM_DESKTOPSWITCH) {
@@ -2125,7 +2138,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     RegisterAppShortcut();
     g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    g_hObjHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+    g_hObjHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     HWINEVENTHOOK desktopHook = SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH,
         EVENT_SYSTEM_DESKTOPSWITCH, nullptr, WinEventProc, 0, 0,
