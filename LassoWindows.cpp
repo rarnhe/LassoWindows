@@ -2081,7 +2081,7 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
 
 static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     HANDLE ready = static_cast<HANDLE>(readyPtr);
-    try { winrt::init_apartment(); }
+    try { winrt::init_apartment(winrt::apartment_type::single_threaded); }
     catch (...) { SetEvent(ready); return 1; }
 
     WNDCLASSW wc{};
