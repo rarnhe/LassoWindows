@@ -10,6 +10,7 @@
 #include <propvarutil.h>
 #include <filesystem>
 #include <unordered_map>
+#include <iterator>
 #include <algorithm>
 
 // WinRT 通知相关
@@ -822,7 +823,7 @@ static void RestoreAllSealedWindows() {
 // --- 逻辑 1：全局压制逻辑 ---
 void SuppressHiddenWindows(HWND hwnd, DWORD event) {
 	// 只有在非任务视图模式下才执行压制
-	if (event == EVENT_OBJECT_SHOW && !g_InSnapWindows) {
+	if (event == EVENT_OBJECT_SHOW && !g_InSnapWindows && CanUnsealOnCurrentDesktop(hwnd)) {
 		// 关键：只要 GetPropW 返回非空，说明窗口已被标记，直接压制
 		if (GetPropW(hwnd, L"MTU_PROC_TAG")) {
 			HideWindowAndHideTaskbarIcon(hwnd);
@@ -856,12 +857,7 @@ void RefreshWindowCache() {
 					// 在当前桌面，加入待管理缓存
 					g_HiddenWindowsCache.push_back(h);
 				}
-				else {
-					// 不在当前桌面，强制隐藏（防止跨桌面残留）
-					if (IsWindowVisible(h)) {
-						HideWindowAndHideTaskbarIcon(h);
-					}
-				}
+				// Foreign-desktop windows are never modified while refreshing cache.
 			}
 		}
 		return TRUE;
