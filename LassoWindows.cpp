@@ -572,7 +572,7 @@ void RestoreWindowAppId(HWND hwnd) {
 		pTaskbarList->AddTab(hwnd);
 	}
 	// 触发重绘
-	SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+	SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
 
@@ -1378,7 +1378,8 @@ BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
 		return TRUE;
 	}
 
-	// 1. 跳过最小化或不可见的窗口
+	// Only current-desktop windows are eligible for the taskbar hot-zone.
+	if (!IsWindowOnCurrentVirtualDesktop(hWnd)) return TRUE;
 	if (IsIconic(hWnd) || !IsWindowVisible(hWnd)) return TRUE;
 
 	// 2. 核心过滤：如果外部已经赋予了 MTU_PROC_TAG 标签，直接跳过
@@ -1424,7 +1425,8 @@ static void TogglePrimaryWindows() {
         }
     } else {
         for (HWND h : g_minimizedPrimaryWindows) {
-            if (IsWindow(h) && IsIconic(h)) ShowWindowAsync(h, SW_RESTORE);
+            if (IsWindow(h) && IsIconic(h) && IsWindowOnCurrentVirtualDesktop(h))
+                ShowWindowAsync(h, SW_RESTORE);
         }
         g_minimizedPrimaryWindows.clear();
     }
@@ -1715,6 +1717,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 
 	// --- 2. 最小化/恢复监控 (仅针对窗口自身 idC == CHILDID_SELF) ---
 	if (idC == CHILDID_SELF) {
+        // A Shell minimize event from another desktop must not wake or regroup it.
+        if ((event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND) &&
+            !IsWindowOnCurrentVirtualDesktop(hwnd)) return;
 		// 最小化开始：触发 AppID 独立化
 		if (event == EVENT_SYSTEM_MINIMIZESTART) {
 
