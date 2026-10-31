@@ -1,12 +1,12 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-10-30 16:21:32
-- 测试源码基准提交：6beaf43f1a4ef508f310a369509beb27414da43b
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/41088983554
+- 时间（UTC）：2026-10-31 09:42:32
+- 测试源码基准提交：49bd5b9f09b358dd152a434d4a5fd37a5d1a6d5d
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/41189725218
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
-- 统计：通过 18 / 失败 0 / 跳过 0 / 共 18
+- 统计：通过 29 / 失败 0 / 跳过 0 / 共 29
 
 | 测试 | 结果 |
 | --- | --- |
@@ -24,6 +24,17 @@
 | rectangle | 通过 |
 | visibility | 通过 |
 | hide_restore | 通过 |
+| desktop_guid_atom | 通过 |
+| legacy_desktop_name_rejected | 通过 |
+| wrong_desktop_guid_rejected | 通过 |
+| minimized_stays_minimized | 通过 |
+| hidden_stays_hidden | 通过 |
+| seal_idempotent | 通过 |
+| restore_tool_style | 通过 |
+| restore_layered_alpha | 通过 |
+| preview_preserves_snapshot | 通过 |
+| hide_others_context | 通过 |
+| untracked_restore | 通过 |
 | suppress | 通过 |
 | collect | 通过 |
 | icon_cache | 通过 |
