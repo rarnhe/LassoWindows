@@ -1984,77 +1984,195 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 	}
 }
 
-int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE hPrev, _In_ LPSTR lpCmd, _In_ int nShow) {
-	// =========================================================================
-	// 【核心新增】：使用唯一的命名 Mutex 实现单实例检测
-	// =========================================================================
-	// 名字可以自己换，加 L"Global\\" 前缀可以确保即使在多用户切换或管理员权限下也是全局唯一的
-	HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\MyWindowManagerUniqueMutex_12345");
+// A message-only window on a separate worker thread serializes COM, WinEvent,
+// taskbar and hide/restore work. Hook callbacks live on the main message thread.
+static void HideCurrentApplication(HWND foreground) {
+    if (!IsWindow(foreground)) return;
+    HWND root = GetAncestor(foreground, GA_ROOT);
+    if (!root) return;
+    wchar_t className[256]{};
+    if (!GetClassNameW(root, className, 256)) return;
+    // Never seal the Desktop, Shell/taskbar, or task-view UI.
+    if (wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
+        wcscmp(className, L"XamlExplorerHostIslandWindow") == 0) return;
 
-	// 如果创建失败，或者系统返回 ERROR_ALREADY_EXISTS，说明已有实例在运行
-	if (hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
-		if (hMutex) {
-			CloseHandle(hMutex); // 安全释放句柄
-		}
-		// 发现多开，直接静默退出（也可以在此处加一个 MessageBoxW 弹窗提示用户）
-		return 0;
-	}
-	// =========================================================================
+    // ApplicationFrameWindow is treated like any other window:
+    // keeping its content alive matters more than hiding a special class.
+    const std::wstring name = GetRealProcessName(root);
+    if (name != L"Unknown" && !name.empty())
+        EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&name));
+}
 
-	// 1. 初始化 WinRT 环境 (用于原生通知)
-	winrt::init_apartment();
-	// 2. 注册应用快捷方式
-	RegisterAppShortcut();
-	// 3. 挂载低级别钩子
-	g_hKeyHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyProc, hInst, 0);
+static void HideOtherApplications(HWND foreground) {
+    if (!IsWindow(foreground)) return;
+    HWND root = GetAncestor(foreground, GA_ROOT);
+    if (!root) return;
+    wchar_t className[256]{};
+    if (!GetClassNameW(root, className, 256)) return;
+    if (wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0) return;
+    CloseFilter filter;
+    filter.currentAppProcName = GetRealProcessName(root);
+    if (filter.currentAppProcName != L"Unknown" &&
+        !filter.currentAppProcName.empty())
+        EnumWindows(EnumHideOthersProc, reinterpret_cast<LPARAM>(&filter));
+}
 
-	SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-	g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hInst, 0);
-	//if (!g_hMouseHook) {
-	//	return 1;
-	//}
+static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_LASSO_HIDE_CURRENT:
+        HideCurrentApplication(reinterpret_cast<HWND>(wp));
+        return 0;
+    case WM_LASSO_HIDE_OTHERS:
+        HideOtherApplications(reinterpret_cast<HWND>(wp));
+        return 0;
+    case WM_LASSO_ALT_TAB:
+        TryUnHideWindowsForAltTab();
+        // If Alt was released before the queued command ran, reproduce
+        // the complete key chord rather than sending an orphaned Tab.
+        if (!(GetAsyncKeyState(VK_MENU) & 0x8000)) {
+            INPUT input[4]{};
+            input[0].type = INPUT_KEYBOARD;
+            input[0].ki.wVk = VK_MENU;
+            input[1].type = INPUT_KEYBOARD;
+            input[1].ki.wVk = VK_TAB;
+            input[2].type = INPUT_KEYBOARD;
+            input[2].ki.wVk = VK_TAB;
+            input[2].ki.dwFlags = KEYEVENTF_KEYUP;
+            input[3].type = INPUT_KEYBOARD;
+            input[3].ki.wVk = VK_MENU;
+            input[3].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(4, input, sizeof(INPUT));
+        } else TriggerTabKeyModern();
+        return 0;
+    case WM_LASSO_ALT_DOWN:
+        g_AltLogicActive = true;
+        return 0;
+    case WM_LASSO_ALT_UP:
+        g_AltLogicActive = false;
+        if (g_InSnapWindows)
+            SetTimer(hwnd, TIMER_ID_COLLECT, 150, nullptr);
+        return 0;
+    case WM_LASSO_ESCAPE:
+        if (g_InSnapWindows) ExecuteCollectRestore();
+        return 0;
+    case WM_LASSO_TOGGLE_PRIMARY:
+        TogglePrimaryWindows();
+        return 0;
+    case WM_TIMER:
+        if (wp == TIMER_ID_COLLECT) {
+            OnCollectTimer(hwnd, msg, wp, GetTickCount());
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        RestoreAllSealedWindows();
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
 
-	g_hSysHook = SetWinEventHook(
-		EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-		NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-	);
-	// Hook 2: 监控对象显示 (0x8002)
-	g_hObjHook = SetWinEventHook(
-		EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
-		NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-	);
+static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
+    HANDLE ready = static_cast<HANDLE>(readyPtr);
+    try { winrt::init_apartment(); }
+    catch (...) { SetEvent(ready); return 1; }
 
-	//监控屏幕切换
-	HWINEVENTHOOK g_hDesktopHook = NULL; // 注意类型是 HWINEVENTHOOK，不是 HHOOK
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = CoordinatorWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"LassoWindowsCoordinator";
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        SetEvent(ready);
+        winrt::uninit_apartment();
+        return 1;
+    }
+    g_hLassoCoordinator = CreateWindowExW(0, wc.lpszClassName, L"",
+        0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    if (!g_hLassoCoordinator) {
+        SetEvent(ready);
+        winrt::uninit_apartment();
+        return 1;
+    }
+    UpdateSystemDpiScalingStatus();
+    RegisterAppShortcut();
+    g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    g_hObjHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    HWINEVENTHOOK desktopHook = SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH,
+        EVENT_SYSTEM_DESKTOPSWITCH, nullptr, WinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-	g_hDesktopHook = SetWinEventHook(
-		EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH,
-		NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-	);
+    SetEvent(ready);
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (g_hSysHook) UnhookWinEvent(g_hSysHook);
+    if (g_hObjHook) UnhookWinEvent(g_hObjHook);
+    if (desktopHook) UnhookWinEvent(desktopHook);
+    RestoreAllSealedWindows();
+    g_hLassoCoordinator = nullptr;
+    winrt::uninit_apartment();
+    return 0;
+}
 
-	if (g_hDesktopHook) UnhookWinEvent(g_hDesktopHook);
+int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Global\\MyWindowManagerUniqueMutex_12345");
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (mutex) CloseHandle(mutex);
+        return 0;
+    }
+    // Initialize DPI before any UI-dependent work.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-	// 7. 标准消息循环 (驱动 WinEventProc 的核心)
-	MSG msg;
-	while (GetMessageW(&msg, NULL, 0, 0)) {
-		TranslateMessage(&msg);
-		DispatchMessageW(&msg);
-	}
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE worker = ready ? CreateThread(nullptr, 0, CoordinatorThreadProc, ready, 0, nullptr) : nullptr;
+    if (!worker || WaitForSingleObject(ready, 15000) != WAIT_OBJECT_0 || !g_hLassoCoordinator) {
+        if (worker) {
+            WaitForSingleObject(worker, INFINITE);
+            CloseHandle(worker);
+        }
+        if (ready) CloseHandle(ready);
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return 1;
+    }
+    CloseHandle(ready);
 
-	// 8. 退出清理 (仅清理本进程的事件钩子)
-	if (g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
-	if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
-	if (g_hSysHook) UnhookWinEvent(g_hSysHook);
-	if (g_hObjHook) UnhookWinEvent(g_hObjHook);
+    g_hKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyProc, hInst, 0);
+    g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hInst, 0);
+    if (!g_hKeyHook || !g_hMouseHook) {
+        if (g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
+        if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
+        PostMessageW(g_hLassoCoordinator, WM_CLOSE, 0, 0);
+        WaitForSingleObject(worker, INFINITE);
+        CloseHandle(worker);
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return 1;
+    }
 
-	// =========================================================================
-	// 【核心新增】：程序退出时释放并关闭互斥量句柄
-	// =========================================================================
-	ReleaseMutex(hMutex);
-	CloseHandle(hMutex);
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
 
-	// 【核心改造】程序退出前，优雅释放、销毁当前主线程的 COM 环境
-	winrt::uninit_apartment();
-
-	return 0;
+    UnhookWindowsHookEx(g_hKeyHook);
+    UnhookWindowsHookEx(g_hMouseHook);
+    if (g_hLassoCoordinator) PostMessageW(g_hLassoCoordinator, WM_CLOSE, 0, 0);
+    WaitForSingleObject(worker, INFINITE);
+    CloseHandle(worker);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return 0;
 }
