@@ -37,10 +37,23 @@ jobs:
         run: |
           ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
           exit $LASTEXITCODE
+      - name: Compile Explorer companion with Windhawk
+        id: windhawk
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'windhawk_setup.exe'
+          $windhawk = Join-Path $env:RUNNER_TEMP 'windhawk'
+          $compiler = Join-Path $env:RUNNER_TEMP 'compile-windhawk-mod.py'
+          Invoke-WebRequest 'https://github.com/ramensoftware/windhawk/releases/download/v1.7.3/windhawk_setup.exe' -OutFile $installer
+          $install = Start-Process $installer -ArgumentList @('/S', '/PORTABLE', "/D=$windhawk") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Windhawk extraction failed ($($install.ExitCode))" }
+          Invoke-WebRequest 'https://raw.githubusercontent.com/ramensoftware/windhawk-mods/5abbcc2ff02fe80a9b46afedbf3f6474f1169f65/scripts/compile_mod.py' -OutFile $compiler
+          python $compiler -w $windhawk -f windhawk/lasso-uwp-taskbar-buttons.wh.cpp -o32 "$env:RUNNER_TEMP/mod32.dll" -o64 "$env:RUNNER_TEMP/mod64.dll" -oarm64 "$env:RUNNER_TEMP/modarm64.dll"
+          exit $LASTEXITCODE
       - name: Write Markdown report and Actions summary
         if: always()
         run: |
-          ./test/write_report.ps1 -Configure '${{ steps.configure.outcome }}' -Build '${{ steps.build.outcome }}' -Test '${{ steps.ctest.outcome }}'
+          ./test/write_report.ps1 -Configure '${{ steps.configure.outcome }}' -Build '${{ steps.build.outcome }}' -Test '${{ steps.ctest.outcome }}' -Windhawk '${{ steps.windhawk.outcome }}'
       - name: Preserve report and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
