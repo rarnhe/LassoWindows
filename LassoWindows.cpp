@@ -278,7 +278,7 @@ static void ShowWin11NativeNotification(const std::wstring& title, const std::ws
 }
 
 // 任务栏图标相关
-#define PROP_ORIGINAL_APPID L"MTU_ORIGINAL_APPID"
+static constexpr wchar_t PROP_ORIGINAL_APPID[] = L"MTU_ORIGINAL_APPID";
 
 /**
  * 获取窗口原始图标并持久化到窗口属性中
@@ -653,7 +653,7 @@ static bool CanUnsealOnCurrentDesktop(HWND h) {
 
 // 事件监控相关
 // --- 全局配置与状态 ---
-#define TIMER_ID_COLLECT 1001
+static constexpr UINT_PTR TIMER_ID_COLLECT = 1001;
 bool g_InSnapWindows = false;
 // 全局句柄
 HHOOK g_hKeyHook = NULL;
@@ -912,7 +912,7 @@ std::wstring GetRealProcessName(HWND hwnd) {
 
 // Alt release collects only locally tagged windows. Other desktops are never
 // activated or shown as a side-effect of choosing an application.
-void CALLBACK OnCollectTimer(HWND hwnd, UINT, UINT_PTR idEvent, DWORD) {
+static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
     KillTimer(hwnd, idEvent);
     if (!g_InSnapWindows) return;
 
@@ -1360,7 +1360,7 @@ BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
 	if (GetWindow(hWnd, GW_OWNER) != nullptr) return TRUE;
 
 	// 4. 精准计算外框渲染物理矩形（剔除 Win10/11 阴影）
-	RECT winRect;
+	RECT winRect{};
 	if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &winRect, sizeof(winRect)))) {
 		if (!GetPhysicalRect(hWnd, &winRect)) return TRUE;
 	}
@@ -1879,7 +1879,7 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         return 0;
     case WM_TIMER:
         if (wp == TIMER_ID_COLLECT) {
-            OnCollectTimer(hwnd, msg, wp, GetTickCount());
+            OnCollectTimer(hwnd, wp);
             return 0;
         }
         break;
