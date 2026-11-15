@@ -146,6 +146,24 @@ void run(const std::string& name) {
         CHECK(!GetPropW(frame, L"MTU_PROC_TAG"));
         return;
     }
+    if (name == "desktop_guid_roundtrip") {
+        Window w;
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        GUID desktop{};
+        CHECK(SUCCEEDED(CLSIDFromString(L"{83FA8748-A4C9-4470-8C7A-E57AA32D85F9}", &desktop)));
+        CHECK(SealWindow(w, L"desktop-guid-fixture.exe", desktop));
+        const auto property = GetPropW(w, L"MTU_VD_TAG");
+        CHECK(property);
+        GUID restored{};
+        CHECK(ReadTaggedDesktopGuid(w, restored) && IsEqualGUID(desktop, restored));
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        CHECK(GetPropW(w, L"MTU_VD_TAG") == property);
+        CHECK(HideWindowAndHideTaskbarIcon(w));
+        CHECK(ReadTaggedDesktopGuid(w, restored) && IsEqualGUID(desktop, restored));
+        CHECK(ShowWindowAndShowTaskbarIcon(w));
+        CHECK(!GetPropW(w, L"MTU_VD_TAG"));
+        return;
+    }
     if (name == "cross_desktop_win_c") {
         Window current, selected, otherDesktop, inactive, otherProcess, invalidProcess, oldDesktopName;
         const GUID deskA{1}, deskB{2};
