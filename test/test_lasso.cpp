@@ -1,6 +1,6 @@
 #include <iostream>
 #include <stdexcept>
-// Compile the actual implementation; console main never calls WinMain or installs hooks.
+// Compile the application implementation for both named tests and manual runs.
 #include "../LassoWindows.cpp"
 #define CHECK(x) do { if (!(x)) throw std::runtime_error(#x); } while(false)
 
@@ -48,7 +48,52 @@ void iniTest(const std::string& name) {
     CHECK(GetIconResourceFromIni(actual, index) == result);
     CHECK(actual == expected); CHECK(index == expectedIndex);
 }
+static void testBackgroundStartup() {
+    wchar_t executable[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    CHECK(length > 0 && length < MAX_PATH);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    // Launch the same no-argument entry point used for desktop validation.
+    CHECK(CreateProcessW(executable, nullptr, nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child));
+    winrt::handle process{child.hProcess};
+    winrt::handle thread{child.hThread};
+    try {
+        HWND coordinator = nullptr;
+        const auto deadline = GetTickCount64() + 10000;
+        while (GetTickCount64() < deadline) {
+            CHECK(WaitForSingleObject(process.get(), 50) == WAIT_TIMEOUT);
+            HWND candidate = FindWindowExW(HWND_MESSAGE, nullptr, L"LassoWindowsCoordinator", nullptr);
+            DWORD owner = 0;
+            if (candidate) GetWindowThreadProcessId(candidate, &owner);
+            if (owner == child.dwProcessId) {
+                coordinator = candidate;
+                break;
+            }
+        }
+        CHECK(coordinator);
+        DWORD_PTR reply = 0;
+        CHECK(SendMessageTimeoutW(coordinator, WM_NULL, 0, 0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, &reply));
+        CHECK(WaitForSingleObject(process.get(), 500) == WAIT_TIMEOUT);
+        CHECK(PostThreadMessageW(child.dwThreadId, WM_QUIT, 0, 0));
+        CHECK(WaitForSingleObject(process.get(), 5000) == WAIT_OBJECT_0);
+        DWORD exitCode = 1;
+        CHECK(GetExitCodeProcess(process.get(), &exitCode) && exitCode == 0);
+    } catch (...) {
+        if (WaitForSingleObject(process.get(), 0) == WAIT_TIMEOUT) {
+            TerminateProcess(process.get(), 1);
+            WaitForSingleObject(process.get(), 1000);
+        }
+        throw;
+    }
+}
+
 void run(const std::string& name) {
+    if (name == "background_startup") { testBackgroundStartup(); return; }
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
     if (name == "invalid_process") {
         CHECK(GetProcessNameByPid(0).empty());
@@ -254,7 +299,15 @@ void run(const std::string& name) {
     } else throw std::runtime_error("unknown case");
 }
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc == 1) {
+        const int result = RunBackground(GetModuleHandleW(nullptr), false);
+        if (result != 0) std::cerr << "LassoWindows background startup failed\n";
+        return result;
+    }
+    if (argc != 2) {
+        std::cerr << "Usage: lasso_tests.exe [test-case]\n";
+        return 2;
+    }
     try { run(argv[1]); std::cout << "PASS: " << argv[1] << '\n'; return 0; }
     catch (const std::exception& e) { std::cerr << "FAIL: " << argv[1] << ": " << e.what() << '\n'; return 1; }
 }
