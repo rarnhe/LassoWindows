@@ -595,6 +595,33 @@ bool IsWindowOnCurrentVirtualDesktop(HWND hWnd) {
 	return (SUCCEEDED(hr) && isOnCurrent);
 }
 
+// Opt-in tracing for interactive reproduction. Never include window titles.
+static bool AltTabDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"LASSO_ALT_TAB_DIAGNOSTICS", value,
+            static_cast<DWORD>(std::size(value))) == 1 && value[0] == L'1';
+    }();
+    return enabled;
+}
+
+static std::wstring DiagnosticGuid(const GUID* id) {
+    wchar_t value[40]{};
+    return id && StringFromGUID2(*id, value, static_cast<int>(std::size(value)))
+        ? value : L"<unavailable>";
+}
+
+static void TraceAltTab(const wchar_t* stage, HWND window, const wchar_t* reason,
+                        const GUID* current = nullptr, const GUID* tagged = nullptr,
+                        const GUID* actual = nullptr, DWORD detail = 0) {
+    if (!AltTabDiagnosticsEnabled()) return;
+    wchar_t line[512]{};
+    swprintf_s(line, L"[Lasso AltTab] %ls hwnd=%p result=%ls current=%ls tag=%ls actual=%ls detail=0x%08lX\n",
+        stage, static_cast<void*>(window), reason, DiagnosticGuid(current).c_str(),
+        DiagnosticGuid(tagged).c_str(), DiagnosticGuid(actual).c_str(), detail);
+    OutputDebugStringW(line);
+}
+
 // Desktop membership is an identity, not a user-editable desktop name.
 // We store the official GUID as a string Atom in MTU_VD_TAG. Existing name
 // tags intentionally fail closed: an unrecognized desktop is never unsealed.
@@ -1017,21 +1044,31 @@ static bool GetCurrentDesktopGuid(GUID& desktop) {
         GetWindowDesktopGuid(foreground, id, true) &&
         !IsEqualGUID(id, pinnedApp) && !IsEqualGUID(id, pinnedWindow)) {
         desktop = id;
+        TraceAltTab(L"desktop", foreground, L"foreground", &desktop);
         return true;
     }
 
     constexpr wchar_t key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
-    if (ReadDesktopRegistryGuid(key, L"CurrentVirtualDesktop", desktop)) return true;
+    if (ReadDesktopRegistryGuid(key, L"CurrentVirtualDesktop", desktop)) {
+        TraceAltTab(L"desktop", foreground, L"explorer-registry", &desktop);
+        return true;
+    }
 
     DWORD session = 0;
     if (ProcessIdToSessionId(GetCurrentProcessId(), &session)) {
         wchar_t sessionKey[128]{};
         swprintf_s(sessionKey, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\%lu\\VirtualDesktops",
             session);
-        if (ReadDesktopRegistryGuid(sessionKey, L"CurrentVirtualDesktop", desktop)) return true;
+        if (ReadDesktopRegistryGuid(sessionKey, L"CurrentVirtualDesktop", desktop)) {
+            TraceAltTab(L"desktop", foreground, L"session-registry", &desktop);
+            return true;
+        }
     }
     // The only listed desktop is necessarily current if there is exactly one.
-    return ReadDesktopRegistryGuid(key, L"VirtualDesktopIDs", desktop);
+    const bool singleDesktop = ReadDesktopRegistryGuid(key, L"VirtualDesktopIDs", desktop);
+    TraceAltTab(L"desktop", foreground, singleDesktop ? L"single-desktop" : L"unavailable",
+        singleDesktop ? &desktop : nullptr);
+    return singleDesktop;
 }
 
 using ReadCurrentDesktop = bool(*)(GUID&);
@@ -1057,9 +1094,14 @@ struct CloseFilter {
 static bool SetSealTag(HWND h, const wchar_t* property, const wchar_t* value) {
     const auto old = GetPropW(h, property);
     const ATOM atom = GlobalAddAtomW(value);
-    if (!atom) return false;
+    if (!atom) {
+        TraceAltTab(L"GlobalAddAtomW", h, property, nullptr, nullptr, nullptr, GetLastError());
+        return false;
+    }
     if (!SetPropW(h, property, reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(atom)))) {
+        const DWORD error = GetLastError();
         GlobalDeleteAtom(atom);
+        TraceAltTab(L"SetPropW", h, property, nullptr, nullptr, nullptr, error);
         return false;
     }
     if (old) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(old)));
@@ -1084,7 +1126,21 @@ static bool SealWindow(HWND h, const std::wstring& process, REFGUID desktop) {
         if (!tracked) g_sealedWindowStates.erase(h);
         return false;
     }
+    GUID tagged{};
+    const bool readTag = ReadTaggedDesktopGuid(h, tagged);
+    if (AltTabDiagnosticsEnabled()) {
+        TraceAltTab(L"seal", h, readTag && IsEqualGUID(tagged, desktop) &&
+            _wcsicmp(ReadTaggedProcess(h).c_str(), process.c_str()) == 0
+                ? L"tags-read-back" : L"tag-readback-mismatch",
+            nullptr, readTag ? &tagged : nullptr, &desktop);
+    }
+    if (!readTag || !IsEqualGUID(tagged, desktop)) {
+        TraceAltTab(L"seal", h, L"seal-aborted-invalid-desktop-tag");
+        ShowWindowAndShowTaskbarIcon(h);
+        return false;
+    }
     if (!HideWindowAndHideTaskbarIcon(h)) {
+        TraceAltTab(L"seal", h, L"hide-failed");
         ShowWindowAndShowTaskbarIcon(h);
         return false;
     }
@@ -1120,6 +1176,7 @@ BOOL CALLBACK EnumHideWindowsProc(HWND h, LPARAM lParam) {
 
     GUID desktop{};
     if (filter->readDesktop(h, desktop, false)) SealWindow(h, filter->process, desktop);
+    else TraceAltTab(L"seal", h, L"window-desktop-unavailable");
     return TRUE;
 }
 
@@ -1233,9 +1290,22 @@ void SuppressWinKeyMenuModern() {
 bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurrentDesktopGuid) {
     // Repeated Tab advances the native switcher without rebuilding the preview.
     if (g_InSnapWindows) return true;
-    if (g_sealedWindowStates.empty()) return false;
+    if (AltTabDiagnosticsEnabled()) {
+        EnumWindows([](HWND h, LPARAM) -> BOOL {
+            if (GetPropW(h, L"MTU_PROC_TAG") && !g_sealedWindowStates.contains(h))
+                TraceAltTab(L"preview", h, L"tagged-without-snapshot");
+            return TRUE;
+        }, 0);
+    }
+    if (g_sealedWindowStates.empty()) {
+        TraceAltTab(L"preview", nullptr, L"no-sealed-windows");
+        return false;
+    }
     GUID currentDesktop{};
-    if (!readCurrentDesktop(currentDesktop) || IsEqualGUID(currentDesktop, GUID{})) return false;
+    if (!readCurrentDesktop(currentDesktop) || IsEqualGUID(currentDesktop, GUID{})) {
+        TraceAltTab(L"preview", nullptr, L"current-desktop-unavailable");
+        return false;
+    }
     g_altTabPreviewDesktop = currentDesktop;
     std::vector<HWND> candidates;
     for (const auto& entry : g_sealedWindowStates) candidates.push_back(entry.first);
@@ -1243,15 +1313,26 @@ bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurren
     // Show events generated by the preview must not immediately re-seal it.
     g_InSnapWindows = true;
     for (HWND h : candidates) {
-        if (!IsOriginalWindowEligibleForPreview(h) ||
-            !TaggedDesktopMatches(h, currentDesktop) ||
-            !IsIdentifiedProcess(ReadTaggedProcess(h))) continue;
-        // A window moved by the user may still carry the previous GUID.
-        // Respect an explicit Shell cloak without querying each sealed HWND via COM.
+        GUID tagged{};
+        const wchar_t* result = nullptr;
         DWORD cloak = 0;
-        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
-            (cloak & DWM_CLOAKED_SHELL)) continue;
-        if (ShowWindowAndShowTaskbarIcon(h, true)) g_snapUnhiddenWindows.push_back(h);
+        if (!IsOriginalWindowEligibleForPreview(h)) result = L"window-ineligible";
+        else if (!ReadTaggedDesktopGuid(h, tagged)) result = L"invalid-desktop-tag";
+        else if (!IsEqualGUID(tagged, currentDesktop)) result = L"desktop-mismatch";
+        else if (!IsIdentifiedProcess(ReadTaggedProcess(h))) result = L"invalid-process-tag";
+        else if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
+            (cloak & DWM_CLOAKED_SHELL)) result = L"shell-cloaked";
+        else if (ShowWindowAndShowTaskbarIcon(h, true)) {
+            g_snapUnhiddenWindows.push_back(h);
+            result = L"restored";
+        } else result = L"restore-failed";
+
+        if (AltTabDiagnosticsEnabled()) {
+            GUID actual{};
+            const bool readActual = GetWindowDesktopGuid(h, actual);
+            TraceAltTab(L"preview", h, result, &currentDesktop,
+                IsEqualGUID(tagged, GUID{}) ? nullptr : &tagged, readActual ? &actual : nullptr, cloak);
+        }
     }
     g_InSnapWindows = !g_snapUnhiddenWindows.empty();
     if (!g_InSnapWindows) g_altTabPreviewDesktop = GUID{};
@@ -1259,7 +1340,9 @@ bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurren
         // Let the restored windows paint before the native switcher captures them.
         for (HWND h : g_snapUnhiddenWindows)
             RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
-        DwmFlush();
+        const HRESULT flushResult = DwmFlush();
+        TraceAltTab(L"preview", nullptr, L"DwmFlush", &currentDesktop,
+            nullptr, nullptr, static_cast<DWORD>(flushResult));
     }
     return g_InSnapWindows;
 }
@@ -1291,8 +1374,13 @@ static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDeskt
         if (!g_sealedWindowStates.contains(h)) continue;
         if (keepProcess && TaggedDesktopMatches(h, currentDesktop) &&
             _wcsicmp(ReadTaggedProcess(h).c_str(), selectedProcess.c_str()) == 0 &&
-            ShowWindowAndShowTaskbarIcon(h)) continue;
-        HideWindowAndHideTaskbarIcon(h);
+            ShowWindowAndShowTaskbarIcon(h)) {
+            TraceAltTab(L"collect", h, L"kept", &currentDesktop);
+            continue;
+        }
+        const bool resealed = HideWindowAndHideTaskbarIcon(h);
+        TraceAltTab(L"collect", h, resealed ? L"resealed" : L"reseal-failed",
+            &currentDesktop, &g_altTabPreviewDesktop);
     }
     g_snapUnhiddenWindows.clear();
     g_altTabPreviewDesktop = GUID{};
@@ -1944,7 +2032,10 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         const bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         const auto count = static_cast<UINT>(BuildAltTabInput(input, altDown, shiftDown, wp != 0));
-        if (SendInput(count, input, sizeof(INPUT)) != count) ExecuteCollectRestore();
+        const UINT sent = SendInput(count, input, sizeof(INPUT));
+        TraceAltTab(L"replay", nullptr, sent == count ? L"sent" : L"short-write",
+            nullptr, nullptr, nullptr, sent);
+        if (sent != count) ExecuteCollectRestore();
         else if (!altDown) ScheduleAltTabCollect(hwnd);
         else KillTimer(hwnd, TIMER_ID_COLLECT);
         return 0;
