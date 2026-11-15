@@ -164,6 +164,60 @@ void run(const std::string& name) {
         CHECK(!GetPropW(w, L"MTU_VD_TAG"));
         return;
     }
+    if (name == "alt_tab_consecutive_previews") {
+        Window preview, otherApp, coordinator;
+        ShowWindow(preview, SW_SHOWNOACTIVATE);
+        ShowWindow(otherApp, SW_SHOWNOACTIVATE);
+        const GUID desktop{1};
+        CHECK(SealWindow(preview, L"sealed-fixture.exe", desktop));
+        const HANDLE procTag = GetPropW(preview, L"MTU_PROC_TAG");
+        const HANDLE desktopTag = GetPropW(preview, L"MTU_VD_TAG");
+        CHECK(procTag && desktopTag);
+        auto currentDesktop = +[](GUID& id) { id = GUID{1}; return true; };
+        g_hLassoCoordinator = coordinator;
+        auto checkSealed = [&] {
+            CHECK(GetPropW(preview, L"MTU_PROC_TAG") == procTag);
+            CHECK(GetPropW(preview, L"MTU_VD_TAG") == desktopTag);
+            CHECK(ReadTaggedProcess(preview) == L"sealed-fixture.exe");
+            CHECK(TaggedDesktopMatches(preview, desktop));
+            CHECK(g_sealedWindowStates.contains(preview.h));
+            CHECK(IsWindowVisible(preview));
+            CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+            BYTE alpha = 255;
+            DWORD flags = 0;
+            CHECK(GetLayeredWindowAttributes(preview, nullptr, &alpha, &flags));
+            CHECK((flags & LWA_ALPHA) && alpha == 0);
+        };
+
+        CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
+        CHECK(g_snapUnhiddenWindows == std::vector<HWND>{preview.h});
+        FinishAltTabPreview(otherApp, currentDesktop);
+        CHECK(!g_InSnapWindows);
+        checkSealed();
+
+        CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
+        CHECK(!(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        ScheduleAltTabCollect(coordinator);
+        CHECK(g_altTabNextCollectAt);
+        // The next chord arrives before the first release's queued timer.
+        CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
+        CHECK(!g_altTabNextCollectAt);
+        OnCollectTimer(coordinator, TIMER_ID_COLLECT);
+        CHECK(g_InSnapWindows && g_snapUnhiddenWindows == std::vector<HWND>{preview.h});
+        CHECK(!(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+
+        ExecuteCollectRestore();
+        CHECK(!g_InSnapWindows);
+        checkSealed();
+
+        CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
+        FinishAltTabPreview(preview, currentDesktop);
+        CHECK(!g_InSnapWindows && IsWindowVisible(preview));
+        CHECK(!GetPropW(preview, L"MTU_PROC_TAG") && !GetPropW(preview, L"MTU_VD_TAG"));
+        CHECK(!g_sealedWindowStates.contains(preview.h));
+        g_hLassoCoordinator = nullptr;
+        return;
+    }
     if (name == "cross_desktop_win_c") {
         Window current, selected, otherDesktop, inactive, otherProcess, invalidProcess, oldDesktopName;
         const GUID deskA{1}, deskB{2};

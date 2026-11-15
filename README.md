@@ -41,11 +41,11 @@ IconResource=C:\Windows\System32\shell32.dll,3
 - `seal / tags-read-back` 表示标签已读回。`tag` 与此处的 `actual` 应相同。
 - `SetPropW` 或 `GlobalAddAtomW` 记录写入失败及错误码。`preview / tagged-without-snapshot` 表示窗口仍有标签，但本次运行缺少样式快照。
 - `desktop` 记录当前桌面 GUID 来源。`preview` 记录标签、实时窗口桌面 GUID，以及跳过或恢复的原因。
-- `replay / short-write` 表示 Windows 接收的模拟输入少于预期。`collect` 记录松键后的解封和重新封印结果。
+- `replay / short-write` 表示 Windows 接收的模拟输入少于预期。`collect` 记录松键后的解封和重新封印结果。连续两轮复现时，可对照同一个 `hwnd` 的 `collect / resealed` 和下一轮 `preview`，检查标签是否相同。
 
 ## 自动测试与双轨报告
 
-测试位于独立的 `test/` 目录，通过 CTest 驱动 36 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
+测试位于独立的 `test/` 目录，通过 CTest 驱动 37 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
 
 ```powershell
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml

@@ -683,7 +683,14 @@ static bool CanUnsealOnCurrentDesktop(HWND h, ReadWindowDesktop readDesktop = Ge
 // --- 全局配置与状态 ---
 static constexpr UINT_PTR TIMER_ID_COLLECT = 1001;
 bool g_InSnapWindows = false;
+static ULONGLONG g_altTabNextCollectAt = 0;
 static ULONGLONG g_altTabCollectDeadline = 0;
+
+static void CancelAltTabCollectTimer(HWND hwnd) {
+    if (hwnd) KillTimer(hwnd, TIMER_ID_COLLECT);
+    g_altTabNextCollectAt = 0;
+    g_altTabCollectDeadline = 0;
+}
 // 全局句柄
 HHOOK g_hKeyHook = NULL;
 HHOOK g_hMouseHook = NULL;
@@ -857,16 +864,29 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     return true;
 }
 
-bool HideWindowAndHideTaskbarIcon(HWND h) {
+bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
     if (!SnapshotWindowState(h)) return false;
+    auto& original = g_sealedWindowStates.at(h);
     LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    // Give Explorer the same visibility transition on re-seal as on preview.
+    // Do it only for a live preview so the initial cross-desktop seal never shows a window.
+    if (afterPreview && IsWindowVisible(h) && !IsIconic(h) && !(exStyle & WS_EX_TOOLWINDOW) &&
+        SetWindowPresented(h, false)) original.hiddenByLasso = true;
+
     exStyle &= ~WS_EX_APPWINDOW;
     exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
     SetLastError(ERROR_SUCCESS);
-    if (!SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle) && GetLastError() != ERROR_SUCCESS)
-        return false;
-    if (!SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA)) return false;
-    SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
+    const bool styleChanged =
+        SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle) != 0 || GetLastError() == ERROR_SUCCESS;
+    const bool transparent = styleChanged && SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    if (styleChanged)
+        SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
+
+    if (afterPreview && original.hiddenByLasso) {
+        if (!IsWindowVisible(h) && !SetWindowPresented(h, true)) return false;
+        original.hiddenByLasso = false;
+    }
+    if (!transparent) return false;
     UpdateTaskbarButton(h, false);
     return true;
 }
@@ -1074,16 +1094,20 @@ static bool GetCurrentDesktopGuid(GUID& desktop) {
 using ReadCurrentDesktop = bool(*)(GUID&);
 static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDesktop = GetCurrentDesktopGuid);
 static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
-    KillTimer(hwnd, idEvent);
-    if (!g_InSnapWindows) return;
+    // KillTimer does not remove WM_TIMER messages already in the queue.
+    // Ignore them until the current Alt release has actually armed collection.
+    const auto now = GetTickCount64();
+    if (!g_InSnapWindows || !g_altTabNextCollectAt || now < g_altTabNextCollectAt) return;
 
     HWND foreground = GetForegroundWindow();
-    if (IsSwitcherWindow(foreground)) {
-        if (GetTickCount64() >= g_altTabCollectDeadline ||
-            !SetTimer(hwnd, idEvent, 100, nullptr)) FinishAltTabPreview(nullptr);
+    const bool switcherActive = IsSwitcherWindow(foreground);
+    if (switcherActive && now < g_altTabCollectDeadline &&
+        SetTimer(hwnd, idEvent, 100, nullptr)) {
+        g_altTabNextCollectAt = now + 100;
         return;
     }
-    FinishAltTabPreview(foreground);
+    CancelAltTabCollectTimer(hwnd);
+    FinishAltTabPreview(switcherActive ? nullptr : foreground);
 }
 
 //realname一致的同类窗口处理
@@ -1320,12 +1344,19 @@ bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurren
         else if (!ReadTaggedDesktopGuid(h, tagged)) result = L"invalid-desktop-tag";
         else if (!IsEqualGUID(tagged, currentDesktop)) result = L"desktop-mismatch";
         else if (!IsIdentifiedProcess(ReadTaggedProcess(h))) result = L"invalid-process-tag";
-        else if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
-            (cloak & DWM_CLOAKED_SHELL)) result = L"shell-cloaked";
-        else if (ShowWindowAndShowTaskbarIcon(h, true)) {
-            g_snapUnhiddenWindows.push_back(h);
-            result = L"restored";
-        } else result = L"restore-failed";
+        else {
+            const bool shellCloaked =
+                SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
+                (cloak & DWM_CLOAKED_SHELL);
+            GUID actual{};
+            if (shellCloaked &&
+                (!GetWindowDesktopGuid(h, actual, true) || !IsEqualGUID(actual, currentDesktop))) {
+                result = L"shell-cloaked";
+            } else if (ShowWindowAndShowTaskbarIcon(h, true)) {
+                g_snapUnhiddenWindows.push_back(h);
+                result = shellCloaked ? L"restored-after-shell-cloak" : L"restored";
+            } else result = L"restore-failed";
+        }
 
         if (AltTabDiagnosticsEnabled()) {
             GUID actual{};
@@ -1378,9 +1409,13 @@ static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDeskt
             TraceAltTab(L"collect", h, L"kept", &currentDesktop);
             continue;
         }
-        const bool resealed = HideWindowAndHideTaskbarIcon(h);
-        TraceAltTab(L"collect", h, resealed ? L"resealed" : L"reseal-failed",
-            &currentDesktop, &g_altTabPreviewDesktop);
+        const bool resealed = HideWindowAndHideTaskbarIcon(h, true);
+        if (AltTabDiagnosticsEnabled()) {
+            GUID tagged{};
+            const bool readTag = ReadTaggedDesktopGuid(h, tagged);
+            TraceAltTab(L"collect", h, resealed ? L"resealed" : L"reseal-failed",
+                &g_altTabPreviewDesktop, readTag ? &tagged : nullptr);
+        }
     }
     g_snapUnhiddenWindows.clear();
     g_altTabPreviewDesktop = GUID{};
@@ -1388,14 +1423,26 @@ static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDeskt
 }
 
 void ExecuteCollectRestore() {
-    KillTimer(g_hLassoCoordinator, TIMER_ID_COLLECT);
+    CancelAltTabCollectTimer(g_hLassoCoordinator);
     FinishAltTabPreview(nullptr);
 }
 
 static void ScheduleAltTabCollect(HWND coordinator) {
     if (!g_InSnapWindows) return;
-    g_altTabCollectDeadline = GetTickCount64() + 3000;
+    const auto now = GetTickCount64();
+    g_altTabNextCollectAt = now + 150;
+    g_altTabCollectDeadline = now + 3000;
     if (!SetTimer(coordinator, TIMER_ID_COLLECT, 150, nullptr)) ExecuteCollectRestore();
+}
+
+static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
+                               ReadCurrentDesktop readCurrentDesktop = GetCurrentDesktopGuid) {
+    if (g_altTabNextCollectAt) {
+        // A new Alt chord arrived before the previous release was collected.
+        CancelAltTabCollectTimer(coordinator);
+        FinishAltTabPreview(IsSwitcherWindow(foreground) ? nullptr : foreground, readCurrentDesktop);
+    }
+    return TryUnHideWindowsForAltTab(readCurrentDesktop);
 }
 
 // ============================================================================
@@ -1431,8 +1478,13 @@ LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
         PostMessageW(coordinator, WM_LASSO_ESCAPE, 0, 0);
 
     if (up && !(key->flags & LLKHF_INJECTED) &&
-        (key->vkCode == VK_MENU || key->vkCode == VK_LMENU || key->vkCode == VK_RMENU))
-        PostMessageW(coordinator, WM_LASSO_ALT_UP, 0, 0);
+        (key->vkCode == VK_MENU || key->vkCode == VK_LMENU || key->vkCode == VK_RMENU)) {
+        const bool rightAlt = key->vkCode == VK_RMENU ||
+            (key->vkCode == VK_MENU && (key->flags & LLKHF_EXTENDED));
+        const int otherAlt = rightAlt ? VK_LMENU : VK_RMENU;
+        if (!(GetAsyncKeyState(otherAlt) & 0x8000))
+            PostMessageW(coordinator, WM_LASSO_ALT_UP, 0, 0);
+    }
 
     if (down && key->vkCode == 'C' && !(key->flags & LLKHF_INJECTED)) {
         bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
@@ -2027,7 +2079,7 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         HideOtherApplications(reinterpret_cast<HWND>(wp));
         return 0;
     case WM_LASSO_ALT_TAB: {
-        TryUnHideWindowsForAltTab();
+        BeginAltTabPreview(hwnd, GetForegroundWindow());
         INPUT input[6]{};
         const bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2037,11 +2089,11 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
             nullptr, nullptr, nullptr, sent);
         if (sent != count) ExecuteCollectRestore();
         else if (!altDown) ScheduleAltTabCollect(hwnd);
-        else KillTimer(hwnd, TIMER_ID_COLLECT);
+        else CancelAltTabCollectTimer(hwnd);
         return 0;
     }
     case WM_LASSO_ALT_UP:
-        if (!(GetAsyncKeyState(VK_MENU) & 0x8000)) ScheduleAltTabCollect(hwnd);
+        ScheduleAltTabCollect(hwnd);
         return 0;
     case WM_LASSO_ESCAPE:
         if (g_InSnapWindows) ExecuteCollectRestore();
