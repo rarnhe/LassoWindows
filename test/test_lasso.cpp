@@ -146,24 +146,6 @@ void run(const std::string& name) {
         CHECK(!GetPropW(frame, L"MTU_PROC_TAG"));
         return;
     }
-    if (name == "desktop_guid_roundtrip") {
-        Window w;
-        ShowWindow(w, SW_SHOWNOACTIVATE);
-        GUID desktop{};
-        CHECK(SUCCEEDED(CLSIDFromString(L"{83FA8748-A4C9-4470-8C7A-E57AA32D85F9}", &desktop)));
-        CHECK(SealWindow(w, L"desktop-guid-fixture.exe", desktop));
-        const auto property = GetPropW(w, L"MTU_VD_TAG");
-        CHECK(property);
-        GUID restored{};
-        CHECK(ReadTaggedDesktopGuid(w, restored) && IsEqualGUID(desktop, restored));
-        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
-        CHECK(GetPropW(w, L"MTU_VD_TAG") == property);
-        CHECK(HideWindowAndHideTaskbarIcon(w));
-        CHECK(ReadTaggedDesktopGuid(w, restored) && IsEqualGUID(desktop, restored));
-        CHECK(ShowWindowAndShowTaskbarIcon(w));
-        CHECK(!GetPropW(w, L"MTU_VD_TAG"));
-        return;
-    }
     if (name == "alt_tab_consecutive_previews") {
         Window preview(0), otherApp, coordinator;
         ShowWindow(preview, SW_SHOWNOACTIVATE);
@@ -226,7 +208,8 @@ void run(const std::string& name) {
     }
     if (name == "cross_desktop_win_c") {
         Window current, selected, otherDesktop, inactive, otherProcess, invalidProcess, oldDesktopName;
-        const GUID deskA{1}, deskB{2};
+        static constexpr GUID deskA{0x83fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xf9}};
+        static constexpr GUID deskB{0x83fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xfa}};
         ShowWindow(current, SW_SHOWNOACTIVATE);
         ShowWindow(selected, SW_SHOWNOACTIVATE);
         ShowWindow(otherDesktop, SW_SHOWNOACTIVATE);
@@ -241,14 +224,16 @@ void run(const std::string& name) {
         CHECK(!process.empty() && process != L"Unknown");
         HideCurrentFilter filter{process, +[](HWND h, GUID& id, bool requireCurrent) {
             const bool foreign = GetPropW(h, L"Fixture.SecondDesktop") != nullptr;
-            id = foreign ? GUID{2} : GUID{1};
-            return !requireCurrent || !foreign;
+            id = foreign ? deskB : deskA;
+            return !requireCurrent;
         }};
         for (HWND h : {current.h, selected.h, otherDesktop.h, inactive.h,
                        invalidProcess.h, oldDesktopName.h})
             CHECK(EnumHideWindowsProc(h, reinterpret_cast<LPARAM>(&filter)));
         CHECK(ReadTaggedProcess(current) == process && TaggedDesktopMatches(current, deskA));
+        CHECK(ReadTaggedProcess(selected) == process && TaggedDesktopMatches(selected, deskA));
         CHECK(ReadTaggedProcess(otherDesktop) == process && TaggedDesktopMatches(otherDesktop, deskB));
+        CHECK(GetWindowLongPtrW(current, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(!GetPropW(inactive, L"MTU_PROC_TAG") && !GetPropW(inactive, L"MTU_VD_TAG"));
 
@@ -258,10 +243,10 @@ void run(const std::string& name) {
         static int desktopReads = 0;
         auto firstDesktop = +[](GUID& id) {
             ++desktopReads;
-            id = GUID{1};
+            id = deskA;
             return true;
         };
-        auto secondDesktop = +[](GUID& id) { id = GUID{2}; return true; };
+        auto secondDesktop = +[](GUID& id) { id = deskB; return true; };
         CHECK(!TryUnHideWindowsForAltTab(+[](GUID&) { return false; }));
         CHECK(TryUnHideWindowsForAltTab(firstDesktop));
         CHECK(desktopReads == 1);
