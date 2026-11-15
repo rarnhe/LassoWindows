@@ -34,25 +34,16 @@ IconResource=C:\Windows\System32\shell32.dll,3
 
 解析使用最后一个逗号分隔路径与索引，支持负索引；索引无法转换时回退为 0。快捷方式已经存在时跳过创建，因此修改 INI 不会自动更新已有快捷方式。
 
-## Alt+Tab 诊断
-
-从 Visual Studio 启动 `LassoWindows.exe` 时，将调试环境变量 `LASSO_ALT_TAB_DIAGNOSTICS` 设为 `1`。测试前先退出已有实例。按一次 `Win+C` 封印普通窗口，立即按 `Alt+Tab`，再松开 Alt。在「输出」窗口的「调试」视图中查看 `[Lasso AltTab]`。
-
-- `seal / tags-read-back` 表示标签已读回。`tag` 与此处的 `actual` 应相同。
-- `SetPropW` 或 `GlobalAddAtomW` 记录写入失败及错误码。`preview / tagged-without-snapshot` 表示窗口仍有标签，但本次运行缺少样式快照。
-- `desktop` 记录当前桌面 GUID 来源。`preview` 记录标签、实时窗口桌面 GUID，以及跳过或恢复的原因。
-- `taskbar / add-failed` 记录窗口加入任务栏失败的 HRESULT。`replay / short-write` 表示 Windows 接收的模拟输入少于预期。`collect` 记录松键后的解封和重新封印结果。连续两轮复现时，可对照同一个 `hwnd` 的 `collect / resealed` 和下一轮 `preview`，检查标签是否相同。
-
 ## 自动测试与双轨报告
 
-测试位于独立的 `test/` 目录，通过 CTest 驱动 37 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
+测试位于独立的 `test/` 目录，通过 CTest 驱动 36 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
 
 ```powershell
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
 ./test/write_report.ps1
 ```
 
-覆盖 INI 正常/缺失/无效索引/含逗号路径、进程识别、窗口过滤、坐标与可见性、隐藏/恢复样式与透明度、自定义窗口样式/分层 Alpha/临时预览快照/回调上下文、压制条件、收网状态、图标缓存和主屏收集过滤；新增 GUID Atom 解析、旧名称标签拒绝、错误 GUID 拒绝，以及最小化/原本隐藏的窗口不被强行显示。
+覆盖 INI 正常/缺失/无效索引/含逗号路径、进程识别、窗口过滤、坐标与可见性、隐藏/恢复样式与透明度、自定义窗口样式/分层 Alpha/临时预览快照/回调上下文、压制条件、收网状态、图标缓存和主屏收集过滤；新增 GUID Atom 解析、旧名称标签拒绝、错误 GUID 拒绝，以及最小化/原本隐藏的窗口不被强行显示。跨桌面用例验证 `Win+C` 给各窗口写入其所在桌面的 GUID，并验证 `Alt+Tab` 只预览当前桌面的窗口。
 
 `.github/workflows/test_cpp.yml` 在 `windows-latest` 上构建应用与测试，响应 main 推送、指向 main 的 PR 和手动触发。参考 [xlsx2md](https://github.com/rarnhe/xlsx2md) 的报告方式：
 
