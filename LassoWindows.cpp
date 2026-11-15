@@ -1027,7 +1027,8 @@ static bool ReadDesktopRegistryGuid(const wchar_t* key, const wchar_t* value, GU
     return true;
 }
 
-static bool GetCurrentDesktopGuidFromForeground(GUID& desktop, HWND anchor) {
+static bool GetCurrentDesktopGuidFromForeground(GUID& desktop, HWND anchor,
+                                               ReadWindowDesktop readDesktop = GetWindowDesktopGuid) {
     // Explorer can update its registry value after the new desktop receives focus.
     // Prefer a regular foreground window when the public API can identify it.
     const HWND foreground = GetAncestor(anchor, GA_ROOT);
@@ -1039,10 +1040,24 @@ static bool GetCurrentDesktopGuidFromForeground(GUID& desktop, HWND anchor) {
         GetClassNameW(foreground, className, static_cast<int>(std::size(className))) &&
         wcscmp(className, L"Progman") != 0 && wcscmp(className, L"WorkerW") != 0 &&
         wcscmp(className, L"Shell_TrayWnd") != 0 && wcscmp(className, L"Shell_SecondaryTrayWnd") != 0 &&
-        GetWindowDesktopGuid(foreground, id, true) &&
+        readDesktop(foreground, id, true) &&
         !IsEqualGUID(id, pinnedApp) && !IsEqualGUID(id, pinnedWindow)) {
         desktop = id;
         return true;
+    }
+
+    // The foreground can be the Shell when this desktop's app windows are sealed.
+    // A live, matching seal can identify the current desktop before the registry catches up.
+    for (const auto& entry : g_sealedWindowStates) {
+        const HWND window = entry.first;
+        GUID tagged{};
+        if (!ReadTaggedDesktopGuid(window, tagged) || !IsIdentifiedProcess(ReadTaggedProcess(window)))
+            continue;
+        if (readDesktop(window, id, true) && IsEqualGUID(id, tagged) &&
+            !IsEqualGUID(id, pinnedApp) && !IsEqualGUID(id, pinnedWindow)) {
+            desktop = id;
+            return true;
+        }
     }
 
     constexpr wchar_t key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
@@ -1955,10 +1970,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 
 // A message-only window on a separate worker thread serializes COM, WinEvent,
 // taskbar and hide/restore work. Hook callbacks live on the main message thread.
-static void HideCurrentApplication(HWND foreground) {
+static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDesktop = GetWindowDesktopGuid,
+                                   bool (*isOnCurrentDesktop)(HWND) = IsWindowOnCurrentVirtualDesktop) {
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;
+    if (!root || !isOnCurrentDesktop(root)) return;
     wchar_t className[256]{};
     if (!GetClassNameW(root, className, 256)) return;
     // Never seal the Desktop, Shell/taskbar, or task-view UI.
@@ -1967,7 +1983,7 @@ static void HideCurrentApplication(HWND foreground) {
         wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
         IsSwitcherWindow(root)) return;
 
-    HideCurrentFilter filter{GetRealProcessName(root)};
+    HideCurrentFilter filter{GetRealProcessName(root), readDesktop};
     if (!IsIdentifiedProcess(filter.process)) {
         // A shared host cannot identify sibling windows from the same app.
         RequestHostedUwpClose(root);
