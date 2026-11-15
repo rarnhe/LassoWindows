@@ -676,6 +676,10 @@ static bool IsApplicationFrameWindow(HWND h) {
         wcscmp(name, L"ApplicationFrameWindow") == 0;
 }
 
+static bool RequestHostedUwpClose(HWND h) {
+    return IsApplicationFrameWindow(h) && PostMessageW(h, WM_CLOSE, 0, 0) != FALSE;
+}
+
 static bool SetWindowPresented(HWND h, bool visible) {
     return SetWindowPos(h, nullptr, 0, 0, 0, 0,
         WINDOW_FRAME_FLAGS | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW)) != FALSE;
@@ -687,21 +691,6 @@ static constexpr wchar_t PROP_UWP_DWM_CLOAK[] = L"LassoWindows.UwpDwmCloak";
 
 static bool SetDwmCloak(HWND h, BOOL cloak) {
     return SUCCEEDED(DwmSetWindowAttribute(h, DWMWA_CLOAK, &cloak, sizeof(cloak)));
-}
-
-static bool CloakApplicationFrame(HWND h) {
-    DWORD cloakFlags = 0;
-    if (FAILED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloakFlags, sizeof(cloakFlags))))
-        return false;
-    if (GetPropW(h, PROP_UWP_DWM_CLOAK))
-        return (cloakFlags & DWM_CLOAKED_APP) || SetDwmCloak(h, TRUE);
-
-    // Don't take ownership of an existing app, shell or inherited cloak.
-    if (cloakFlags || !SetPropW(h, PROP_UWP_DWM_CLOAK, reinterpret_cast<HANDLE>(UINT_PTR{1})))
-        return false;
-    if (SetDwmCloak(h, TRUE)) return true;
-    RemovePropW(h, PROP_UWP_DWM_CLOAK);
-    return false;
 }
 
 static bool RestoreApplicationFrameCloak(HWND h) {
@@ -723,23 +712,21 @@ struct SealedWindowState {
     bool hasLayerAttributes = false;
     bool wasVisible = false;
     bool wasIconic = false;
-    bool applicationFrame = false;
     bool hiddenByLasso = false;
 };
 static std::unordered_map<HWND, SealedWindowState> g_sealedWindowStates;
 
 static bool SnapshotWindowState(HWND h) {
-    if (!IsWindow(h)) return false;
+    if (!IsWindow(h) || IsApplicationFrameWindow(h)) return false;
     if (g_sealedWindowStates.contains(h)) return true;
     SealedWindowState state;
     state.exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
     state.wasVisible = IsWindowVisible(h) != FALSE;
     state.wasIconic = IsIconic(h) != FALSE;
-    state.applicationFrame = IsApplicationFrameWindow(h);
     if (!GetWindowPlacement(h, &state.placement)) return false;
     // If an existing layered window does not expose its original attributes,
     // leave it alone rather than rewriting its alpha and losing its content.
-    if (!state.applicationFrame && (state.exStyle & WS_EX_LAYERED)) {
+    if (state.exStyle & WS_EX_LAYERED) {
         if (!GetLayeredWindowAttributes(h, &state.colorKey, &state.alpha, &state.layerFlags))
             return false;
         state.hasLayerAttributes = true;
@@ -798,31 +785,23 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return false; }
 
     auto& original = it->second;
-    if (original.applicationFrame) {
-        if (!RestoreApplicationFrameCloak(h)) return false;
-    } else {
-        // Explorer must observe a hide/show transition to rediscover a
-        // former tool window before the native switcher enumerates windows.
-        const bool refreshButton = preview && IsWindowVisible(h) &&
-            (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) &&
-            !(original.exStyle & WS_EX_TOOLWINDOW);
-        if (refreshButton && SetWindowPresented(h, false))
-            original.hiddenByLasso = true;
+    // Let Explorer rediscover a former tool window before native Alt+Tab.
+    const bool refreshButton = preview && IsWindowVisible(h) &&
+        (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) &&
+        !(original.exStyle & WS_EX_TOOLWINDOW);
+    if (refreshButton && SetWindowPresented(h, false))
+        original.hiddenByLasso = true;
 
-        SetWindowLongPtrW(h, GWL_EXSTYLE, original.exStyle);
-        if (original.hasLayerAttributes)
-            SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
-        SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
-    }
+    SetWindowLongPtrW(h, GWL_EXSTYLE, original.exStyle);
+    if (original.hasLayerAttributes)
+        SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
+    SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
     if (original.hiddenByLasso) {
         if (!IsWindowVisible(h) && !SetWindowPresented(h, true)) return false;
         original.hiddenByLasso = false;
     }
-    if (original.applicationFrame) {
-        if (FAILED(uwp_taskbar::SetSwitcherVisibility(h, true))) return false;
-    } else if (original.wasVisible && IsWindowVisible(h) && !(original.exStyle & WS_EX_TOOLWINDOW)) {
+    if (original.wasVisible && IsWindowVisible(h) && !(original.exStyle & WS_EX_TOOLWINDOW))
         UpdateTaskbarButton(h, true);
-    }
     InvalidateRect(h, nullptr, TRUE);
     if (!preview) {
         ClearSealMarkers(h);
@@ -833,28 +812,12 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
 
 void HideWindowAndHideTaskbarIcon(HWND h) {
     if (!SnapshotWindowState(h)) return;
-    auto& original = g_sealedWindowStates.at(h);
-    if (original.applicationFrame) {
-        if (!original.wasVisible) return;
-
-        // The taskbar tracks the hosted view separately from the frame's
-        // visibility. Update Shell before hiding the HWND.
-        const HRESULT shellResult = uwp_taskbar::SetSwitcherVisibility(h, false);
-        if (IsWindowVisible(h) && !CloakApplicationFrame(h) && SetWindowPresented(h, false))
-            original.hiddenByLasso = true;
-        wchar_t message[128]{};
-        swprintf_s(message, L"LassoWindows: UWP Shell switcher exclusion for HWND %p: 0x%08lX\n",
-            static_cast<void*>(h), static_cast<unsigned long>(shellResult));
-        OutputDebugStringW(message);
-        if (SUCCEEDED(shellResult)) return;
-    } else {
-        LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
-        exStyle &= ~WS_EX_APPWINDOW;
-        exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
-        SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
-        SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-        SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
-    }
+    LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    exStyle &= ~WS_EX_APPWINDOW;
+    exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+    SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
+    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
     UpdateTaskbarButton(h, false);
 }
 
@@ -1014,7 +977,8 @@ static bool IsSwitcherWindow(HWND h) {
         wcsncmp(name, simpleSwitcher, std::size(simpleSwitcher) - 1) == 0;
 }
 
-static void FinishAltTabPreview(HWND winner);
+using CanUnsealWindow = bool(*)(HWND);
+static void FinishAltTabPreview(HWND winner, CanUnsealWindow canUnseal = CanUnsealOnCurrentDesktop);
 static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
     KillTimer(hwnd, idEvent);
     if (!g_InSnapWindows) return;
@@ -1033,12 +997,19 @@ struct CloseFilter {
     std::wstring currentAppProcName;
 };
 
+static constexpr wchar_t SHARED_UWP_HOST[] = L"ApplicationFrameHost.exe";
+
+struct HideCurrentFilter {
+    std::wstring process;
+    bool hostedUwp;
+};
+
 // 隐藏指定 App 进程名对应的窗口
 BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
 	if (!lParam) return FALSE;
 
-	const std::wstring& targetProcName = *(reinterpret_cast<const std::wstring*>(lParam));
-	if (targetProcName.empty()) return TRUE;
+	const auto& filter = *reinterpret_cast<const HideCurrentFilter*>(lParam);
+	const auto& targetProcName = filter.process;
 
 	// 基础过滤：仅处理可见顶级窗口
 	if (!IsWindow(hWnd) || !IsWindowVisible(hWnd) || GetParent(hWnd) != NULL) {
@@ -1050,9 +1021,15 @@ BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
 		return TRUE;
 	}
 
+	const bool hostedUwp = IsApplicationFrameWindow(hWnd);
+	if (hostedUwp != filter.hostedUwp) return TRUE;
 	std::wstring currentWndProcName = GetRealProcessName(hWnd);
 
 	if (_wcsicmp(targetProcName.c_str(), currentWndProcName.c_str()) == 0) {
+		if (hostedUwp) {
+			RequestHostedUwpClose(hWnd);
+			return TRUE;
+		}
 		wchar_t className[256] = { 0 };
 		if (GetClassNameW(hWnd, className, 256)) {
 			// Corner Case: explorer.exe 过滤
@@ -1123,6 +1100,13 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 
 	// 3. 核心逻辑：如果这个窗口【不属于】当前正在使用的 App
 	if (_wcsicmp(otherWndProcName.c_str(), currentAppProcName.c_str()) != 0) {
+		if (IsApplicationFrameWindow(hWnd)) {
+			if (_wcsicmp(currentAppProcName.c_str(), SHARED_UWP_HOST) != 0 &&
+				otherWndProcName != L"Unknown" &&
+				_wcsicmp(otherWndProcName.c_str(), SHARED_UWP_HOST) != 0)
+				RequestHostedUwpClose(hWnd);
+			return TRUE;
+		}
 
 		// --- 关键修正：仿照 EnumHideWindowsProc 的安全过滤 ---
 
@@ -1144,11 +1128,6 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 				}
 			}
 
-			// ---------------------------------------------------------------------
-			// 分支 B：处理 UWP 托管进程 (ApplicationFrameHost.exe / ApplicationFrameWindow)
-			// 核心修正：将其移出 explorer 作用域，在外层进行平级判定
-			// ---------------------------------------------------------------------
-			// Hosted UWP frames are hidden later by HideWindowAndHideTaskbarIcon.
 		}
 
 		// Validate reversible state before writing marker properties.
@@ -1241,7 +1220,7 @@ void SuppressWinKeyMenuModern() {
 // Alt+Tab 反隐藏及收网逻辑修正版（支持同进程多窗口统一解封与还原）
 // ============================================================================
 
-bool TryUnHideWindowsForAltTab() {
+bool TryUnHideWindowsForAltTab(CanUnsealWindow canUnseal = CanUnsealOnCurrentDesktop) {
     // Repeated Tab advances the native switcher without rebuilding the preview.
     if (g_InSnapWindows) return true;
     std::vector<HWND> candidates;
@@ -1251,7 +1230,7 @@ bool TryUnHideWindowsForAltTab() {
     g_InSnapWindows = true;
     for (HWND h : candidates) {
         if (!IsOriginalWindowEligibleForPreview(h) ||
-            ReadTaggedProcess(h).empty() || !CanUnsealOnCurrentDesktop(h)) continue;
+            ReadTaggedProcess(h).empty() || !canUnseal(h)) continue;
         if (ShowWindowAndShowTaskbarIcon(h, true)) g_snapUnhiddenWindows.push_back(h);
     }
     g_InSnapWindows = !g_snapUnhiddenWindows.empty();
@@ -1259,24 +1238,24 @@ bool TryUnHideWindowsForAltTab() {
     return g_InSnapWindows;
 }
 
-static void FinishAltTabPreview(HWND winner) {
+static void FinishAltTabPreview(HWND winner, CanUnsealWindow canUnseal) {
     if (!g_InSnapWindows) return;
 
     std::wstring chosenProcess;
-    if (winner && IsWindowOnCurrentVirtualDesktop(winner)) {
-        // A UWP frame can lose access to its child while in the switcher.
-        chosenProcess = ReadTaggedProcess(winner);
-        if (chosenProcess.empty()) chosenProcess = GetRealProcessName(winner);
+    if (winner) {
+        if (canUnseal(winner)) chosenProcess = ReadTaggedProcess(winner);
+        if (chosenProcess.empty() && IsWindowOnCurrentVirtualDesktop(winner))
+            chosenProcess = GetRealProcessName(winner);
     }
     if (!chosenProcess.empty() && chosenProcess != L"Unknown" &&
-        _wcsicmp(chosenProcess.c_str(), L"ApplicationFrameHost.exe") != 0) {
+        _wcsicmp(chosenProcess.c_str(), SHARED_UWP_HOST) != 0) {
         for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
             const HWND h = (it++)->first;
-            if (CanUnsealOnCurrentDesktop(h) &&
+            if (canUnseal(h) &&
                 _wcsicmp(chosenProcess.c_str(), ReadTaggedProcess(h).c_str()) == 0)
                 ShowWindowAndShowTaskbarIcon(h);
         }
-    } else if (winner && CanUnsealOnCurrentDesktop(winner)) {
+    } else if (winner && canUnseal(winner)) {
         ShowWindowAndShowTaskbarIcon(winner);
     }
     for (HWND h : g_snapUnhiddenWindows) {
@@ -1610,10 +1589,13 @@ bool IsHiddenWindowReallyVisiable(HWND hwnd) {
 	return (finalStyle & WS_VISIBLE) != 0;
 }
 
+static HWND g_taskViewWindow = nullptr;
+
 void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
     if (event == EVENT_OBJECT_DESTROY && idC == CHILDID_SELF) {
+        if (g_taskViewWindow == hwnd) g_taskViewWindow = nullptr;
         // A HWND can be recycled after destruction; never restore stale state
         // onto a different window that later receives the same handle value.
         g_sealedWindowStates.erase(hwnd);
@@ -1849,39 +1831,19 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 	// --- 3. 全局压制逻辑 ---
 	// 只要窗口显示且不在任务视图中，就检查是否持有标记
 	SuppressHiddenWindows(hwnd, event);
-	// --- 4. 任务视图监控：单次触发模式 ---
-	bool isTaskViewWindow = (className == L"XamlExplorerHostIslandWindow" && windowTitle == L"任务视图");
-	if (isTaskViewWindow) {
-		// 1. 尺寸过滤：排除鼠标悬停产生的微型预览窗口（Win10/11 悬停预览通常小于 500px）
-		RECT rc;
-		GetPhysicalRect(hwnd, &rc);
-		if ((rc.right - rc.left) < 500) return;
-		// 2. 识别“进入”或“在其中切换”的瞬间
-		// EVENT_OBJECT_SHOW: 任务视图刚打开
-		// EVENT_SYSTEM_FOREGROUND: 焦点切回任务视图
-		if (event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_FOREGROUND) {
-			// 3. 状态锁：确保在一次任务视图生命周期内只执行一次转移逻辑
-			if (!g_InSnapWindows) {
-				g_InSnapWindows = true;
-
-				// --- 执行 TODO：窗口转移逻辑 ---
-				// 这里调用你之后要实现的函数
-				// ExecuteWindowTransferByRules(); 
-
-				ShowWin11NativeNotification(L"待完成", L"Win+Tab可完成窗口转移");
-			}
-		}
-		if (event == EVENT_OBJECT_DESTROY) {
-			//退出任务视图的时候应该还是可以做点什么
-		}
-	}
-	else {
-		// 4. 关键：当焦点不再是任务视图窗口时，重置触发锁
-		// 这样下次用户再次按下 Win+Tab 时，逻辑可以再次触发
-		if (event == EVENT_SYSTEM_FOREGROUND) {
-			g_InSnapWindows = false;
-		}
-	}
+    // Win+Tab's notification is independent of the Alt+Tab preview session.
+    const bool isTaskViewWindow = className == L"XamlExplorerHostIslandWindow" &&
+        windowTitle == L"任务视图";
+    if (isTaskViewWindow && idC == CHILDID_SELF &&
+        (event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_FOREGROUND)) {
+        RECT rc{};
+        if (g_taskViewWindow != hwnd && GetPhysicalRect(hwnd, &rc) && rc.right - rc.left >= 500) {
+            g_taskViewWindow = hwnd;
+            ShowWin11NativeNotification(L"待完成", L"Win+Tab可完成窗口转移");
+        }
+    } else if (event == EVENT_SYSTEM_FOREGROUND) {
+        g_taskViewWindow = nullptr;
+    }
 }
 
 // A message-only window on a separate worker thread serializes COM, WinEvent,
@@ -1898,12 +1860,14 @@ static void HideCurrentApplication(HWND foreground) {
         wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
         IsSwitcherWindow(root)) return;
 
-    const std::wstring name = GetRealProcessName(root);
-    if (_wcsicmp(name.c_str(), L"ApplicationFrameHost.exe") == 0) {
-        // The shared host is not an application identity.
-        EnumHideWindowsProc(root, reinterpret_cast<LPARAM>(&name));
-    } else if (name != L"Unknown" && !name.empty()) {
-        EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&name));
+    HideCurrentFilter filter{GetRealProcessName(root), IsApplicationFrameWindow(root)};
+    const bool knownProcess = filter.process != L"Unknown" && !filter.process.empty();
+    if (filter.hostedUwp &&
+        (!knownProcess || _wcsicmp(filter.process.c_str(), SHARED_UWP_HOST) == 0)) {
+        // Close only the foreground frame when the business process is unknown.
+        RequestHostedUwpClose(root);
+    } else if (knownProcess) {
+        EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&filter));
     }
 }
 
