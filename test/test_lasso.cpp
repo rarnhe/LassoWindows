@@ -108,72 +108,88 @@ void run(const std::string& name) {
         CHECK(view.shown == 1 && !GetPropW(frame, property));
         return;
     }
-    if (name == "uwp_frame_visibility") {
+    if (name == "uwp_frame_close" || name == "uwp_frame_recovery") {
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = L"ApplicationFrameWindow";
         CHECK(RegisterClassW(&wc));
-
-        auto cloakFlags = [](HWND hwnd) {
-            DWORD flags = 0;
-            CHECK(SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &flags, sizeof(flags))));
-            return flags;
-        };
-
         Window frame(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
-        const LONG_PTR style = GetWindowLongPtrW(frame, GWL_EXSTYLE);
         ShowWindow(frame, SW_SHOWNOACTIVATE);
-        HideWindowAndHideTaskbarIcon(frame);
-        CHECK(IsWindow(frame) && IsWindowVisible(frame));
-        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
-        CHECK(GetPropW(frame, PROP_UWP_DWM_CLOAK));
-        CHECK(GetWindowLongPtrW(frame, GWL_EXSTYLE) == style);
-        CHECK(IsOriginalWindowEligibleForPreview(frame));
-        CHECK(ShowWindowAndShowTaskbarIcon(frame, true));
-        CHECK(!(cloakFlags(frame) & DWM_CLOAKED_APP));
-        CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
-        CHECK(IsWindowVisible(frame) && g_sealedWindowStates.contains(frame.h));
-        HideWindowAndHideTaskbarIcon(frame);
-        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
-        CHECK(ShowWindowAndShowTaskbarIcon(frame));
-        CHECK(!(cloakFlags(frame) & DWM_CLOAKED_APP));
-        CHECK(IsWindowVisible(frame) && !g_sealedWindowStates.contains(frame.h));
 
-        HideWindowAndHideTaskbarIcon(frame);
-        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
+        if (name == "uwp_frame_close") {
+            Window ordinary;
+            CHECK(!RequestHostedUwpClose(ordinary));
+            CHECK(!SnapshotWindowState(frame));
+            CHECK(RequestHostedUwpClose(frame));
+            CHECK(IsWindow(frame)); // PostMessage queues the request.
+            MSG message{};
+            CHECK(PeekMessageW(&message, frame, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+            CHECK(message.hwnd == frame.h && message.wParam == 0 && message.lParam == 0);
+            DispatchMessageW(&message);
+            CHECK(!IsWindow(frame));
+            CHECK(!g_sealedWindowStates.contains(frame.h));
+            return;
+        }
+
+        // A frame left cloaked by a previous Lasso version remains recoverable.
+        CHECK(SetDwmCloak(frame, TRUE));
+        CHECK(SetPropW(frame, PROP_UWP_DWM_CLOAK, reinterpret_cast<HANDLE>(UINT_PTR{1})));
         const ATOM proc = GlobalAddAtomW(L"uwp-fixture.exe");
         CHECK(proc);
         CHECK(SetPropW(frame, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(proc))));
-        g_sealedWindowStates.clear(); // The next process only sees the window properties.
         RecoverApplicationFrameState();
-        CHECK(!(cloakFlags(frame) & DWM_CLOAKED_APP));
+        DWORD cloak = 0;
+        CHECK(SUCCEEDED(DwmGetWindowAttribute(frame, DWMWA_CLOAKED, &cloak, sizeof(cloak))));
+        CHECK(!(cloak & DWM_CLOAKED_APP));
         CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
         CHECK(!GetPropW(frame, L"MTU_PROC_TAG"));
+        return;
+    }
+    if (name == "alt_tab_foreground_transition") {
+        Window selected, other, foreign;
+        GUID desktop{}, differentDesktop{};
+        CHECK(SUCCEEDED(CLSIDFromString(L"{10000000-0000-0000-0000-000000000001}", &desktop)));
+        CHECK(SUCCEEDED(CLSIDFromString(L"{10000000-0000-0000-0000-000000000002}", &differentDesktop)));
 
-        // A cloak installed by the window owner stays in place on restoration.
-        CHECK(SetDwmCloak(frame, TRUE));
-        HideWindowAndHideTaskbarIcon(frame);
-        CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
-        CHECK(!IsWindowVisible(frame));
-        CHECK(ShowWindowAndShowTaskbarIcon(frame));
-        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
-        CHECK(SetDwmCloak(frame, FALSE));
+        auto seal = [](HWND h, const wchar_t* process, REFGUID desktopId) {
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+            wchar_t guidText[40]{};
+            CHECK(StringFromGUID2(desktopId, guidText, static_cast<int>(std::size(guidText))));
+            const ATOM processAtom = GlobalAddAtomW(process);
+            const ATOM desktopAtom = GlobalAddAtomW(guidText);
+            CHECK(processAtom && desktopAtom);
+            CHECK(SetPropW(h, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(processAtom))));
+            CHECK(SetPropW(h, L"MTU_VD_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(desktopAtom))));
+            HideWindowAndHideTaskbarIcon(h);
+        };
+        seal(selected, L"selected-fixture.exe", desktop);
+        seal(other, L"other-fixture.exe", desktop);
+        seal(foreign, L"selected-fixture.exe", differentDesktop);
 
-        Window minimized(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
-        ShowWindow(minimized, SW_SHOWMINNOACTIVE);
-        CHECK(IsIconic(minimized));
-        HideWindowAndHideTaskbarIcon(minimized);
-        CHECK(cloakFlags(minimized) & DWM_CLOAKED_APP);
-        CHECK(!IsOriginalWindowEligibleForPreview(minimized));
-        CHECK(ShowWindowAndShowTaskbarIcon(minimized));
-        CHECK(IsIconic(minimized) && IsWindowVisible(minimized));
+        // CI has no interactive virtual desktop. Substitute its membership
+        // check while retaining the real seal, WinEvent, preview and collect.
+        auto onFixtureDesktop = +[](HWND h) {
+            GUID current{};
+            return SUCCEEDED(CLSIDFromString(L"{10000000-0000-0000-0000-000000000001}", &current)) &&
+                TaggedDesktopMatches(h, current);
+        };
+        CHECK(TryUnHideWindowsForAltTab(onFixtureDesktop));
+        CHECK(g_snapUnhiddenWindows.size() == 2);
+        CHECK(!(GetWindowLongPtrW(selected, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(GetWindowLongPtrW(foreign, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
-        Window hidden(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
-        HideWindowAndHideTaskbarIcon(hidden);
-        CHECK(!IsOriginalWindowEligibleForPreview(hidden));
-        CHECK(ShowWindowAndShowTaskbarIcon(hidden));
-        CHECK(!IsWindowVisible(hidden));
+        WinEventProc(nullptr, EVENT_SYSTEM_FOREGROUND, selected, OBJID_WINDOW, CHILDID_SELF, 0, 0);
+        CHECK(g_InSnapWindows);
+        FinishAltTabPreview(selected, onFixtureDesktop);
+        CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
+        CHECK(IsWindowVisible(selected));
+        CHECK(!(GetWindowLongPtrW(selected, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(ReadTaggedProcess(selected).empty());
+        CHECK(!GetPropW(selected, L"MTU_VD_TAG"));
+        CHECK(GetWindowLongPtrW(other, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(GetWindowLongPtrW(foreign, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        RestoreAllSealedWindows();
         return;
     }
     if (name == "alt_tab_chord") {
