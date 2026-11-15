@@ -4,6 +4,7 @@
 #include <inspectable.h>
 #include <servprov.h>
 #include <shobjidl_core.h>
+#include <string>
 #include <winrt/base.h>
 
 namespace uwp_taskbar {
@@ -63,6 +64,19 @@ inline HRESULT FindView(HWND hwnd, winrt::com_ptr<ApplicationView>& view) {
     if (FAILED(hr)) return hr;
     if (!collection) return E_NOINTERFACE;
     return collection->GetViewForHwnd(hwnd, view.put());
+}
+
+inline std::wstring ReadAppId(HWND hwnd) {
+    winrt::com_ptr<ApplicationView> view;
+    PWSTR appId = nullptr;
+    if (SUCCEEDED(FindView(hwnd, view)) && view &&
+        SUCCEEDED(view->GetAppUserModelId(&appId)) && appId) {
+        std::wstring result(appId);
+        CoTaskMemFree(appId);
+        return result;
+    }
+    CoTaskMemFree(appId);
+    return {};
 }
 
 // The property belongs to the HWND so a later launch can undo an interrupted
