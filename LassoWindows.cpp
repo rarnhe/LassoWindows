@@ -1894,8 +1894,14 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
-    HANDLE ready = static_cast<HANDLE>(readyPtr);
+struct CoordinatorStartup {
+    HANDLE ready;
+    bool registerShortcut;
+};
+
+static DWORD WINAPI CoordinatorThreadProc(void* startupPtr) {
+    const auto startup = *static_cast<const CoordinatorStartup*>(startupPtr);
+    HANDLE ready = startup.ready;
     try { winrt::init_apartment(winrt::apartment_type::single_threaded); }
     catch (...) { SetEvent(ready); return 1; }
 
@@ -1916,7 +1922,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
         return 1;
     }
     UpdateSystemDpiScalingStatus();
-    RegisterAppShortcut();
+    if (startup.registerShortcut) RegisterAppShortcut();
     g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_hObjHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
@@ -1940,7 +1946,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     return 0;
 }
 
-int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
+static int RunBackground(HINSTANCE hInst, bool registerShortcut) {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Global\\MyWindowManagerUniqueMutex_12345");
     if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (mutex) CloseHandle(mutex);
@@ -1950,7 +1956,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ in
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE worker = ready ? CreateThread(nullptr, 0, CoordinatorThreadProc, ready, 0, nullptr) : nullptr;
+    CoordinatorStartup startup{ready, registerShortcut};
+    HANDLE worker = ready ? CreateThread(nullptr, 0, CoordinatorThreadProc, &startup, 0, nullptr) : nullptr;
     if (!worker || WaitForSingleObject(ready, 15000) != WAIT_OBJECT_0 || !g_hLassoCoordinator) {
         if (worker) {
             WaitForSingleObject(worker, INFINITE);
@@ -1990,4 +1997,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ in
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     return 0;
+}
+
+int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
+    return RunBackground(hInst, true);
 }
