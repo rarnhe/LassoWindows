@@ -1,12 +1,12 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-15 09:58:17
-- 测试源码基准提交：c3b3e613df942ecdf24c28bb04c6955af7ac8e6d
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43701738136
+- 时间（UTC）：2026-11-15 14:09:31
+- 测试源码基准提交：300f9bccd594082918061988d8104ade10013291
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43722734099
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
-- 统计：通过 29 / 失败 0 / 跳过 0 / 共 29
+- 统计：通过 31 / 失败 0 / 跳过 0 / 共 31
 
 | 测试 | 结果 |
 | --- | --- |
@@ -39,11 +39,13 @@
 | collect | 通过 |
 | icon_cache | 通过 |
 | toggle_filter | 通过 |
+| uwp_frame_visibility | 通过 |
+| alt_tab_chord | 通过 |
 
 ## 失败详情
 无用例失败详情；若整体失败，请检查 Actions 阶段和构建日志。
 
 ## 覆盖范围
-真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
+真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、Alt+Tab 按键序列、模拟 UWP 外框的可见性切换、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
 
 全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。
