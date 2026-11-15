@@ -7,7 +7,7 @@
 // @github          https://github.com/rarnhe/LassoWindows
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -lruntimeobject
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject
 // ==/WindhawkMod==
 
 #include <windows.h>
