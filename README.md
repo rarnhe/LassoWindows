@@ -34,9 +34,15 @@ IconResource=C:\Windows\System32\shell32.dll,3
 
 解析使用最后一个逗号分隔路径与索引，支持负索引；索引无法转换时回退为 0。快捷方式已经存在时跳过创建，因此修改 INI 不会自动更新已有快捷方式。
 
+## Windows 11 上同步隐藏 UWP 任务栏图标
+
+安装 [Windhawk 1.7.3](https://github.com/ramensoftware/windhawk/releases/tag/v1.7.3) 或兼容的新版本。在 Windhawk 中选择「创建新模组」，用 [lasso-uwp-taskbar-buttons.wh.cpp](windhawk/lasso-uwp-taskbar-buttons.wh.cpp) 替换模板，编译并启用。启动这个分支构建的 `LassoWindows.exe`，在目标应用按 `Win+C`。
+
+模组按 AppUserModelID 折叠 Explorer 实际绘制的按钮，选回应用、关闭 Lasso 或停用模组后恢复。固定的图标只改变本次运行中的显示。同一应用还有可见窗口时，任务栏分组保持可用。模组面向 Windows 11 x64 的原生任务栏，其他任务栏实现继续使用原有 Shell 路径。模组的 Windhawk 日志会显示任务栏符号是否可用。
+
 ## 自动测试与双轨报告
 
-测试位于独立的 `test/` 目录，通过 CTest 驱动 32 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
+测试位于独立的 `test/` 目录，通过 CTest 驱动 33 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
 
 ```powershell
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
@@ -59,4 +65,4 @@ ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --outp
 - `MTU_VD_TAG` 现在保存官方窗口桌面 GUID，使用 `IVirtualDesktopManager` 校验当前桌面。旧版桌面**名称**标签不会被解封（fail closed），以防止同名或改名导致错误唤醒；切换版本前建议主动解封旧版封印窗口。
 - 已注册桌面切换 WinEvent Hook，但尚未实现跨桌面自动迁移；切换桌面并不改变被封印窗口的原桌面归属。
 - 已增加原始扩展样式、可读取透明度等快照及正常退出恢复；但 Windows 的特殊分层窗口效果、受权限保护的窗口和强制结束进程后的恢复仍无法保证，必须实机验证。
-- UWP 路径使用未公开的 Shell COM 接口。接口取不到或状态读回失败时沿用窗口隐藏路径，任务栏按钮可能保留。固定在任务栏上的启动图标仍由 Explorer 管理。调试输出中的 `UWP Shell switcher exclusion` 记录该调用的 HRESULT。实际按钮和 Alt+Tab 缩略图需要在交互式桌面验证。
+- UWP 路径使用未公开的 Shell COM 接口。接口取不到或状态读回失败时沿用窗口隐藏路径，任务栏按钮可能保留。使用可选 Windhawk 模组时，也可暂时折叠固定图标。调试输出中的 `UWP Shell switcher exclusion` 记录该调用的 HRESULT。实际按钮和 Alt+Tab 缩略图需要在交互式桌面验证。
