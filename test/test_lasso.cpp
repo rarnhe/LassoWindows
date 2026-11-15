@@ -147,12 +147,14 @@ void run(const std::string& name) {
         return;
     }
     if (name == "cross_desktop_win_c") {
-        Window current, selected, otherDesktop, inactive, moved;
+        Window current, selected, otherDesktop, inactive, moved, invalidProcess, oldDesktopName;
         const GUID deskA{1}, deskB{2};
         ShowWindow(current, SW_SHOWNOACTIVATE);
         ShowWindow(selected, SW_SHOWNOACTIVATE);
         ShowWindow(otherDesktop, SW_SHOWNOACTIVATE);
         ShowWindow(moved, SW_SHOWNOACTIVATE);
+        ShowWindow(invalidProcess, SW_SHOWNOACTIVATE);
+        ShowWindow(oldDesktopName, SW_SHOWNOACTIVATE);
         CHECK(SetPropW(otherDesktop, L"Fixture.SecondDesktop", reinterpret_cast<HANDLE>(UINT_PTR{1})));
 
         // Exercise the same enumeration callback used by Win+C with a
@@ -164,7 +166,8 @@ void run(const std::string& name) {
             id = foreign ? GUID{2} : GUID{1};
             return !requireCurrent || !foreign;
         }};
-        for (HWND h : {current.h, selected.h, otherDesktop.h, inactive.h, moved.h})
+        for (HWND h : {current.h, selected.h, otherDesktop.h, inactive.h, moved.h,
+                       invalidProcess.h, oldDesktopName.h})
             CHECK(EnumHideWindowsProc(h, reinterpret_cast<LPARAM>(&filter)));
         CHECK(ReadTaggedProcess(current) == process && TaggedDesktopMatches(current, deskA));
         CHECK(ReadTaggedProcess(otherDesktop) == process && TaggedDesktopMatches(otherDesktop, deskB));
@@ -173,10 +176,14 @@ void run(const std::string& name) {
 
         // Move a sealed window without changing its tag. It must stay hidden.
         CHECK(SetPropW(moved, L"Fixture.SecondDesktop", reinterpret_cast<HANDLE>(UINT_PTR{1})));
+        CHECK(SetSealTag(invalidProcess, L"MTU_PROC_TAG", L"Unknown"));
+        CHECK(SetSealTag(oldDesktopName, L"MTU_VD_TAG", L"Fixture desktop name"));
         CHECK(TryUnHideWindowsForAltTab(filter.readDesktop));
         CHECK(g_snapUnhiddenWindows.size() == 2);
         CHECK(!(GetWindowLongPtrW(selected, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
         CHECK(GetWindowLongPtrW(moved, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(GetWindowLongPtrW(invalidProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(GetWindowLongPtrW(oldDesktopName, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
         WinEventProc(nullptr, EVENT_SYSTEM_FOREGROUND, selected, OBJID_WINDOW, CHILDID_SELF, 0, 0);
@@ -195,13 +202,14 @@ void run(const std::string& name) {
         };
         CHECK(TryUnHideWindowsForAltTab(secondDesktop));
         CHECK(g_snapUnhiddenWindows == std::vector<HWND>{otherDesktop.h});
-        FinishAltTabPreview(nullptr, secondDesktop);
+        ExecuteCollectRestore(); // The coordinator invokes this on Escape.
+        CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
         CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(TaggedDesktopMatches(otherDesktop, deskB));
         RestoreAllSealedWindows();
         return;
     }
-    if (name == "uwp_frame_reversible_seal") {
+    if (name == "uwp_win_c_close") {
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
         wc.hInstance = GetModuleHandleW(nullptr);
@@ -209,24 +217,18 @@ void run(const std::string& name) {
         CHECK(RegisterClassW(&wc));
         Window frame(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
         ShowWindow(frame, SW_SHOWNOACTIVATE);
-        const GUID desktop{1};
-        CHECK(SealWindow(frame, L"uwp-fixture.exe", desktop));
-        CHECK(IsWindow(frame) && !IsWindowVisible(frame));
-        CHECK(ReadTaggedProcess(frame) == L"uwp-fixture.exe" && TaggedDesktopMatches(frame, desktop));
-        CHECK(IsOriginalWindowEligibleForPreview(frame));
-        auto onDesktop = +[](HWND, GUID& id, bool) { id = GUID{1}; return true; };
-        CHECK(TryUnHideWindowsForAltTab(onDesktop));
-        CHECK(IsWindowVisible(frame));
-        FinishAltTabPreview(nullptr, onDesktop);
-        CHECK(IsWindow(frame) && !IsWindowVisible(frame));
-        CHECK(TryUnHideWindowsForAltTab(onDesktop));
-        FinishAltTabPreview(frame, onDesktop);
-        CHECK(IsWindowVisible(frame) && !GetPropW(frame, L"MTU_PROC_TAG"));
-        CHECK(SealWindow(frame, L"uwp-fixture.exe", desktop));
-        g_sealedWindowStates.clear();
-        RecoverApplicationFrameState();
-        CHECK(IsWindowVisible(frame) && !GetPropW(frame, PROP_UWP_HIDDEN_FRAME));
+        HideCurrentFilter filter{GetRealProcessName(frame), +[](HWND, GUID& id, bool) {
+            id = GUID{2};
+            return true;
+        }};
+        CHECK(!filter.process.empty() && filter.process != L"Unknown");
+        CHECK(EnumHideWindowsProc(frame, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(IsWindowVisible(frame) && !g_sealedWindowStates.contains(frame.h));
         CHECK(!GetPropW(frame, L"MTU_PROC_TAG") && !GetPropW(frame, L"MTU_VD_TAG"));
+        MSG message{};
+        CHECK(PeekMessageW(&message, frame, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+        DispatchMessageW(&message);
+        CHECK(!IsWindow(frame));
         return;
     }
     if (name == "alt_tab_chord") {
