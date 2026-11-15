@@ -31,8 +31,9 @@ ApplicationView : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE GetNeediness(int*) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetLastActivationTimestamp(ULONGLONG*) = 0;
     virtual HRESULT STDMETHODCALLTYPE SetLastActivationTimestamp(ULONGLONG) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetVirtualDesktopId(GUID*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetVirtualDesktopId(REFGUID) = 0;
+    // Unused slots required to preserve the Shell ABI for the switcher methods.
+    virtual HRESULT STDMETHODCALLTYPE ReservedSlot19() = 0;
+    virtual HRESULT STDMETHODCALLTYPE ReservedSlot20() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetShowInSwitchers(int*) = 0;
     virtual HRESULT STDMETHODCALLTYPE SetShowInSwitchers(int) = 0;
 };
