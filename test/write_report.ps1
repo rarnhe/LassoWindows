@@ -3,6 +3,7 @@ param(
     [string]$Configure = "success",
     [string]$Build = "success",
     [string]$Test = "success",
+    [string]$Windhawk = "local",
     [string]$OutputPath = "test_report.md"
 )
 $ErrorActionPreference = "Stop"
@@ -15,7 +16,7 @@ if (Test-Path -LiteralPath $junit) {
 $failed = @($cases | Where-Object { $_.SelectSingleNode("failure") -or $_.SelectSingleNode("error") })
 $skipped = @($cases | Where-Object { $_.SelectSingleNode("skipped") })
 $passed = $cases.Count - $failed.Count - $skipped.Count
-$ok = $Configure -eq "success" -and $Build -eq "success" -and $Test -eq "success" -and $cases.Count -gt 0 -and $failed.Count -eq 0 -and $skipped.Count -eq 0
+$ok = ($Windhawk -in @("success", "local")) -and $Configure -eq "success" -and $Build -eq "success" -and $Test -eq "success" -and $cases.Count -gt 0 -and $failed.Count -eq 0 -and $skipped.Count -eq 0
 $status = if ($ok) { "通过 (Passed)" } else { "失败或未完整执行 (Failed)" }
 $revision = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw "Cannot read tested revision" }
@@ -28,7 +29,7 @@ $lines = [System.Collections.Generic.List[string]]::new()
     "- 测试源码基准提交：$revision",
     "- 执行记录：$run",
     "- 平台：Windows / MSVC / C++20 / Win32 + Windows SDK",
-    "- 阶段：Configure=$Configure / Build=$Build / CTest=$Test",
+    "- 阶段：Configure=$Configure / Build=$Build / CTest=$Test / WindhawkCompile=$Windhawk",
     "- 统计：通过 $passed / 失败 $($failed.Count) / 跳过 $($skipped.Count) / 共 $($cases.Count)", "",
     "| 测试 | 结果 |", "| --- | --- |"
 ) | ForEach-Object { $lines.Add($_) }
@@ -49,7 +50,7 @@ foreach ($case in $failed) {
 if ($failed.Count -eq 0) { $lines.Add("无用例失败详情；若整体失败，请检查 Actions 阶段和构建日志。") }
 $lines.Add("")
 $lines.Add("## 覆盖范围")
-$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、Alt+Tab 按键序列、模拟 UWP 外框的 DWM 遮蔽、恢复及回退与 Shell 切换器状态的保存、读回及恢复、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
+$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、Alt+Tab 按键序列、模拟 UWP 外框的 DWM 遮蔽、恢复及回退、Shell 状态保存与恢复，以及任务栏按钮发布与分组保护、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
 $lines.Add("")
 $lines.Add("全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。")
 $content = $lines -join [Environment]::NewLine
