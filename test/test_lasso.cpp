@@ -50,6 +50,56 @@ void iniTest(const std::string& name) {
 }
 void run(const std::string& name) {
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
+    if (name == "uwp_taskbar_button_publication") {
+        const HINSTANCE module = GetModuleHandleW(nullptr);
+        WNDCLASSW frameClass{};
+        frameClass.lpfnWndProc = DefWindowProcW;
+        frameClass.hInstance = module;
+        frameClass.lpszClassName = L"ApplicationFrameWindow";
+        CHECK(RegisterClassW(&frameClass));
+        WNDCLASSW publisherClass = frameClass;
+        publisherClass.lpszClassName = TASKBAR_BRIDGE_CLASS;
+        CHECK(RegisterClassW(&publisherClass));
+        g_taskbarButtonPublisher = CreateWindowExW(0, TASKBAR_BRIDGE_CLASS, L"",
+            0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, module, nullptr);
+        CHECK(g_taskbarButtonPublisher);
+        CHECK(FindWindowExW(HWND_MESSAGE, nullptr, TASKBAR_BRIDGE_CLASS, nullptr) ==
+            g_taskbarButtonPublisher);
+
+        const std::wstring appId = L"Lasso.Test_123!Fixture";
+        const auto property = TASKBAR_HIDE_PREFIX + appId;
+        Window sealed(WS_EX_APPWINDOW, nullptr, frameClass.lpszClassName);
+        Window sibling(WS_EX_APPWINDOW, nullptr, frameClass.lpszClassName);
+        CHECK(SnapshotWindowState(sealed));
+        g_sealedWindowStates.at(sealed).hiddenTaskbarAppId = appId;
+        PublishTaskbarButtons();
+        CHECK(GetPropW(g_taskbarButtonPublisher, property.c_str()));
+
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        winrt::com_ptr<IPropertyStore> store;
+        CHECK(SUCCEEDED(SHGetPropertyStoreForWindow(sibling, IID_PPV_ARGS(store.put()))));
+        PROPVARIANT appIdValue{};
+        CHECK(SUCCEEDED(InitPropVariantFromString(appId.c_str(), &appIdValue)));
+        const HRESULT setId = store->SetValue(PKEY_AppUserModel_ID, appIdValue);
+        PropVariantClear(&appIdValue);
+        CHECK(SUCCEEDED(setId));
+        ShowWindow(sibling, SW_SHOWNOACTIVATE);
+        CHECK(ReadTaskbarAppId(sibling) == appId);
+        PublishTaskbarButtons();
+        CHECK(!GetPropW(g_taskbarButtonPublisher, property.c_str()));
+        CHECK(SetWindowPresented(sibling, false));
+        PublishTaskbarButtons();
+        CHECK(GetPropW(g_taskbarButtonPublisher, property.c_str()));
+        store = nullptr;
+        winrt::uninit_apartment();
+
+        CHECK(ShowWindowAndShowTaskbarIcon(sealed, true));
+        PublishTaskbarButtons();
+        CHECK(!GetPropW(g_taskbarButtonPublisher, property.c_str()));
+        CHECK(DestroyWindow(g_taskbarButtonPublisher));
+        g_taskbarButtonPublisher = nullptr;
+        return;
+    }
     if (name == "uwp_shell_switcher_state") {
         struct SwitcherView {
             int shown = 1;
