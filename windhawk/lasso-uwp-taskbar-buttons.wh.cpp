@@ -6,7 +6,7 @@
 // @author          LassoWindows
 // @github          https://github.com/rarnhe/LassoWindows
 // @include         explorer.exe
-// @architecture    x86-64
+// @architecture    amd64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject
 // ==/WindhawkMod==
 
@@ -24,6 +24,7 @@
 #include <mutex>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -56,11 +57,13 @@ HMODULE g_module = nullptr;
 
 bool ShouldHide(const FrameworkElement& button, HWND publisher) {
     if (!publisher) return false;
-    std::wstring id(Automation::AutomationProperties::GetAutomationId(button).c_str());
+    const auto automationId = Automation::AutomationProperties::GetAutomationId(button);
+    const std::wstring_view id(automationId.c_str(), automationId.size());
     if (!id.starts_with(kAutomationPrefix)) return false;
-    id.erase(0, std::size(kAutomationPrefix) - 1);
-    if (id.empty() || id.size() > 128) return false;
-    const auto property = kPropertyPrefix + id;
+    const auto appId = id.substr(std::size(kAutomationPrefix) - 1);
+    if (appId.empty() || appId.size() > 128) return false;
+    std::wstring property(kPropertyPrefix);
+    property.append(appId);
     return GetPropW(publisher, property.c_str()) != nullptr;
 }
 
