@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <iterator>
 #include <algorithm>
+#include "uwp_taskbar.h"
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
@@ -760,12 +761,15 @@ static void ClearSealMarkers(HWND h) {
     }
 }
 
-static void RecoverApplicationFrameCloaks() {
+static void RecoverApplicationFrameState() {
     EnumWindows([](HWND h, LPARAM) -> BOOL {
-        if (GetPropW(h, PROP_UWP_DWM_CLOAK) && IsApplicationFrameWindow(h) &&
-            RestoreApplicationFrameCloak(h)) {
-            ClearSealMarkers(h);
-        }
+        if (!GetPropW(h, PROP_UWP_DWM_CLOAK) &&
+            !GetPropW(h, uwp_taskbar::PROP_RESTORE_SWITCHER)) return TRUE;
+        if (!IsApplicationFrameWindow(h)) return TRUE;
+
+        const bool restoredCloak = RestoreApplicationFrameCloak(h);
+        const bool restoredSwitcher = SUCCEEDED(uwp_taskbar::SetSwitcherVisibility(h, true));
+        if (restoredCloak && restoredSwitcher) ClearSealMarkers(h);
         return TRUE;
     }, 0);
 }
@@ -814,9 +818,11 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
         if (!IsWindowVisible(h) && !SetWindowPresented(h, true)) return false;
         original.hiddenByLasso = false;
     }
-    if (!original.applicationFrame && original.wasVisible &&
-        IsWindowVisible(h) && !(original.exStyle & WS_EX_TOOLWINDOW))
+    if (original.applicationFrame) {
+        if (FAILED(uwp_taskbar::SetSwitcherVisibility(h, true))) return false;
+    } else if (original.wasVisible && IsWindowVisible(h) && !(original.exStyle & WS_EX_TOOLWINDOW)) {
         UpdateTaskbarButton(h, true);
+    }
     InvalidateRect(h, nullptr, TRUE);
     if (!preview) {
         ClearSealMarkers(h);
@@ -829,11 +835,18 @@ void HideWindowAndHideTaskbarIcon(HWND h) {
     if (!SnapshotWindowState(h)) return;
     auto& original = g_sealedWindowStates.at(h);
     if (original.applicationFrame) {
-        // DWM exclusion lets Explorer filter the hosted view while keeping
-        // the frame available for the next Alt+Tab preview.
-        if (original.wasVisible && IsWindowVisible(h) && CloakApplicationFrame(h)) return;
-        if (original.wasVisible && IsWindowVisible(h) && SetWindowPresented(h, false))
+        if (!original.wasVisible) return;
+
+        // The taskbar tracks the hosted view separately from the frame's
+        // visibility. Update Shell before hiding the HWND.
+        const HRESULT shellResult = uwp_taskbar::SetSwitcherVisibility(h, false);
+        if (IsWindowVisible(h) && !CloakApplicationFrame(h) && SetWindowPresented(h, false))
             original.hiddenByLasso = true;
+        wchar_t message[128]{};
+        swprintf_s(message, L"LassoWindows: UWP Shell switcher exclusion for HWND %p: 0x%08lX\n",
+            static_cast<void*>(h), static_cast<unsigned long>(shellResult));
+        OutputDebugStringW(message);
+        if (SUCCEEDED(shellResult)) return;
     } else {
         LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
         exStyle &= ~WS_EX_APPWINDOW;
@@ -1978,7 +1991,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
         return 1;
     }
     UpdateSystemDpiScalingStatus();
-    RecoverApplicationFrameCloaks();
+    RecoverApplicationFrameState();
     RegisterAppShortcut();
     g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);

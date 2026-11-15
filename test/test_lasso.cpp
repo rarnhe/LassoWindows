@@ -50,6 +50,64 @@ void iniTest(const std::string& name) {
 }
 void run(const std::string& name) {
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
+    if (name == "uwp_shell_switcher_state") {
+        struct SwitcherView {
+            int shown = 1;
+            int writes = 0;
+            bool ignoreWrite = false;
+            bool failReadAfterWrite = false;
+            bool readFails = false;
+
+            HRESULT GetShowInSwitchers(int* result) const {
+                if (readFails) return E_FAIL;
+                *result = shown;
+                return S_OK;
+            }
+            HRESULT SetShowInSwitchers(int requested) {
+                ++writes;
+                if (!ignoreWrite) shown = requested;
+                readFails = failReadAfterWrite;
+                return S_OK;
+            }
+        };
+        Window frame;
+        SwitcherView view;
+        const auto property = uwp_taskbar::PROP_RESTORE_SWITCHER;
+        using uwp_taskbar::SetSwitcherVisibility;
+        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, false, view)));
+        CHECK(view.shown == 0 && view.writes == 1 && GetPropW(frame, property));
+        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, false, view)));
+        CHECK(view.writes == 1);
+
+        view.ignoreWrite = true;
+        CHECK(FAILED(SetSwitcherVisibility(frame, true, view)));
+        CHECK(view.shown == 0 && GetPropW(frame, property));
+
+        view.ignoreWrite = false;
+        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, true, view)));
+        CHECK(view.shown == 1 && !GetPropW(frame, property));
+
+        view.ignoreWrite = true;
+        CHECK(FAILED(SetSwitcherVisibility(frame, false, view)));
+        CHECK(view.shown == 1 && !GetPropW(frame, property));
+
+        view.shown = 0; // The Shell view was already excluded independently.
+        const int writes = view.writes;
+        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, false, view)));
+        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, true, view)));
+        CHECK(view.shown == 0 && view.writes == writes && !GetPropW(frame, property));
+
+        view.shown = 1;
+        view.ignoreWrite = false;
+        view.failReadAfterWrite = true;
+        CHECK(FAILED(SetSwitcherVisibility(frame, false, view)));
+        CHECK(view.shown == 0 && GetPropW(frame, property));
+        view.failReadAfterWrite = false;
+        view.readFails = false;
+        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, true, view)));
+        CHECK(view.shown == 1 && !GetPropW(frame, property));
+        return;
+    }
     if (name == "uwp_frame_visibility") {
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
@@ -88,7 +146,7 @@ void run(const std::string& name) {
         CHECK(proc);
         CHECK(SetPropW(frame, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(proc))));
         g_sealedWindowStates.clear(); // The next process only sees the window properties.
-        RecoverApplicationFrameCloaks();
+        RecoverApplicationFrameState();
         CHECK(!(cloakFlags(frame) & DWM_CLOAKED_APP));
         CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
         CHECK(!GetPropW(frame, L"MTU_PROC_TAG"));

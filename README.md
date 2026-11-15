@@ -6,13 +6,13 @@ LassoWindows 是基于 Win32、COM 与 C++/WinRT 的后台窗口管理工具。�
 
 | 操作 | 当前行为 |
 | --- | --- |
-| Win + C | 隐藏当前应用在当前虚拟桌面的同进程窗口；仅操作当前虚拟桌面的窗口，Explorer 仅处理文件夹窗口。对 `ApplicationFrameWindow` 托管的 UWP 窗口通过 DWM 遮蔽外框供 Explorer 过滤运行中的窗口按钮，应用继续运行。 |
+| Win + C | 隐藏当前应用在当前虚拟桌面的同进程窗口；仅操作当前虚拟桌面的窗口，Explorer 仅处理文件夹窗口。对 `ApplicationFrameWindow` 托管的 UWP 窗口隐藏外框，并请求 Shell 排除对应的运行按钮，应用继续运行。 |
 | Shift + Win + C | 尝试隐藏当前桌面中其他应用的窗口，保留当前应用；使用明确的 `CloseFilter` 上下文，UWP 也按外框处理。 |
 | Alt + Tab | 按 `MTU_PROC_TAG` 和匹配当前桌面的 `MTU_VD_TAG` 临时恢复原本可见且非最小化的封印窗口，再交给 Windows 切换器。松开 Alt 后约 150ms 保留所选应用并重新封印其他预览窗口，Esc 取消本次预览。 |
 | 点击主屏任务栏最右侧 30 像素区域 | 在最小化与恢复主屏普通窗口之间切换，跳过其他虚拟桌面、已封印窗口、副屏窗口、工具窗口及有 owner 的弹窗。 |
 | 再次打开同应用窗口或通过关联文件唤醒 | 事件处理尝试恢复同进程、同桌面的已隐藏窗口并清理标签。 |
 
-程序在封印前保存窗口原始扩展样式、可读取的分层窗口透明度、可见性及窗口布局信息；无法安全读取原有分层属性的窗口会跳过封印。封印时通过透明度为 0、鼠标穿透、工具窗口样式及任务栏接口隐藏窗口，并使用 `MTU_PROC_TAG` / `MTU_VD_TAG` Atom 属性记录进程名和官方虚拟桌面 GUID，标题添加蛛网前缀。恢复时撤销相关标签，并按照快照恢复样式与 Alpha；Alt+Tab 临时预览会保留快照，最终解封才销毁快照。UWP 外框优先使用 `DWMWA_CLOAK`，失败时回退到无激活的可见性切换和 `ITaskbarList::DeleteTab`。Alt+Tab 预览、解封和下次启动时恢复 Lasso 设置的遮蔽。普通窗口在 Alt+Tab 预览前刷新可见性，使 Shell 重新识别窗口。解封保留最小化状态，也保留原本隐藏的窗口状态。解封前检查 GUID 标签和 Windows 当前桌面归属。右下角主屏切换仍是用户主动请求的最小化/恢复功能，仅作用于当前虚拟桌面的窗口。
+程序在封印前保存窗口原始扩展样式、可读取的分层窗口透明度、可见性及窗口布局信息；无法安全读取原有分层属性的窗口会跳过封印。封印时通过透明度为 0、鼠标穿透、工具窗口样式及任务栏接口隐藏窗口，并使用 `MTU_PROC_TAG` / `MTU_VD_TAG` Atom 属性记录进程名和官方虚拟桌面 GUID，标题添加蛛网前缀。恢复时撤销相关标签，并按照快照恢复样式与 Alpha；Alt+Tab 临时预览会保留快照，最终解封才销毁快照。UWP 封印通过窗口句柄定位 Shell 的 `IApplicationView`，调用 `SetShowInSwitchers(0)` 并读回状态，同时通过 DWM 或无激活的可见性切换隐藏外框。Alt+Tab 预览、解封和下次启动时恢复 Lasso 更改的 Shell 状态和 DWM 遮蔽。普通窗口在 Alt+Tab 预览前刷新可见性，使 Shell 重新识别窗口。解封保留最小化状态，也保留原本隐藏的窗口状态。解封前检查 GUID 标签和 Windows 当前桌面归属。右下角主屏切换仍是用户主动请求的最小化/恢复功能，仅作用于当前虚拟桌面的窗口。
 
 任务栏相关代码会备份/恢复 AppUserModelID，缓存原始图标，并尝试设置窗口快照与叠加图标。启动时以命名互斥量限制单实例，在独立协调线程初始化 WinRT/COM、创建消息窗口并注册窗口事件 Hook；低级键盘和鼠标 Hook 只识别输入、投递消息，窗口枚举/COM/DWM 等耗时操作由协调线程串行处理。正常退出会尝试恢复被封印窗口并解除钩子。程序目前没有设置界面或托盘退出入口，必要时可在任务管理器结束进程。
 
@@ -36,7 +36,7 @@ IconResource=C:\Windows\System32\shell32.dll,3
 
 ## 自动测试与双轨报告
 
-测试位于独立的 `test/` 目录，通过 CTest 驱动 31 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
+测试位于独立的 `test/` 目录，通过 CTest 驱动 32 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
 
 ```powershell
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
@@ -59,4 +59,4 @@ ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --outp
 - `MTU_VD_TAG` 现在保存官方窗口桌面 GUID，使用 `IVirtualDesktopManager` 校验当前桌面。旧版桌面**名称**标签不会被解封（fail closed），以防止同名或改名导致错误唤醒；切换版本前建议主动解封旧版封印窗口。
 - 已注册桌面切换 WinEvent Hook，但尚未实现跨桌面自动迁移；切换桌面并不改变被封印窗口的原桌面归属。
 - 已增加原始扩展样式、可读取透明度等快照及正常退出恢复；但 Windows 的特殊分层窗口效果、受权限保护的窗口和强制结束进程后的恢复仍无法保证，必须实机验证。
-- UWP 以运行中窗口按钮为目标，用户固定在任务栏上的启动图标仍由 Explorer 管理。DWM 拒绝跨进程遮蔽时，回退路径可能只隐藏外框。实际 UWP 按钮和 Alt+Tab 缩略图需要在交互式桌面验证。
+- UWP 路径使用未公开的 Shell COM 接口。接口取不到或状态读回失败时沿用窗口隐藏路径，任务栏按钮可能保留。固定在任务栏上的启动图标仍由 Explorer 管理。调试输出中的 `UWP Shell switcher exclusion` 记录该调用的 HRESULT。实际按钮和 Alt+Tab 缩略图需要在交互式桌面验证。
