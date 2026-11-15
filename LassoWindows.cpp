@@ -10,6 +10,8 @@
 #include <propvarutil.h>
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
+#include <shobjidl.h>
 #include <iterator>
 #include <algorithm>
 #include "uwp_taskbar.h"
@@ -725,8 +727,73 @@ struct SealedWindowState {
     bool wasIconic = false;
     bool applicationFrame = false;
     bool hiddenByLasso = false;
+    std::wstring hiddenTaskbarAppId;
 };
 static std::unordered_map<HWND, SealedWindowState> g_sealedWindowStates;
+
+static constexpr wchar_t TASKBAR_BRIDGE_CLASS[] = L"LassoWindowsCoordinator";
+static constexpr wchar_t TASKBAR_HIDE_PREFIX[] = L"LassoWindows.TaskbarHide.";
+static constexpr UINT_PTR TIMER_ID_TASKBAR_BUTTONS = 1002;
+static HWND g_taskbarButtonPublisher = nullptr;
+static std::unordered_set<std::wstring> g_publishedTaskbarAppIds;
+
+static std::wstring ReadTaskbarAppId(HWND h) {
+    std::wstring shellId = uwp_taskbar::ReadAppId(h);
+    if (!shellId.empty()) return shellId;
+    winrt::com_ptr<IPropertyStore> properties;
+    if (SUCCEEDED(SHGetPropertyStoreForWindow(h, IID_PPV_ARGS(properties.put())))) {
+        PROPVARIANT value{};
+        const HRESULT result = properties->GetValue(PKEY_AppUserModel_ID, &value);
+        std::wstring appId;
+        if (SUCCEEDED(result) && value.vt == VT_LPWSTR && value.pwszVal)
+            appId = value.pwszVal;
+        PropVariantClear(&value);
+        if (!appId.empty()) return appId;
+    }
+    return {};
+}
+
+static void PublishTaskbarButtons() {
+    if (!g_taskbarButtonPublisher) return;
+    std::unordered_set<std::wstring> hiddenAppIds;
+    for (const auto& [h, state] : g_sealedWindowStates) {
+        if (IsWindow(h) && !state.hiddenTaskbarAppId.empty())
+            hiddenAppIds.insert(state.hiddenTaskbarAppId);
+    }
+    if (!hiddenAppIds.empty()) {
+        // A taskbar button can represent several windows, including one
+        // outside the current virtual desktop. Leave that group accessible.
+        EnumWindows([](HWND h, LPARAM data) -> BOOL {
+            auto& ids = *reinterpret_cast<std::unordered_set<std::wstring>*>(data);
+            if (!IsApplicationFrameWindow(h) || !IsWindowVisible(h)) return TRUE;
+            const auto state = g_sealedWindowStates.find(h);
+            if (state == g_sealedWindowStates.end() || state->second.hiddenTaskbarAppId.empty())
+                ids.erase(ReadTaskbarAppId(h));
+            return !ids.empty();
+        }, reinterpret_cast<LPARAM>(&hiddenAppIds));
+    }
+    for (auto it = g_publishedTaskbarAppIds.begin(); it != g_publishedTaskbarAppIds.end();) {
+        if (hiddenAppIds.contains(*it)) {
+            ++it;
+        } else {
+            const auto name = TASKBAR_HIDE_PREFIX + *it;
+            RemovePropW(g_taskbarButtonPublisher, name.c_str());
+            it = g_publishedTaskbarAppIds.erase(it);
+        }
+    }
+    for (const auto& appId : hiddenAppIds) {
+        if (g_publishedTaskbarAppIds.contains(appId)) continue;
+        const auto name = TASKBAR_HIDE_PREFIX + appId;
+        if (SetPropW(g_taskbarButtonPublisher, name.c_str(), reinterpret_cast<HANDLE>(UINT_PTR{1})))
+            g_publishedTaskbarAppIds.insert(appId);
+    }
+}
+
+static void ScheduleTaskbarButtonUpdate() {
+    if (g_taskbarButtonPublisher &&
+        !SetTimer(g_taskbarButtonPublisher, TIMER_ID_TASKBAR_BUTTONS, 40, nullptr))
+        PublishTaskbarButtons();
+}
 
 static bool SnapshotWindowState(HWND h) {
     if (!IsWindow(h)) return false;
@@ -819,6 +886,8 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
         original.hiddenByLasso = false;
     }
     if (original.applicationFrame) {
+        original.hiddenTaskbarAppId.clear();
+        ScheduleTaskbarButtonUpdate();
         if (FAILED(uwp_taskbar::SetSwitcherVisibility(h, true))) return false;
     } else if (original.wasVisible && IsWindowVisible(h) && !(original.exStyle & WS_EX_TOOLWINDOW)) {
         UpdateTaskbarButton(h, true);
@@ -839,9 +908,15 @@ void HideWindowAndHideTaskbarIcon(HWND h) {
 
         // The taskbar tracks the hosted view separately from the frame's
         // visibility. Update Shell before hiding the HWND.
+        const auto appId = g_taskbarButtonPublisher ? ReadTaskbarAppId(h) : std::wstring{};
         const HRESULT shellResult = uwp_taskbar::SetSwitcherVisibility(h, false);
-        if (IsWindowVisible(h) && !CloakApplicationFrame(h) && SetWindowPresented(h, false))
-            original.hiddenByLasso = true;
+        if (IsWindowVisible(h)) {
+            const bool cloaked = CloakApplicationFrame(h);
+            if (!cloaked && SetWindowPresented(h, false)) original.hiddenByLasso = true;
+            if ((cloaked || original.hiddenByLasso) && !appId.empty() && appId.size() <= 128)
+                original.hiddenTaskbarAppId = appId;
+        }
+        ScheduleTaskbarButtonUpdate();
         wchar_t message[128]{};
         swprintf_s(message, L"LassoWindows: UWP Shell switcher exclusion for HWND %p: 0x%08lX\n",
             static_cast<void*>(h), static_cast<unsigned long>(shellResult));
@@ -1613,10 +1688,13 @@ bool IsHiddenWindowReallyVisiable(HWND hwnd) {
 void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
+    if (idC == CHILDID_SELF && event == EVENT_OBJECT_SHOW &&
+        !g_publishedTaskbarAppIds.empty() && IsApplicationFrameWindow(hwnd))
+        ScheduleTaskbarButtonUpdate();
     if (event == EVENT_OBJECT_DESTROY && idC == CHILDID_SELF) {
         // A HWND can be recycled after destruction; never restore stale state
         // onto a different window that later receives the same handle value.
-        g_sealedWindowStates.erase(hwnd);
+        if (g_sealedWindowStates.erase(hwnd)) ScheduleTaskbarButtonUpdate();
         auto forget = [hwnd](std::vector<HWND>& v) {
             v.erase(std::remove(v.begin(), v.end(), hwnd), v.end());
         };
@@ -1953,6 +2031,11 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         TogglePrimaryWindows();
         return 0;
     case WM_TIMER:
+        if (wp == TIMER_ID_TASKBAR_BUTTONS) {
+            KillTimer(hwnd, TIMER_ID_TASKBAR_BUTTONS);
+            PublishTaskbarButtons();
+            return 0;
+        }
         if (wp == TIMER_ID_COLLECT) {
             OnCollectTimer(hwnd, wp);
             return 0;
@@ -1977,7 +2060,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = CoordinatorWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"LassoWindowsCoordinator";
+    wc.lpszClassName = TASKBAR_BRIDGE_CLASS;
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         SetEvent(ready);
         winrt::uninit_apartment();
@@ -1990,6 +2073,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
         winrt::uninit_apartment();
         return 1;
     }
+    g_taskbarButtonPublisher = g_hLassoCoordinator;
     UpdateSystemDpiScalingStatus();
     RecoverApplicationFrameState();
     RegisterAppShortcut();
@@ -2011,6 +2095,9 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     if (g_hObjHook) UnhookWinEvent(g_hObjHook);
     if (desktopHook) UnhookWinEvent(desktopHook);
     RestoreAllSealedWindows();
+    if (IsWindow(g_taskbarButtonPublisher)) DestroyWindow(g_taskbarButtonPublisher);
+    g_taskbarButtonPublisher = nullptr;
+    g_publishedTaskbarAppIds.clear();
     g_hLassoCoordinator = nullptr;
     winrt::uninit_apartment();
     return 0;
