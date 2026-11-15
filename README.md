@@ -25,7 +25,13 @@ cmake -S . -B out/test -A x64 -DBUILD_TESTING=ON
 cmake --build out/test --config Release --parallel
 ```
 
-运行 `out/test/Release/LassoWindows.exe`。如需快捷方式图标，可在应用可执行文件同目录放置 ANSI（系统代码页）编码的 `desktop.ini`：
+运行 `out/test/Release/LassoWindows.exe` 启动后台程序。在 Visual Studio 的 `x64-release` 配置下，从仓库根目录也可以用下面的命令手动验证快捷键：
+
+```powershell
+.\out\build\x64-release\test\lasso_tests.exe
+```
+
+空参数启动与正式程序共用消息循环和钩子。PowerShell 会等待进程退出，可以切到另一个普通窗口验证 `Win+C`、`Shift+Win+C` 和 `Alt+Tab`。两个入口共用单实例锁，请先结束已经运行的实例。正式程序启动时还会注册开始菜单快捷方式。如需快捷方式图标，可在正式应用可执行文件同目录放置 ANSI（系统代码页）编码的 `desktop.ini`：
 
 ```ini
 [.ShellClassInfo]
@@ -36,7 +42,7 @@ IconResource=C:\Windows\System32\shell32.dll,3
 
 ## 自动测试与双轨报告
 
-测试位于独立的 `test/` 目录，通过 CTest 驱动 29 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
+CTest 通过用例名调用 `lasso_tests.exe`。窗口用例创建并销毁自己的 Win32 窗口，INI 临时文件只放在测试可执行文件旁。所有用例串行执行。`background_startup` 另外启动一个空参数子进程，检查协调窗口响应、进程持续运行以及退出清理。
 
 ```powershell
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
