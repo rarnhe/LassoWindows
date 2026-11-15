@@ -680,6 +680,39 @@ static bool SetWindowPresented(HWND h, bool visible) {
         WINDOW_FRAME_FLAGS | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW)) != FALSE;
 }
 
+// A DWM cloak can outlive the process. Track ownership on the frame so
+// recovery clears only cloaks that Lasso set, including after a forced exit.
+static constexpr wchar_t PROP_UWP_DWM_CLOAK[] = L"LassoWindows.UwpDwmCloak";
+
+static bool SetDwmCloak(HWND h, BOOL cloak) {
+    return SUCCEEDED(DwmSetWindowAttribute(h, DWMWA_CLOAK, &cloak, sizeof(cloak)));
+}
+
+static bool CloakApplicationFrame(HWND h) {
+    DWORD cloakFlags = 0;
+    if (FAILED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloakFlags, sizeof(cloakFlags))))
+        return false;
+    if (GetPropW(h, PROP_UWP_DWM_CLOAK))
+        return (cloakFlags & DWM_CLOAKED_APP) || SetDwmCloak(h, TRUE);
+
+    // Don't take ownership of an existing app, shell or inherited cloak.
+    if (cloakFlags || !SetPropW(h, PROP_UWP_DWM_CLOAK, reinterpret_cast<HANDLE>(UINT_PTR{1})))
+        return false;
+    if (SetDwmCloak(h, TRUE)) return true;
+    RemovePropW(h, PROP_UWP_DWM_CLOAK);
+    return false;
+}
+
+static bool RestoreApplicationFrameCloak(HWND h) {
+    if (!GetPropW(h, PROP_UWP_DWM_CLOAK)) return true;
+    DWORD cloakFlags = 0;
+    if (FAILED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloakFlags, sizeof(cloakFlags))))
+        return false;
+    if ((cloakFlags & DWM_CLOAKED_APP) && !SetDwmCloak(h, FALSE)) return false;
+    RemovePropW(h, PROP_UWP_DWM_CLOAK);
+    return true;
+}
+
 struct SealedWindowState {
     LONG_PTR exStyle = 0;
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
@@ -727,6 +760,16 @@ static void ClearSealMarkers(HWND h) {
     }
 }
 
+static void RecoverApplicationFrameCloaks() {
+    EnumWindows([](HWND h, LPARAM) -> BOOL {
+        if (GetPropW(h, PROP_UWP_DWM_CLOAK) && IsApplicationFrameWindow(h) &&
+            RestoreApplicationFrameCloak(h)) {
+            ClearSealMarkers(h);
+        }
+        return TRUE;
+    }, 0);
+}
+
 static bool IsOriginalWindowEligibleForPreview(HWND h) {
     if (!IsWindow(h)) return false;
     const auto it = g_sealedWindowStates.find(h);
@@ -751,7 +794,9 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return false; }
 
     auto& original = it->second;
-    if (!original.applicationFrame) {
+    if (original.applicationFrame) {
+        if (!RestoreApplicationFrameCloak(h)) return false;
+    } else {
         // Explorer must observe a hide/show transition to rediscover a
         // former tool window before the native switcher enumerates windows.
         const bool refreshButton = preview && IsWindowVisible(h) &&
@@ -784,7 +829,9 @@ void HideWindowAndHideTaskbarIcon(HWND h) {
     if (!SnapshotWindowState(h)) return;
     auto& original = g_sealedWindowStates.at(h);
     if (original.applicationFrame) {
-        // Hide the hosted frame so Explorer removes its running button.
+        // DWM exclusion lets Explorer filter the hosted view while keeping
+        // the frame available for the next Alt+Tab preview.
+        if (original.wasVisible && IsWindowVisible(h) && CloakApplicationFrame(h)) return;
         if (original.wasVisible && IsWindowVisible(h) && SetWindowPresented(h, false))
             original.hiddenByLasso = true;
     } else {
@@ -1931,6 +1978,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
         return 1;
     }
     UpdateSystemDpiScalingStatus();
+    RecoverApplicationFrameCloaks();
     RegisterAppShortcut();
     g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
