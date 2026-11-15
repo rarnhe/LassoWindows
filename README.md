@@ -34,9 +34,18 @@ IconResource=C:\Windows\System32\shell32.dll,3
 
 解析使用最后一个逗号分隔路径与索引，支持负索引；索引无法转换时回退为 0。快捷方式已经存在时跳过创建，因此修改 INI 不会自动更新已有快捷方式。
 
+## Alt+Tab 诊断
+
+从 Visual Studio 启动 `LassoWindows.exe` 时，将调试环境变量 `LASSO_ALT_TAB_DIAGNOSTICS` 设为 `1`。测试前先退出已有实例。按一次 `Win+C` 封印普通窗口，立即按 `Alt+Tab`，再松开 Alt。在「输出」窗口的「调试」视图中查看 `[Lasso AltTab]`。
+
+- `seal / tags-read-back` 表示标签已读回。`tag` 与此处的 `actual` 应相同。
+- `SetPropW` 或 `GlobalAddAtomW` 记录写入失败及错误码。`preview / tagged-without-snapshot` 表示窗口仍有标签，但本次运行缺少样式快照。
+- `desktop` 记录当前桌面 GUID 来源。`preview` 记录标签、实时窗口桌面 GUID，以及跳过或恢复的原因。
+- `replay / short-write` 表示 Windows 接收的模拟输入少于预期。`collect` 记录松键后的解封和重新封印结果。
+
 ## 自动测试与双轨报告
 
-测试位于独立的 `test/` 目录，通过 CTest 驱动 35 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
+测试位于独立的 `test/` 目录，通过 CTest 驱动 36 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
 
 ```powershell
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
