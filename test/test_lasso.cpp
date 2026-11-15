@@ -165,8 +165,10 @@ void run(const std::string& name) {
         return;
     }
     if (name == "alt_tab_consecutive_previews") {
-        Window preview, otherApp, coordinator;
+        Window preview(0), otherApp, coordinator;
         ShowWindow(preview, SW_SHOWNOACTIVATE);
+        const LONG_PTR originalStyle = GetWindowLongPtrW(preview, GWL_EXSTYLE);
+        CHECK(!(originalStyle & WS_EX_APPWINDOW));
         ShowWindow(otherApp, SW_SHOWNOACTIVATE);
         const GUID desktop{1};
         CHECK(SealWindow(preview, L"sealed-fixture.exe", desktop));
@@ -191,6 +193,8 @@ void run(const std::string& name) {
 
         CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
         CHECK(g_snapUnhiddenWindows == std::vector<HWND>{preview.h});
+        CHECK(IsWindowVisible(preview));
+        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) == (originalStyle | WS_EX_APPWINDOW));
         FinishAltTabPreview(otherApp, currentDesktop);
         CHECK(!g_InSnapWindows);
         checkSealed();
@@ -204,7 +208,8 @@ void run(const std::string& name) {
         CHECK(!g_altTabNextCollectAt);
         OnCollectTimer(coordinator, TIMER_ID_COLLECT);
         CHECK(g_InSnapWindows && g_snapUnhiddenWindows == std::vector<HWND>{preview.h});
-        CHECK(!(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(IsWindowVisible(preview));
+        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) == (originalStyle | WS_EX_APPWINDOW));
 
         ExecuteCollectRestore();
         CHECK(!g_InSnapWindows);
@@ -213,6 +218,7 @@ void run(const std::string& name) {
         CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
         FinishAltTabPreview(preview, currentDesktop);
         CHECK(!g_InSnapWindows && IsWindowVisible(preview));
+        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) == originalStyle);
         CHECK(!GetPropW(preview, L"MTU_PROC_TAG") && !GetPropW(preview, L"MTU_VD_TAG"));
         CHECK(!g_sealedWindowStates.contains(preview.h));
         g_hLassoCoordinator = nullptr;
@@ -443,7 +449,9 @@ void run(const std::string& name) {
         SetWindowLongPtrW(w, GWL_EXSTYLE, (original & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW);
         const LONG_PTR tool = GetWindowLongPtrW(w, GWL_EXSTYLE);
         HideWindowAndHideTaskbarIcon(w);
-        ShowWindowAndShowTaskbarIcon(w);
+        CHECK(!IsOriginalWindowEligibleForPreview(w));
+        CHECK(!ShowWindowAndShowTaskbarIcon(w, true));
+        CHECK(ShowWindowAndShowTaskbarIcon(w));
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == tool);
         CHECK(!g_sealedWindowStates.contains(w.h));
     } else if (name == "restore_layered_alpha") {

@@ -716,7 +716,7 @@ static bool RequestHostedUwpClose(HWND h) {
 
 static std::unordered_map<HWND, ULONGLONG> g_restoredWindowShows;
 
-static bool SetWindowPresented(HWND h, bool visible) {
+static bool SetWindowPresented(HWND h, bool visible, UINT flags = 0) {
     if (visible) {
         const auto now = GetTickCount64();
         std::erase_if(g_restoredWindowShows, [now](const auto& event) {
@@ -725,7 +725,7 @@ static bool SetWindowPresented(HWND h, bool visible) {
         g_restoredWindowShows[h] = now;
     }
     if (SetWindowPos(h, nullptr, 0, 0, 0, 0,
-            WINDOW_FRAME_FLAGS | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW))) return true;
+            WINDOW_FRAME_FLAGS | flags | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW))) return true;
     if (visible) g_restoredWindowShows.erase(h);
     return false;
 }
@@ -819,17 +819,20 @@ static bool IsOriginalWindowEligibleForPreview(HWND h) {
     if (!IsWindow(h)) return false;
     const auto it = g_sealedWindowStates.find(h);
     return it != g_sealedWindowStates.end() && it->second.wasVisible &&
+        !(it->second.exStyle & WS_EX_TOOLWINDOW) &&
         !it->second.wasIconic && !IsIconic(h) &&
         (it->second.hiddenByLasso || IsWindowVisible(h));
 }
 
 static void UpdateTaskbarButton(HWND h, bool visible) {
     winrt::com_ptr<ITaskbarList> taskbar;
-    if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
-            IID_ITaskbarList, taskbar.put_void())) && SUCCEEDED(taskbar->HrInit())) {
-        if (visible) taskbar->AddTab(h);
-        else taskbar->DeleteTab(h);
-    }
+    HRESULT result = CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+        IID_ITaskbarList, taskbar.put_void());
+    if (SUCCEEDED(result)) result = taskbar->HrInit();
+    if (SUCCEEDED(result)) result = visible ? taskbar->AddTab(h) : taskbar->DeleteTab(h);
+    if (FAILED(result))
+        TraceAltTab(L"taskbar", h, visible ? L"add-failed" : L"delete-failed",
+            nullptr, nullptr, nullptr, static_cast<DWORD>(result));
 }
 
 // Keep the snapshot and tags during the temporary native switcher preview.
@@ -839,22 +842,27 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return false; }
 
     auto& original = it->second;
-    // Restore the original styles and show the window before replaying Tab.
-    const bool refreshButton = preview && IsWindowVisible(h) &&
-        (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) &&
-        !(original.exStyle & WS_EX_TOOLWINDOW);
-    if (refreshButton && SetWindowPresented(h, false))
-        original.hiddenByLasso = true;
+    if (preview && !IsOriginalWindowEligibleForPreview(h)) return false;
 
-    SetWindowLongPtrW(h, GWL_EXSTYLE, original.exStyle);
-    if (original.hasLayerAttributes)
-        SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
-    SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
-    if (original.hiddenByLasso) {
-        if (!IsWindowVisible(h) && !SetWindowPresented(h, true)) return false;
+    // Like the original switcher path, temporarily make the preview an
+    // app window and explicitly show it. The snapshot owns the final style.
+    const LONG_PTR targetStyle = preview ? original.exStyle | WS_EX_APPWINDOW : original.exStyle;
+    if (preview && IsWindowVisible(h) && !SetWindowPresented(h, false)) return false;
+    if (preview) original.hiddenByLasso = true;
+
+    SetLastError(ERROR_SUCCESS);
+    if (!SetWindowLongPtrW(h, GWL_EXSTYLE, targetStyle) && GetLastError() != ERROR_SUCCESS)
+        return false;
+    if (original.hasLayerAttributes &&
+        !SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags))
+        return false;
+    if (preview || original.hiddenByLasso) {
+        if (!SetWindowPresented(h, true, SWP_FRAMECHANGED) || !IsWindowVisible(h)) return false;
         original.hiddenByLasso = false;
+    } else if (!SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED)) {
+        return false;
     }
-    if (original.wasVisible && IsWindowVisible(h) && !(original.exStyle & WS_EX_TOOLWINDOW))
+    if (original.wasVisible && IsWindowVisible(h) && !(targetStyle & WS_EX_TOOLWINDOW))
         UpdateTaskbarButton(h, true);
     InvalidateRect(h, nullptr, TRUE);
     if (!preview) {
@@ -1049,10 +1057,10 @@ static bool ReadDesktopRegistryGuid(const wchar_t* key, const wchar_t* value, GU
     return true;
 }
 
-static bool GetCurrentDesktopGuid(GUID& desktop) {
+static bool GetCurrentDesktopGuidFromForeground(GUID& desktop, HWND anchor) {
     // Explorer can update its registry value after the new desktop receives focus.
     // Prefer a regular foreground window when the public API can identify it.
-    const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    const HWND foreground = GetAncestor(anchor, GA_ROOT);
     wchar_t className[64]{};
     constexpr GUID pinnedApp{0xbb64d5b7, 0x4de3, 0x4ab2, {0xa8, 0x7c, 0xdb, 0x76, 0x01, 0xae, 0xa7, 0xdc}};
     constexpr GUID pinnedWindow{0xc2ddea68, 0x66f2, 0x4cf9, {0x82, 0x64, 0x1b, 0xfd, 0x00, 0xfb, 0xbb, 0xac}};
@@ -1089,6 +1097,10 @@ static bool GetCurrentDesktopGuid(GUID& desktop) {
     TraceAltTab(L"desktop", foreground, singleDesktop ? L"single-desktop" : L"unavailable",
         singleDesktop ? &desktop : nullptr);
     return singleDesktop;
+}
+
+static bool GetCurrentDesktopGuid(GUID& desktop) {
+    return GetCurrentDesktopGuidFromForeground(desktop, GetForegroundWindow());
 }
 
 using ReadCurrentDesktop = bool(*)(GUID&);
@@ -1311,7 +1323,8 @@ void SuppressWinKeyMenuModern() {
 // Alt+Tab 临时预览及同桌面进程组收网
 // ============================================================================
 
-bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurrentDesktopGuid) {
+bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = nullptr,
+                              HWND foreground = GetForegroundWindow()) {
     // Repeated Tab advances the native switcher without rebuilding the preview.
     if (g_InSnapWindows) return true;
     if (AltTabDiagnosticsEnabled()) {
@@ -1326,7 +1339,9 @@ bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurren
         return false;
     }
     GUID currentDesktop{};
-    if (!readCurrentDesktop(currentDesktop) || IsEqualGUID(currentDesktop, GUID{})) {
+    const bool resolved = readCurrentDesktop ? readCurrentDesktop(currentDesktop)
+        : GetCurrentDesktopGuidFromForeground(currentDesktop, foreground);
+    if (!resolved || IsEqualGUID(currentDesktop, GUID{})) {
         TraceAltTab(L"preview", nullptr, L"current-desktop-unavailable");
         return false;
     }
@@ -1355,7 +1370,10 @@ bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurren
             } else if (ShowWindowAndShowTaskbarIcon(h, true)) {
                 g_snapUnhiddenWindows.push_back(h);
                 result = shellCloaked ? L"restored-after-shell-cloak" : L"restored";
-            } else result = L"restore-failed";
+            } else {
+                const bool resealed = HideWindowAndHideTaskbarIcon(h, true);
+                result = resealed ? L"restore-failed" : L"restore-and-reseal-failed";
+            }
         }
 
         if (AltTabDiagnosticsEnabled()) {
@@ -1436,13 +1454,14 @@ static void ScheduleAltTabCollect(HWND coordinator) {
 }
 
 static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
-                               ReadCurrentDesktop readCurrentDesktop = GetCurrentDesktopGuid) {
+                               ReadCurrentDesktop readCurrentDesktop = nullptr) {
     if (g_altTabNextCollectAt) {
         // A new Alt chord arrived before the previous release was collected.
         CancelAltTabCollectTimer(coordinator);
-        FinishAltTabPreview(IsSwitcherWindow(foreground) ? nullptr : foreground, readCurrentDesktop);
+        FinishAltTabPreview(IsSwitcherWindow(foreground) ? nullptr : foreground,
+            readCurrentDesktop ? readCurrentDesktop : GetCurrentDesktopGuid);
     }
-    return TryUnHideWindowsForAltTab(readCurrentDesktop);
+    return TryUnHideWindowsForAltTab(readCurrentDesktop, foreground);
 }
 
 // ============================================================================
@@ -1472,7 +1491,9 @@ LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (key->flags & LLKHF_INJECTED)
             return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
         const bool reverse = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (PostMessageW(coordinator, WM_LASSO_ALT_TAB, reverse, 0)) return 1;
+        const HWND foreground = GetForegroundWindow();
+        if (PostMessageW(coordinator, WM_LASSO_ALT_TAB, reverse,
+                reinterpret_cast<LPARAM>(foreground))) return 1;
     }
     if (key->vkCode == VK_ESCAPE && down)
         PostMessageW(coordinator, WM_LASSO_ESCAPE, 0, 0);
@@ -2079,7 +2100,8 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         HideOtherApplications(reinterpret_cast<HWND>(wp));
         return 0;
     case WM_LASSO_ALT_TAB: {
-        BeginAltTabPreview(hwnd, GetForegroundWindow());
+        const HWND foregroundAtKeyDown = reinterpret_cast<HWND>(lp);
+        BeginAltTabPreview(hwnd, IsWindow(foregroundAtKeyDown) ? foregroundAtKeyDown : GetForegroundWindow());
         INPUT input[6]{};
         const bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
