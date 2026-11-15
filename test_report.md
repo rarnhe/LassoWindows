@@ -1,9 +1,9 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-10-31 09:42:32
-- 测试源码基准提交：49bd5b9f09b358dd152a434d4a5fd37a5d1a6d5d
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/41189725218
+- 时间（UTC）：2026-11-15 09:58:17
+- 测试源码基准提交：c3b3e613df942ecdf24c28bb04c6955af7ac8e6d
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43701738136
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
 - 统计：通过 29 / 失败 0 / 跳过 0 / 共 29
