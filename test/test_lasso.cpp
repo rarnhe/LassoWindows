@@ -147,12 +147,12 @@ void run(const std::string& name) {
         return;
     }
     if (name == "cross_desktop_win_c") {
-        Window current, selected, otherDesktop, inactive, moved, invalidProcess, oldDesktopName;
+        Window current, selected, otherDesktop, inactive, otherProcess, invalidProcess, oldDesktopName;
         const GUID deskA{1}, deskB{2};
         ShowWindow(current, SW_SHOWNOACTIVATE);
         ShowWindow(selected, SW_SHOWNOACTIVATE);
         ShowWindow(otherDesktop, SW_SHOWNOACTIVATE);
-        ShowWindow(moved, SW_SHOWNOACTIVATE);
+        ShowWindow(otherProcess, SW_SHOWNOACTIVATE);
         ShowWindow(invalidProcess, SW_SHOWNOACTIVATE);
         ShowWindow(oldDesktopName, SW_SHOWNOACTIVATE);
         CHECK(SetPropW(otherDesktop, L"Fixture.SecondDesktop", reinterpret_cast<HANDLE>(UINT_PTR{1})));
@@ -166,7 +166,7 @@ void run(const std::string& name) {
             id = foreign ? GUID{2} : GUID{1};
             return !requireCurrent || !foreign;
         }};
-        for (HWND h : {current.h, selected.h, otherDesktop.h, inactive.h, moved.h,
+        for (HWND h : {current.h, selected.h, otherDesktop.h, inactive.h,
                        invalidProcess.h, oldDesktopName.h})
             CHECK(EnumHideWindowsProc(h, reinterpret_cast<LPARAM>(&filter)));
         CHECK(ReadTaggedProcess(current) == process && TaggedDesktopMatches(current, deskA));
@@ -174,34 +174,47 @@ void run(const std::string& name) {
         CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(!GetPropW(inactive, L"MTU_PROC_TAG") && !GetPropW(inactive, L"MTU_VD_TAG"));
 
-        // Move a sealed window without changing its tag. It must stay hidden.
-        CHECK(SetPropW(moved, L"Fixture.SecondDesktop", reinterpret_cast<HANDLE>(UINT_PTR{1})));
+        CHECK(SealWindow(otherProcess, L"other-fixture.exe", deskA));
         CHECK(SetSealTag(invalidProcess, L"MTU_PROC_TAG", L"Unknown"));
         CHECK(SetSealTag(oldDesktopName, L"MTU_VD_TAG", L"Fixture desktop name"));
-        CHECK(TryUnHideWindowsForAltTab(filter.readDesktop));
-        CHECK(g_snapUnhiddenWindows.size() == 2);
+        static int desktopReads = 0;
+        auto firstDesktop = +[](GUID& id) {
+            ++desktopReads;
+            id = GUID{1};
+            return true;
+        };
+        auto secondDesktop = +[](GUID& id) { id = GUID{2}; return true; };
+        CHECK(!TryUnHideWindowsForAltTab(+[](GUID&) { return false; }));
+        CHECK(TryUnHideWindowsForAltTab(firstDesktop));
+        CHECK(desktopReads == 1);
+        CHECK(TryUnHideWindowsForAltTab(firstDesktop)); // Repeated tabs reuse the preview.
+        CHECK(desktopReads == 1);
+        CHECK(g_snapUnhiddenWindows.size() == 3);
         CHECK(!(GetWindowLongPtrW(selected, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
-        CHECK(GetWindowLongPtrW(moved, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(!(GetWindowLongPtrW(otherProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
         CHECK(GetWindowLongPtrW(invalidProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(oldDesktopName, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
         WinEventProc(nullptr, EVENT_SYSTEM_FOREGROUND, selected, OBJID_WINDOW, CHILDID_SELF, 0, 0);
         CHECK(g_InSnapWindows);
-        FinishAltTabPreview(selected, filter.readDesktop);
+        FinishAltTabPreview(selected, firstDesktop);
+        CHECK(desktopReads == 2);
         CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
-        CHECK(IsWindowVisible(selected));
+        CHECK(IsWindowVisible(selected) && IsWindowVisible(current));
         CHECK(ReadTaggedProcess(selected).empty() && !GetPropW(selected, L"MTU_VD_TAG"));
-        CHECK(GetWindowLongPtrW(current, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
-        CHECK(ReadTaggedProcess(current) == process && TaggedDesktopMatches(current, deskA));
+        CHECK(ReadTaggedProcess(current).empty() && !GetPropW(current, L"MTU_VD_TAG"));
+        CHECK(GetWindowLongPtrW(otherProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(TaggedDesktopMatches(otherProcess, deskA));
+        CHECK(TaggedDesktopMatches(otherDesktop, deskB));
 
-        auto secondDesktop = +[](HWND h, GUID& id, bool requireCurrent) {
-            const bool foreign = GetPropW(h, L"Fixture.SecondDesktop") != nullptr;
-            id = foreign ? GUID{2} : GUID{1};
-            return !requireCurrent || foreign;
-        };
         CHECK(TryUnHideWindowsForAltTab(secondDesktop));
         CHECK(g_snapUnhiddenWindows == std::vector<HWND>{otherDesktop.h});
+        FinishAltTabPreview(otherDesktop, firstDesktop); // Desktop changed while Alt was held.
+        CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(TaggedDesktopMatches(otherDesktop, deskB));
+
+        CHECK(TryUnHideWindowsForAltTab(secondDesktop));
         ExecuteCollectRestore(); // The coordinator invokes this on Escape.
         CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
         CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);

@@ -23,6 +23,7 @@
 #pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "propsys.lib")
+#pragma comment(lib, "advapi32.lib")
 using namespace winrt;
 using namespace Windows::UI::Notifications;
 using namespace Windows::Data::Xml::Dom;
@@ -991,7 +992,50 @@ static bool IsSwitcherWindow(HWND h) {
         wcsncmp(name, simpleSwitcher, std::size(simpleSwitcher) - 1) == 0;
 }
 
-static void FinishAltTabPreview(HWND winner, ReadWindowDesktop readDesktop = GetWindowDesktopGuid);
+static bool ReadDesktopRegistryGuid(const wchar_t* key, const wchar_t* value, GUID& desktop) {
+    GUID id{};
+    DWORD size = sizeof(id);
+    if (RegGetValueW(HKEY_CURRENT_USER, key, value, RRF_RT_REG_BINARY,
+            nullptr, &id, &size) != ERROR_SUCCESS || size != sizeof(id) ||
+        IsEqualGUID(id, GUID{})) return false;
+    desktop = id;
+    return true;
+}
+
+static bool GetCurrentDesktopGuid(GUID& desktop) {
+    // Explorer can update its registry value after the new desktop receives focus.
+    // Prefer a regular foreground window when the public API can identify it.
+    const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    wchar_t className[64]{};
+    constexpr GUID pinnedApp{0xbb64d5b7, 0x4de3, 0x4ab2, {0xa8, 0x7c, 0xdb, 0x76, 0x01, 0xae, 0xa7, 0xdc}};
+    constexpr GUID pinnedWindow{0xc2ddea68, 0x66f2, 0x4cf9, {0x82, 0x64, 0x1b, 0xfd, 0x00, 0xfb, 0xbb, 0xac}};
+    GUID id{};
+    if (foreground && IsWindowVisible(foreground) && !IsSwitcherWindow(foreground) &&
+        GetClassNameW(foreground, className, static_cast<int>(std::size(className))) &&
+        wcscmp(className, L"Progman") != 0 && wcscmp(className, L"WorkerW") != 0 &&
+        wcscmp(className, L"Shell_TrayWnd") != 0 && wcscmp(className, L"Shell_SecondaryTrayWnd") != 0 &&
+        GetWindowDesktopGuid(foreground, id, true) &&
+        !IsEqualGUID(id, pinnedApp) && !IsEqualGUID(id, pinnedWindow)) {
+        desktop = id;
+        return true;
+    }
+
+    constexpr wchar_t key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
+    if (ReadDesktopRegistryGuid(key, L"CurrentVirtualDesktop", desktop)) return true;
+
+    DWORD session = 0;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &session)) {
+        wchar_t sessionKey[128]{};
+        swprintf_s(sessionKey, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\%lu\\VirtualDesktops",
+            session);
+        if (ReadDesktopRegistryGuid(sessionKey, L"CurrentVirtualDesktop", desktop)) return true;
+    }
+    // The only listed desktop is necessarily current if there is exactly one.
+    return ReadDesktopRegistryGuid(key, L"VirtualDesktopIDs", desktop);
+}
+
+using ReadCurrentDesktop = bool(*)(GUID&);
+static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDesktop = GetCurrentDesktopGuid);
 static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
     KillTimer(hwnd, idEvent);
     if (!g_InSnapWindows) return;
@@ -1143,6 +1187,7 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 
 // 隐藏同类型窗口后，alt+tab临时查看下。
 // --- 全局变量与状态控制 ---
+static GUID g_altTabPreviewDesktop{};
 std::vector<HWND> g_snapUnhiddenWindows; // 存储 Alt+Tab 临时反隐藏的窗口句柄列表
 // ============================================================================
 // 1. 现代按键模拟辅助函数 (基于 SendInput)
@@ -1182,12 +1227,16 @@ void SuppressWinKeyMenuModern() {
 }
 
 // ============================================================================
-// Alt+Tab 临时预览及逐窗口收网
+// Alt+Tab 临时预览及同桌面进程组收网
 // ============================================================================
 
-bool TryUnHideWindowsForAltTab(ReadWindowDesktop readDesktop = GetWindowDesktopGuid) {
+bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = GetCurrentDesktopGuid) {
     // Repeated Tab advances the native switcher without rebuilding the preview.
     if (g_InSnapWindows) return true;
+    if (g_sealedWindowStates.empty()) return false;
+    GUID currentDesktop{};
+    if (!readCurrentDesktop(currentDesktop) || IsEqualGUID(currentDesktop, GUID{})) return false;
+    g_altTabPreviewDesktop = currentDesktop;
     std::vector<HWND> candidates;
     for (const auto& entry : g_sealedWindowStates) candidates.push_back(entry.first);
 
@@ -1195,10 +1244,17 @@ bool TryUnHideWindowsForAltTab(ReadWindowDesktop readDesktop = GetWindowDesktopG
     g_InSnapWindows = true;
     for (HWND h : candidates) {
         if (!IsOriginalWindowEligibleForPreview(h) ||
-            !CanUnsealOnCurrentDesktop(h, readDesktop)) continue;
+            !TaggedDesktopMatches(h, currentDesktop) ||
+            !IsIdentifiedProcess(ReadTaggedProcess(h))) continue;
+        // A window moved by the user may still carry the previous GUID.
+        // Respect an explicit Shell cloak without querying each sealed HWND via COM.
+        DWORD cloak = 0;
+        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
+            (cloak & DWM_CLOAKED_SHELL)) continue;
         if (ShowWindowAndShowTaskbarIcon(h, true)) g_snapUnhiddenWindows.push_back(h);
     }
     g_InSnapWindows = !g_snapUnhiddenWindows.empty();
+    if (!g_InSnapWindows) g_altTabPreviewDesktop = GUID{};
     if (g_InSnapWindows) {
         // Let the restored windows paint before the native switcher captures them.
         for (HWND h : g_snapUnhiddenWindows)
@@ -1208,22 +1264,38 @@ bool TryUnHideWindowsForAltTab(ReadWindowDesktop readDesktop = GetWindowDesktopG
     return g_InSnapWindows;
 }
 
-static void FinishAltTabPreview(HWND winner, ReadWindowDesktop readDesktop) {
+static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDesktop) {
     if (!g_InSnapWindows) return;
 
-    const HWND root = winner ? GetAncestor(winner, GA_ROOT) : nullptr;
-    const HWND owner = winner ? GetAncestor(winner, GA_ROOTOWNER) : nullptr;
-    HWND selected = root;
-    if (std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), selected) ==
-        g_snapUnhiddenWindows.end()) selected = owner;
+    std::wstring selectedProcess;
+    GUID currentDesktop{};
+    if (IsWindow(winner) && readCurrentDesktop(currentDesktop) &&
+        IsEqualGUID(currentDesktop, g_altTabPreviewDesktop)) {
+        const HWND root = GetAncestor(winner, GA_ROOT);
+        const HWND owner = GetAncestor(winner, GA_ROOTOWNER);
+        HWND selected = root;
+        if (std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), selected) ==
+            g_snapUnhiddenWindows.end()) selected = owner;
+        if (std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), selected) !=
+            g_snapUnhiddenWindows.end()) {
+            if (TaggedDesktopMatches(selected, currentDesktop))
+                selectedProcess = ReadTaggedProcess(selected);
+        } else if (root) {
+            // A visible window can be selected while its siblings are being previewed.
+            selectedProcess = GetRealProcessName(root);
+        }
+    }
 
+    const bool keepProcess = IsIdentifiedProcess(selectedProcess);
     for (HWND h : g_snapUnhiddenWindows) {
         if (!g_sealedWindowStates.contains(h)) continue;
-        if (h == selected && CanUnsealOnCurrentDesktop(h, readDesktop) &&
+        if (keepProcess && TaggedDesktopMatches(h, currentDesktop) &&
+            _wcsicmp(ReadTaggedProcess(h).c_str(), selectedProcess.c_str()) == 0 &&
             ShowWindowAndShowTaskbarIcon(h)) continue;
         HideWindowAndHideTaskbarIcon(h);
     }
     g_snapUnhiddenWindows.clear();
+    g_altTabPreviewDesktop = GUID{};
     g_InSnapWindows = false;
 }
 
