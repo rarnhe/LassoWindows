@@ -6,8 +6,8 @@
 
 struct Window {
     HWND h;
-    explicit Window(DWORD ex = WS_EX_APPWINDOW, HWND parent = nullptr) {
-        h = CreateWindowExW(ex, L"STATIC", L"Lasso fixture",
+    explicit Window(DWORD ex = WS_EX_APPWINDOW, HWND parent = nullptr, const wchar_t* windowClass = L"STATIC") {
+        h = CreateWindowExW(ex, windowClass, L"Lasso fixture",
             parent ? WS_CHILD : WS_OVERLAPPEDWINDOW, 50, 50, 240, 160,
             parent, nullptr, GetModuleHandleW(nullptr), nullptr);
         CHECK(h);
@@ -50,6 +50,56 @@ void iniTest(const std::string& name) {
 }
 void run(const std::string& name) {
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
+    if (name == "uwp_frame_visibility") {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"ApplicationFrameWindow";
+        CHECK(RegisterClassW(&wc));
+
+        Window frame(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
+        const LONG_PTR style = GetWindowLongPtrW(frame, GWL_EXSTYLE);
+        ShowWindow(frame, SW_SHOWNOACTIVATE);
+        HideWindowAndHideTaskbarIcon(frame);
+        CHECK(IsWindow(frame) && !IsWindowVisible(frame));
+        CHECK(GetWindowLongPtrW(frame, GWL_EXSTYLE) == style);
+        CHECK(IsOriginalWindowEligibleForPreview(frame));
+        CHECK(ShowWindowAndShowTaskbarIcon(frame, true));
+        CHECK(IsWindowVisible(frame) && g_sealedWindowStates.contains(frame.h));
+        HideWindowAndHideTaskbarIcon(frame);
+        CHECK(!IsWindowVisible(frame));
+        CHECK(ShowWindowAndShowTaskbarIcon(frame));
+        CHECK(IsWindowVisible(frame) && !g_sealedWindowStates.contains(frame.h));
+
+        Window minimized(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
+        ShowWindow(minimized, SW_SHOWMINNOACTIVE);
+        CHECK(IsIconic(minimized));
+        HideWindowAndHideTaskbarIcon(minimized);
+        CHECK(!IsWindowVisible(minimized));
+        CHECK(!IsOriginalWindowEligibleForPreview(minimized));
+        CHECK(ShowWindowAndShowTaskbarIcon(minimized));
+        CHECK(IsIconic(minimized) && IsWindowVisible(minimized));
+
+        Window hidden(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
+        HideWindowAndHideTaskbarIcon(hidden);
+        CHECK(!IsOriginalWindowEligibleForPreview(hidden));
+        CHECK(ShowWindowAndShowTaskbarIcon(hidden));
+        CHECK(!IsWindowVisible(hidden));
+        return;
+    }
+    if (name == "alt_tab_chord") {
+        INPUT input[6]{};
+        CHECK(BuildAltTabInput(input, false, false, true) == 6);
+        constexpr WORD keys[] = {VK_MENU, VK_SHIFT, VK_TAB, VK_TAB, VK_SHIFT, VK_MENU};
+        for (size_t i = 0; i < std::size(keys); ++i) {
+            CHECK(input[i].type == INPUT_KEYBOARD && input[i].ki.wVk == keys[i]);
+            CHECK(input[i].ki.dwFlags == (i >= 3 ? KEYEVENTF_KEYUP : 0));
+        }
+        CHECK(BuildAltTabInput(input, true, false, false) == 2);
+        CHECK(input[0].ki.wVk == VK_TAB && input[0].ki.dwFlags == 0);
+        CHECK(input[1].ki.wVk == VK_TAB && input[1].ki.dwFlags == KEYEVENTF_KEYUP);
+        return;
+    }
     if (name == "invalid_process") {
         CHECK(GetProcessNameByPid(0).empty());
         CHECK(GetRealProcessName(nullptr) == L"Unknown"); return;
@@ -217,13 +267,28 @@ void run(const std::string& name) {
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     } else if (name == "collect") {
-        g_InSnapWindows = true; g_AltLogicActive = true;
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        ATOM process = GlobalAddAtomW(L"preview-fixture.exe");
+        CHECK(process);
+        CHECK(SetPropW(w, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(process))));
+        HideWindowAndHideTaskbarIcon(w);
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        CHECK(IsWindowVisible(w));
+        CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+
+        g_InSnapWindows = true;
         g_snapUnhiddenWindows = {w, nullptr};
+        CHECK(TryUnHideWindowsForAltTab());
+        CHECK(g_snapUnhiddenWindows.size() == 2);
         ExecuteCollectRestore();
         CHECK(g_snapUnhiddenWindows.empty());
-        CHECK(!g_InSnapWindows && !g_AltLogicActive);
+        CHECK(!g_InSnapWindows);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
-        ExecuteCollectRestore(); CHECK(g_snapUnhiddenWindows.empty());
+        CHECK(ReadTaggedProcess(w) == L"preview-fixture.exe");
+        ExecuteCollectRestore();
+        CHECK(g_snapUnhiddenWindows.empty());
+        CHECK(ShowWindowAndShowTaskbarIcon(w));
+        CHECK(ReadTaggedProcess(w).empty());
     } else if (name == "icon_cache") {
         auto icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); CHECK(icon);
         SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));

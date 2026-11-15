@@ -49,7 +49,7 @@ foreach ($case in $failed) {
 if ($failed.Count -eq 0) { $lines.Add("无用例失败详情；若整体失败，请检查 Actions 阶段和构建日志。") }
 $lines.Add("")
 $lines.Add("## 覆盖范围")
-$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
+$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、Alt+Tab 按键序列、模拟 UWP 外框的可见性切换、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
 $lines.Add("")
 $lines.Add("全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。")
 $content = $lines -join [Environment]::NewLine
