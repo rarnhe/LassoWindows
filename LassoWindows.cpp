@@ -609,17 +609,17 @@ static bool GetWindowDesktopGuid(HWND h, GUID& id, bool requireCurrent = false) 
     if (SUCCEEDED(hr) && (!requireCurrent || onCurrent))
         hr = manager->GetWindowDesktopId(h, &id);
     manager->Release();
-    return SUCCEEDED(hr) && (!requireCurrent || onCurrent);
+    return SUCCEEDED(hr) && (!requireCurrent || onCurrent) && !IsEqualGUID(id, GUID{});
 }
 
 static bool ReadTaggedDesktopGuid(HWND h, GUID& id) {
-    HANDLE prop = GetPropW(h, L"MTU_VD_TAG");
-    if (!prop) return false;
+    const auto atom = reinterpret_cast<UINT_PTR>(GetPropW(h, L"MTU_VD_TAG"));
     wchar_t value[64]{};
-    ATOM atom = static_cast<ATOM>(reinterpret_cast<UINT_PTR>(prop));
-    if (!GlobalGetAtomNameW(atom, value, static_cast<int>(std::size(value))))
+    if (atom < MAXINTATOM || atom > 0xffff ||
+        !GlobalGetAtomNameW(static_cast<ATOM>(atom), value, static_cast<int>(std::size(value))))
         return false;
-    return SUCCEEDED(CLSIDFromString(value, &id));
+    return wcslen(value) == 38 && value[0] == L'{' && value[37] == L'}' &&
+        SUCCEEDED(CLSIDFromString(value, &id)) && !IsEqualGUID(id, GUID{});
 }
 
 static bool TaggedDesktopMatches(HWND h, const GUID& expected) {
@@ -627,29 +627,28 @@ static bool TaggedDesktopMatches(HWND h, const GUID& expected) {
     return ReadTaggedDesktopGuid(h, tag) && IsEqualGUID(tag, expected);
 }
 
-static bool TagCurrentVirtualDesktop(HWND h) {
-    GUID actual{};
-    if (!GetWindowDesktopGuid(h, actual, true)) return false;
-    if (GetPropW(h, L"MTU_VD_TAG")) return TaggedDesktopMatches(h, actual);
-    wchar_t text[64]{};
-    if (!StringFromGUID2(actual, text, static_cast<int>(std::size(text)))) return false;
-    ATOM atom = GlobalAddAtomW(text);
-    if (!atom) return false;
-    if (!SetPropW(h, L"MTU_VD_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(atom)))) {
-        GlobalDeleteAtom(atom);
-        return false;
-    }
-    return true;
+static constexpr wchar_t SHARED_UWP_HOST[] = L"ApplicationFrameHost.exe";
+
+static std::wstring ReadTaggedProcess(HWND h) {
+    const auto tag = GetPropW(h, L"MTU_PROC_TAG");
+    wchar_t process[MAX_PATH]{};
+    const auto atom = reinterpret_cast<UINT_PTR>(tag);
+    if (atom < MAXINTATOM || atom > 0xffff ||
+        !GlobalGetAtomNameW(static_cast<ATOM>(atom), process, static_cast<int>(std::size(process)))) return {};
+    return process;
 }
 
-// Fail closed if either the saved GUID, actual GUID or current-desktop check
-// is unavailable. Never use a matching process name alone for unsealing.
-static bool CanUnsealOnCurrentDesktop(HWND h) {
-    if (!GetPropW(h, L"MTU_PROC_TAG")) return false;
-    GUID saved{}, actual{};
-    return ReadTaggedDesktopGuid(h, saved) &&
-        GetWindowDesktopGuid(h, actual, true) &&
-        IsEqualGUID(saved, actual);
+static bool IsIdentifiedProcess(const std::wstring& process) {
+    return !process.empty() && _wcsicmp(process.c_str(), L"Unknown") != 0 &&
+        _wcsicmp(process.c_str(), SHARED_UWP_HOST) != 0;
+}
+
+using ReadWindowDesktop = bool(*)(HWND, GUID&, bool);
+
+static bool CanUnsealOnCurrentDesktop(HWND h, ReadWindowDesktop readDesktop = GetWindowDesktopGuid) {
+    if (!IsIdentifiedProcess(ReadTaggedProcess(h))) return false;
+    GUID current{};
+    return readDesktop(h, current, true) && TaggedDesktopMatches(h, current);
 }
 
 // 事件监控相关
@@ -680,13 +679,25 @@ static bool RequestHostedUwpClose(HWND h) {
     return IsApplicationFrameWindow(h) && PostMessageW(h, WM_CLOSE, 0, 0) != FALSE;
 }
 
+static std::unordered_map<HWND, ULONGLONG> g_restoredWindowShows;
+
 static bool SetWindowPresented(HWND h, bool visible) {
-    return SetWindowPos(h, nullptr, 0, 0, 0, 0,
-        WINDOW_FRAME_FLAGS | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW)) != FALSE;
+    if (visible) {
+        const auto now = GetTickCount64();
+        std::erase_if(g_restoredWindowShows, [now](const auto& event) {
+            return now - event.second > 3000;
+        });
+        g_restoredWindowShows[h] = now;
+    }
+    if (SetWindowPos(h, nullptr, 0, 0, 0, 0,
+            WINDOW_FRAME_FLAGS | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW))) return true;
+    if (visible) g_restoredWindowShows.erase(h);
+    return false;
 }
 
 // A DWM cloak can outlive the process. Track ownership on the frame so
 // recovery clears only cloaks that Lasso set, including after a forced exit.
+static constexpr wchar_t PROP_UWP_HIDDEN_FRAME[] = L"LassoWindows.UwpHiddenFrame";
 static constexpr wchar_t PROP_UWP_DWM_CLOAK[] = L"LassoWindows.UwpDwmCloak";
 
 static bool SetDwmCloak(HWND h, BOOL cloak) {
@@ -748,15 +759,23 @@ static void ClearSealMarkers(HWND h) {
     }
 }
 
+static bool RestoreHiddenUwpFrame(HWND h) {
+    if (!GetPropW(h, PROP_UWP_HIDDEN_FRAME)) return true;
+    if (!IsWindowVisible(h) && !SetWindowPresented(h, true)) return false;
+    RemovePropW(h, PROP_UWP_HIDDEN_FRAME);
+    return true;
+}
+
 static void RecoverApplicationFrameState() {
     EnumWindows([](HWND h, LPARAM) -> BOOL {
-        if (!GetPropW(h, PROP_UWP_DWM_CLOAK) &&
+        if (!GetPropW(h, PROP_UWP_HIDDEN_FRAME) && !GetPropW(h, PROP_UWP_DWM_CLOAK) &&
             !GetPropW(h, uwp_taskbar::PROP_RESTORE_SWITCHER)) return TRUE;
         if (!IsApplicationFrameWindow(h)) return TRUE;
 
         const bool restoredCloak = RestoreApplicationFrameCloak(h);
         const bool restoredSwitcher = SUCCEEDED(uwp_taskbar::SetSwitcherVisibility(h, true));
-        if (restoredCloak && restoredSwitcher) ClearSealMarkers(h);
+        const bool restoredFrame = RestoreHiddenUwpFrame(h);
+        if (restoredCloak && restoredSwitcher && restoredFrame) ClearSealMarkers(h);
         return TRUE;
     }, 0);
 }
@@ -785,7 +804,7 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return false; }
 
     auto& original = it->second;
-    // Let Explorer rediscover a former tool window before native Alt+Tab.
+    // Restore the original styles and show the window before replaying Tab.
     const bool refreshButton = preview && IsWindowVisible(h) &&
         (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) &&
         !(original.exStyle & WS_EX_TOOLWINDOW);
@@ -810,15 +829,18 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     return true;
 }
 
-void HideWindowAndHideTaskbarIcon(HWND h) {
-    if (!SnapshotWindowState(h)) return;
+bool HideWindowAndHideTaskbarIcon(HWND h) {
+    if (!SnapshotWindowState(h)) return false;
     LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
     exStyle &= ~WS_EX_APPWINDOW;
     exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
-    SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle);
-    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    SetLastError(ERROR_SUCCESS);
+    if (!SetWindowLongPtrW(h, GWL_EXSTYLE, exStyle) && GetLastError() != ERROR_SUCCESS)
+        return false;
+    if (!SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA)) return false;
     SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED);
     UpdateTaskbarButton(h, false);
+    return true;
 }
 
 static void RestoreAllSealedWindows() {
@@ -958,14 +980,6 @@ std::wstring GetRealProcessName(HWND hwnd) {
 	return result;
 }
 
-static std::wstring ReadTaggedProcess(HWND h) {
-    const auto tag = GetPropW(h, L"MTU_PROC_TAG");
-    wchar_t process[MAX_PATH]{};
-    if (!tag || !GlobalGetAtomNameW(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(tag)),
-            process, static_cast<int>(std::size(process)))) return {};
-    return process;
-}
-
 static bool IsSwitcherWindow(HWND h) {
     wchar_t name[96]{};
     if (!GetClassNameW(h, name, static_cast<int>(std::size(name)))) return false;
@@ -977,8 +991,7 @@ static bool IsSwitcherWindow(HWND h) {
         wcsncmp(name, simpleSwitcher, std::size(simpleSwitcher) - 1) == 0;
 }
 
-using CanUnsealWindow = bool(*)(HWND);
-static void FinishAltTabPreview(HWND winner, CanUnsealWindow canUnseal = CanUnsealOnCurrentDesktop);
+static void FinishAltTabPreview(HWND winner, ReadWindowDesktop readDesktop = GetWindowDesktopGuid);
 static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
     KillTimer(hwnd, idEvent);
     if (!g_InSnapWindows) return;
@@ -989,7 +1002,7 @@ static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
             !SetTimer(hwnd, idEvent, 100, nullptr)) FinishAltTabPreview(nullptr);
         return;
     }
-    FinishAltTabPreview(GetAncestor(foreground, GA_ROOTOWNER));
+    FinishAltTabPreview(foreground);
 }
 
 //realname一致的同类窗口处理
@@ -997,84 +1010,73 @@ struct CloseFilter {
     std::wstring currentAppProcName;
 };
 
-static constexpr wchar_t SHARED_UWP_HOST[] = L"ApplicationFrameHost.exe";
+static bool SetSealTag(HWND h, const wchar_t* property, const wchar_t* value) {
+    const auto old = GetPropW(h, property);
+    const ATOM atom = GlobalAddAtomW(value);
+    if (!atom) return false;
+    if (!SetPropW(h, property, reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(atom)))) {
+        GlobalDeleteAtom(atom);
+        return false;
+    }
+    if (old) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(old)));
+    return true;
+}
+
+static bool SealWindow(HWND h, const std::wstring& process, REFGUID desktop) {
+    wchar_t desktopText[40]{};
+    if (process.empty() || IsEqualGUID(desktop, GUID{}) ||
+        !StringFromGUID2(desktop, desktopText, static_cast<int>(std::size(desktopText)))) return false;
+    const bool tracked = g_sealedWindowStates.contains(h);
+    if (!SnapshotWindowState(h)) return false;
+
+    const bool hadProcess = GetPropW(h, L"MTU_PROC_TAG") != nullptr;
+    const bool processMatches = _wcsicmp(ReadTaggedProcess(h).c_str(), process.c_str()) == 0;
+    if ((!processMatches && !SetSealTag(h, L"MTU_PROC_TAG", process.c_str())) ||
+        (!TaggedDesktopMatches(h, desktop) && !SetSealTag(h, L"MTU_VD_TAG", desktopText))) {
+        if (!hadProcess) {
+            if (const auto added = RemovePropW(h, L"MTU_PROC_TAG"))
+                GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(added)));
+        }
+        if (!tracked) g_sealedWindowStates.erase(h);
+        return false;
+    }
+    if (!HideWindowAndHideTaskbarIcon(h)) {
+        ShowWindowAndShowTaskbarIcon(h);
+        return false;
+    }
+
+    wchar_t title[512]{};
+    const std::wstring prefix = L"🕸";
+    if (GetWindowTextW(h, title, static_cast<int>(std::size(title))) > 0 &&
+        wcsncmp(title, prefix.c_str(), prefix.length()) != 0)
+        SetWindowTextW(h, (prefix + title).c_str());
+    return true;
+}
 
 struct HideCurrentFilter {
     std::wstring process;
-    bool hostedUwp;
+    ReadWindowDesktop readDesktop = GetWindowDesktopGuid;
 };
 
-// 隐藏指定 App 进程名对应的窗口
-BOOL CALLBACK EnumHideWindowsProc(HWND hWnd, LPARAM lParam) {
-	if (!lParam) return FALSE;
+BOOL CALLBACK EnumHideWindowsProc(HWND h, LPARAM lParam) {
+    const auto* filter = reinterpret_cast<const HideCurrentFilter*>(lParam);
+    if (!filter) return FALSE;
+    if (!IsWindowVisible(h) || GetParent(h) != nullptr) return TRUE;
+    if (_wcsicmp(GetRealProcessName(h).c_str(), filter->process.c_str()) != 0) return TRUE;
 
-	const auto& filter = *reinterpret_cast<const HideCurrentFilter*>(lParam);
-	const auto& targetProcName = filter.process;
+    wchar_t className[256]{};
+    if (_wcsicmp(filter->process.c_str(), L"explorer.exe") == 0 &&
+        (!GetClassNameW(h, className, static_cast<int>(std::size(className))) ||
+         wcscmp(className, L"CabinetWClass") != 0)) return TRUE;
 
-	// 基础过滤：仅处理可见顶级窗口
-	if (!IsWindow(hWnd) || !IsWindowVisible(hWnd) || GetParent(hWnd) != NULL) {
-		return TRUE;
-	}
+    if (IsApplicationFrameWindow(h)) {
+        RequestHostedUwpClose(h);
+        return TRUE;
+    }
 
-	// 虚拟桌面过滤
-	if (!IsWindowOnCurrentVirtualDesktop(hWnd)) {
-		return TRUE;
-	}
-
-	const bool hostedUwp = IsApplicationFrameWindow(hWnd);
-	if (hostedUwp != filter.hostedUwp) return TRUE;
-	std::wstring currentWndProcName = GetRealProcessName(hWnd);
-
-	if (_wcsicmp(targetProcName.c_str(), currentWndProcName.c_str()) == 0) {
-		if (hostedUwp) {
-			RequestHostedUwpClose(hWnd);
-			return TRUE;
-		}
-		wchar_t className[256] = { 0 };
-		if (GetClassNameW(hWnd, className, 256)) {
-			// Corner Case: explorer.exe 过滤
-			if (_wcsicmp(currentWndProcName.c_str(), L"explorer.exe") == 0) {
-				if (_wcsicmp(className, L"CabinetWClass") != 0) {
-					return TRUE;
-				}
-			}
-		}
-
-		// Reject windows that cannot safely be restored before changing any title/tags.
-		const bool alreadyTracked = g_sealedWindowStates.contains(hWnd);
-		if (!SnapshotWindowState(hWnd)) return TRUE;
-		if (!TagCurrentVirtualDesktop(hWnd)) {
-			if (!alreadyTracked) g_sealedWindowStates.erase(hWnd);
-			return TRUE;
-		}
-
-		// --- A. 添加 “🕸” 蛛网标 ---
-		wchar_t originalTitle[512] = { 0 };
-		if (GetWindowTextW(hWnd, originalTitle, 512) > 0) {
-			std::wstring titleStr = originalTitle;
-			std::wstring prefix = L"🕸";
-
-			if (titleStr.find(prefix) != 0) {
-				std::wstring newTitle = prefix + titleStr;
-				SetWindowTextW(hWnd, newTitle.c_str());
-				SetWindowPos(hWnd, NULL, 0, 0, 0, 0,
-					SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-			}
-		}
-
-		// --- B. 挂载进程名 Atom (MTU_PROC_TAG) ---
-		if (!GetPropW(hWnd, L"MTU_PROC_TAG")) {
-			ATOM procAtom = GlobalAddAtomW(targetProcName.c_str());
-			SetPropW(hWnd, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(procAtom)));
-		}
-
-		// MTU_VD_TAG already contains the official virtual desktop GUID.
-
-		// --- D. 执行隐匿 ---
-		HideWindowAndHideTaskbarIcon(hWnd);
-	}
-
-	return TRUE;
+    GUID desktop{};
+    if (filter->readDesktop(h, desktop, false)) SealWindow(h, filter->process, desktop);
+    return TRUE;
 }
 
 // 反向隐藏：隐藏所有【不属于】当前 App 进程名的窗口
@@ -1130,45 +1132,8 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 
 		}
 
-		// Validate reversible state before writing marker properties.
-		const bool alreadyTracked = g_sealedWindowStates.contains(hWnd);
-		if (!SnapshotWindowState(hWnd)) return TRUE;
-		if (!TagCurrentVirtualDesktop(hWnd)) {
-			if (!alreadyTracked) g_sealedWindowStates.erase(hWnd);
-			return TRUE;
-		}
-
-		// --- 1. 获取并修改标题文字 ---
-		wchar_t originalTitle[512];
-		if (GetWindowTextW(hWnd, originalTitle, 512) > 0) {
-			std::wstring titleStr = originalTitle;
-			std::wstring prefix = L"🕸";
-
-			// 检查是否已经贴过标，防止重复添加
-			if (titleStr.find(prefix) != 0) {
-				std::wstring newTitle = prefix + titleStr;
-				SetWindowTextW(hWnd, newTitle.c_str());
-			}
-		}
-		else {
-			// 如果窗口本来没有标题，直接设置
-			SetWindowTextW(hWnd, L"🕸");
-		}
-
-		SetWindowPos(hWnd, NULL, 0, 0, 0, 0,
-			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-
-		// --- 动态贴标逻辑 ---
-		// 标记该窗口所属的进程名，以便后续通过 Alt+Tab 恢复该进程的所有窗口
-		if (!GetPropW(hWnd, L"MTU_PROC_TAG")) {
-			ATOM procAtom = GlobalAddAtomW(otherWndProcName.c_str());
-			SetPropW(hWnd, L"MTU_PROC_TAG", (HANDLE)(UINT_PTR)procAtom);
-		}
-
-		// MTU_VD_TAG already contains the official virtual desktop GUID.
-
-		// --- 执行隐藏 ---
-		HideWindowAndHideTaskbarIcon(hWnd);
+        GUID desktop{};
+        if (GetWindowDesktopGuid(hWnd, desktop, true)) SealWindow(hWnd, otherWndProcName, desktop);
 	}
 
 	return TRUE;
@@ -1217,10 +1182,10 @@ void SuppressWinKeyMenuModern() {
 }
 
 // ============================================================================
-// Alt+Tab 反隐藏及收网逻辑修正版（支持同进程多窗口统一解封与还原）
+// Alt+Tab 临时预览及逐窗口收网
 // ============================================================================
 
-bool TryUnHideWindowsForAltTab(CanUnsealWindow canUnseal = CanUnsealOnCurrentDesktop) {
+bool TryUnHideWindowsForAltTab(ReadWindowDesktop readDesktop = GetWindowDesktopGuid) {
     // Repeated Tab advances the native switcher without rebuilding the preview.
     if (g_InSnapWindows) return true;
     std::vector<HWND> candidates;
@@ -1230,38 +1195,33 @@ bool TryUnHideWindowsForAltTab(CanUnsealWindow canUnseal = CanUnsealOnCurrentDes
     g_InSnapWindows = true;
     for (HWND h : candidates) {
         if (!IsOriginalWindowEligibleForPreview(h) ||
-            ReadTaggedProcess(h).empty() || !canUnseal(h)) continue;
+            !CanUnsealOnCurrentDesktop(h, readDesktop)) continue;
         if (ShowWindowAndShowTaskbarIcon(h, true)) g_snapUnhiddenWindows.push_back(h);
     }
     g_InSnapWindows = !g_snapUnhiddenWindows.empty();
-    if (g_InSnapWindows) DwmFlush();
+    if (g_InSnapWindows) {
+        // Let the restored windows paint before the native switcher captures them.
+        for (HWND h : g_snapUnhiddenWindows)
+            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+        DwmFlush();
+    }
     return g_InSnapWindows;
 }
 
-static void FinishAltTabPreview(HWND winner, CanUnsealWindow canUnseal) {
+static void FinishAltTabPreview(HWND winner, ReadWindowDesktop readDesktop) {
     if (!g_InSnapWindows) return;
 
-    std::wstring chosenProcess;
-    if (winner) {
-        if (canUnseal(winner)) chosenProcess = ReadTaggedProcess(winner);
-        if (chosenProcess.empty() && IsWindowOnCurrentVirtualDesktop(winner))
-            chosenProcess = GetRealProcessName(winner);
-    }
-    if (!chosenProcess.empty() && chosenProcess != L"Unknown" &&
-        _wcsicmp(chosenProcess.c_str(), SHARED_UWP_HOST) != 0) {
-        for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
-            const HWND h = (it++)->first;
-            if (canUnseal(h) &&
-                _wcsicmp(chosenProcess.c_str(), ReadTaggedProcess(h).c_str()) == 0)
-                ShowWindowAndShowTaskbarIcon(h);
-        }
-    } else if (winner && canUnseal(winner)) {
-        ShowWindowAndShowTaskbarIcon(winner);
-    }
+    const HWND root = winner ? GetAncestor(winner, GA_ROOT) : nullptr;
+    const HWND owner = winner ? GetAncestor(winner, GA_ROOTOWNER) : nullptr;
+    HWND selected = root;
+    if (std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), selected) ==
+        g_snapUnhiddenWindows.end()) selected = owner;
+
     for (HWND h : g_snapUnhiddenWindows) {
-        // Undo a preview even if the user changed desktops while it was open.
-        if (g_sealedWindowStates.contains(h) && GetPropW(h, L"MTU_PROC_TAG"))
-            HideWindowAndHideTaskbarIcon(h);
+        if (!g_sealedWindowStates.contains(h)) continue;
+        if (h == selected && CanUnsealOnCurrentDesktop(h, readDesktop) &&
+            ShowWindowAndShowTaskbarIcon(h)) continue;
+        HideWindowAndHideTaskbarIcon(h);
     }
     g_snapUnhiddenWindows.clear();
     g_InSnapWindows = false;
@@ -1599,6 +1559,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
         // A HWND can be recycled after destruction; never restore stale state
         // onto a different window that later receives the same handle value.
         g_sealedWindowStates.erase(hwnd);
+        g_restoredWindowShows.erase(hwnd);
         auto forget = [hwnd](std::vector<HWND>& v) {
             v.erase(std::remove(v.begin(), v.end(), hwnd), v.end());
         };
@@ -1709,10 +1670,21 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 	std::wstring className = cls;
 	std::wstring windowTitle = title;
 
-    // Reopening an application may unseal its existing windows only when
-    // the event and the tagged window belong to the active desktop.
-    if ((event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE ||
-         event == EVENT_OBJECT_FOCUS || event == EVENT_SYSTEM_FOREGROUND) &&
+    bool restoredByLasso = false;
+    if (event == EVENT_OBJECT_SHOW && idC == CHILDID_SELF) {
+        const auto show = g_restoredWindowShows.find(hwnd);
+        if (show != g_restoredWindowShows.end()) {
+            // WinEvent's timestamp and the low 32 bits of uptime use the same
+            // clock. Unsigned subtraction also handles the timestamp wrap.
+            restoredByLasso = dwM - static_cast<DWORD>(show->second) <= 3000;
+            if (restoredByLasso || GetTickCount64() - show->second > 3000)
+                g_restoredWindowShows.erase(show);
+        }
+    }
+
+    // A new window can wake its local app group. A show event generated by
+    // Alt+Tab must not unseal the other windows in that same group.
+    if (!restoredByLasso && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE) &&
         idC == CHILDID_SELF && !g_InSnapWindows &&
         !IsSwitcherWindow(hwnd) &&
         IsWindowOnCurrentVirtualDesktop(hwnd)) {
@@ -1720,7 +1692,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
         // A show/create event for an already tagged window must not trigger
         // a recursive reactivation as we change its styles.
         const bool tagged = GetPropW(hwnd, L"MTU_PROC_TAG") != nullptr;
-        if (!tagged || (event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_CREATE)) {
+        if (!tagged) {
             DWORD pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
             if (pid && pid != GetCurrentProcessId()) {
@@ -1860,15 +1832,13 @@ static void HideCurrentApplication(HWND foreground) {
         wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
         IsSwitcherWindow(root)) return;
 
-    HideCurrentFilter filter{GetRealProcessName(root), IsApplicationFrameWindow(root)};
-    const bool knownProcess = filter.process != L"Unknown" && !filter.process.empty();
-    if (filter.hostedUwp &&
-        (!knownProcess || _wcsicmp(filter.process.c_str(), SHARED_UWP_HOST) == 0)) {
-        // Close only the foreground frame when the business process is unknown.
+    HideCurrentFilter filter{GetRealProcessName(root)};
+    if (!IsIdentifiedProcess(filter.process)) {
+        // A shared host cannot identify sibling windows from the same app.
         RequestHostedUwpClose(root);
-    } else if (knownProcess) {
-        EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&filter));
+        return;
     }
+    EnumWindows(EnumHideWindowsProc, reinterpret_cast<LPARAM>(&filter));
 }
 
 static void HideOtherApplications(HWND foreground) {
