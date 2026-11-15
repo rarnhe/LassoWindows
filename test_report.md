@@ -1,9 +1,9 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-15 17:42:58
-- 测试源码基准提交：39b11133fadf70c91d3c6dda798af6b841e16776
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43742594868
+- 时间（UTC）：2026-11-15 17:53:51
+- 测试源码基准提交：01c1525b13f0f9e3257ecf74c9798f62d4a696cd
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43743598376
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
 - 统计：通过 37 / 失败 0 / 跳过 0 / 共 37
@@ -52,6 +52,6 @@
 无用例失败详情；若整体失败，请检查 Actions 阶段和构建日志。
 
 ## 覆盖范围
-真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、跨虚拟桌面同进程封印及逐窗 GUID 标签、非零桌面 GUID 的写入/读回和取消预览后的保留、Alt+Tab 当前桌面 GUID 筛选、同进程解封、连续预览和收网计时器隔离、Win+C 向模拟 UWP 外框派发 WM_CLOSE、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
+真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、跨虚拟桌面同进程封印及逐窗 GUID 标签、非零桌面 GUID 的写入/读回和取消预览后的保留、Alt+Tab 当前桌面 GUID 筛选、同进程解封、连续预览、临时应用窗口样式和最终原样恢复、收网计时器隔离、Win+C 向模拟 UWP 外框派发 WM_CLOSE、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
 
 全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。
