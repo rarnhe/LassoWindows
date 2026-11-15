@@ -1,9 +1,9 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-15 14:09:31
-- 测试源码基准提交：300f9bccd594082918061988d8104ade10013291
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43722734099
+- 时间（UTC）：2026-11-15 14:30:47
+- 测试源码基准提交：81d88a70a215129658ce43dc69b89df2846b0eeb
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43724682690
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
 - 统计：通过 31 / 失败 0 / 跳过 0 / 共 31
@@ -46,6 +46,6 @@
 无用例失败详情；若整体失败，请检查 Actions 阶段和构建日志。
 
 ## 覆盖范围
-真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、Alt+Tab 按键序列、模拟 UWP 外框的可见性切换、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
+真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、Alt+Tab 按键序列、模拟 UWP 外框的 DWM 遮蔽、恢复及回退、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
 
 全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。
