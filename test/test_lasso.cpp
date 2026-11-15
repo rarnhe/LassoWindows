@@ -57,25 +57,56 @@ void run(const std::string& name) {
         wc.lpszClassName = L"ApplicationFrameWindow";
         CHECK(RegisterClassW(&wc));
 
+        auto cloakFlags = [](HWND hwnd) {
+            DWORD flags = 0;
+            CHECK(SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &flags, sizeof(flags))));
+            return flags;
+        };
+
         Window frame(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
         const LONG_PTR style = GetWindowLongPtrW(frame, GWL_EXSTYLE);
         ShowWindow(frame, SW_SHOWNOACTIVATE);
         HideWindowAndHideTaskbarIcon(frame);
-        CHECK(IsWindow(frame) && !IsWindowVisible(frame));
+        CHECK(IsWindow(frame) && IsWindowVisible(frame));
+        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
+        CHECK(GetPropW(frame, PROP_UWP_DWM_CLOAK));
         CHECK(GetWindowLongPtrW(frame, GWL_EXSTYLE) == style);
         CHECK(IsOriginalWindowEligibleForPreview(frame));
         CHECK(ShowWindowAndShowTaskbarIcon(frame, true));
+        CHECK(!(cloakFlags(frame) & DWM_CLOAKED_APP));
+        CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
         CHECK(IsWindowVisible(frame) && g_sealedWindowStates.contains(frame.h));
         HideWindowAndHideTaskbarIcon(frame);
+        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
+        CHECK(ShowWindowAndShowTaskbarIcon(frame));
+        CHECK(!(cloakFlags(frame) & DWM_CLOAKED_APP));
+        CHECK(IsWindowVisible(frame) && !g_sealedWindowStates.contains(frame.h));
+
+        HideWindowAndHideTaskbarIcon(frame);
+        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
+        const ATOM proc = GlobalAddAtomW(L"uwp-fixture.exe");
+        CHECK(proc);
+        CHECK(SetPropW(frame, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(proc))));
+        g_sealedWindowStates.clear(); // The next process only sees the window properties.
+        RecoverApplicationFrameCloaks();
+        CHECK(!(cloakFlags(frame) & DWM_CLOAKED_APP));
+        CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
+        CHECK(!GetPropW(frame, L"MTU_PROC_TAG"));
+
+        // A cloak installed by the window owner stays in place on restoration.
+        CHECK(SetDwmCloak(frame, TRUE));
+        HideWindowAndHideTaskbarIcon(frame);
+        CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
         CHECK(!IsWindowVisible(frame));
         CHECK(ShowWindowAndShowTaskbarIcon(frame));
-        CHECK(IsWindowVisible(frame) && !g_sealedWindowStates.contains(frame.h));
+        CHECK(cloakFlags(frame) & DWM_CLOAKED_APP);
+        CHECK(SetDwmCloak(frame, FALSE));
 
         Window minimized(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
         ShowWindow(minimized, SW_SHOWMINNOACTIVE);
         CHECK(IsIconic(minimized));
         HideWindowAndHideTaskbarIcon(minimized);
-        CHECK(!IsWindowVisible(minimized));
+        CHECK(cloakFlags(minimized) & DWM_CLOAKED_APP);
         CHECK(!IsOriginalWindowEligibleForPreview(minimized));
         CHECK(ShowWindowAndShowTaskbarIcon(minimized));
         CHECK(IsIconic(minimized) && IsWindowVisible(minimized));
