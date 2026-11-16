@@ -158,27 +158,43 @@ void run(const std::string& name) {
         return;
     }
     if (name == "primary_hide_events") {
-        Window a, b, incoming;
-        for (HWND h : {a.h, b.h, incoming.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
+        RegisterFixtureClass(L"WorkerW");
+        Window a, b, incoming, foreground, desktop(0, nullptr, L"WorkerW");
+        Window offscreen(WS_EX_APPWINDOW, nullptr, L"STATIC",
+            GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 500,
+            GetSystemMetrics(SM_YVIRTUALSCREEN), 200, 100, WS_POPUP);
+        for (HWND h : {a.h, b.h, incoming.h, foreground.h, desktop.h, offscreen.h})
+            ShowWindow(h, SW_SHOWNOACTIVATE);
         const DWORD noOwnProcess = 0;
         for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND}) {
             CHECK(HidePrimaryWindow(a));
             CHECK(HidePrimaryWindow(b));
             g_primaryHideCompletedAt = GetTickCount64();
-            DWORD time = static_cast<DWORD>(g_primaryHideCompletedAt);
-            if (event == EVENT_SYSTEM_FOREGROUND) {
-                SetForegroundWindow(incoming);
-                CHECK(GetForegroundWindow() == incoming.h);
-            }
-            RestorePrimaryWindowsOnEvent(event, incoming, time, noOwnProcess);
+            const DWORD time = static_cast<DWORD>(g_primaryHideCompletedAt);
+            const HWND active = event == EVENT_SYSTEM_FOREGROUND ? incoming.h : foreground.h;
+            RestorePrimaryWindowsOnEvent(event, incoming, time, active, noOwnProcess);
             CHECK(g_hiddenPrimaryWindows.size() == 2); // Ignore events already queued at hide time.
-            RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, noOwnProcess);
+            RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, active, noOwnProcess);
             CHECK(g_hiddenPrimaryWindows.size() == 2);
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1); // Own process.
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, active); // Own process.
             CHECK(g_hiddenPrimaryWindows.size() == 2);
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, desktop, noOwnProcess);
+            CHECK(g_hiddenPrimaryWindows.size() == 2);
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, nullptr, noOwnProcess);
+            CHECK(g_hiddenPrimaryWindows.size() == 2);
+            const HWND offscreenActive = event == EVENT_SYSTEM_FOREGROUND ? offscreen.h : foreground.h;
+            CHECK(!MonitorFromWindow(offscreen, MONITOR_DEFAULTTONULL));
+            RestorePrimaryWindowsOnEvent(event, offscreen, time + 1, offscreenActive, noOwnProcess);
+            CHECK(g_hiddenPrimaryWindows.size() == 2);
+            if (event == EVENT_SYSTEM_FOREGROUND) {
+                RestorePrimaryWindowsOnEvent(event, incoming, time + 1, foreground, noOwnProcess);
+                CHECK(g_hiddenPrimaryWindows.size() == 2);
+            }
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, active, noOwnProcess);
             CHECK(g_hiddenPrimaryWindows.empty());
             CHECK(IsWindowVisible(a) && IsWindowVisible(b));
+            CHECK(!(GetWindowLongPtrW(a, GWL_EXSTYLE) & WS_EX_LAYERED));
+            CHECK(!(GetWindowLongPtrW(b, GWL_EXSTYLE) & WS_EX_LAYERED));
         }
         CHECK(HidePrimaryWindow(a));
         CHECK(HidePrimaryWindow(b));
@@ -703,34 +719,42 @@ void run(const std::string& name) {
         HGDIOBJ old = SelectObject(dc, bitmap);
         CHECK(old && old != HGDI_ERROR);
         const auto& card = *g_altTabProxies.front();
-        card.frame->width = 2;
-        card.frame->height = 2;
-        card.frame->pixels.assign(4, 0xff224466);
+        card.frame->width = 8;
+        card.frame->height = 1;
+        card.frame->pixels.assign(8, 0xff224466);
         PaintAltTabProxy(dc, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, card);
         GdiFlush();
         const auto* pixels = static_cast<const DWORD*>(bits);
-        RECT web{PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, 0, 0};
+        constexpr int imageHeight = PROXY_FRAME_WIDTH / 8;
+        constexpr int imageTop = (PROXY_FRAME_HEIGHT - imageHeight) / 2;
+        constexpr int imageBottom = imageTop + imageHeight;
+        const auto rendered = std::vector<DWORD>(pixels, pixels +
+            static_cast<size_t>(PROXY_FRAME_WIDTH) * PROXY_FRAME_HEIGHT);
+
+        // Rendering with a taller clip must leave the common rows identical.
+        PatBlt(dc, 0, 0, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, WHITENESS);
+        DrawPreviewWeb(dc, RECT{0, 0, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT});
+        GdiFlush();
         size_t blackPixels = 0;
         size_t backgroundPixels = 0;
-        const LONG left = (PROXY_FRAME_WIDTH - PROXY_FRAME_HEIGHT) / 2;
-        const LONG right = left + PROXY_FRAME_HEIGHT;
+        size_t tallerWebPixels = 0;
         for (LONG y = 0; y < PROXY_FRAME_HEIGHT; ++y) {
-            for (LONG x = left; x < right; ++x) {
-                const auto pixel = pixels[y * PROXY_FRAME_WIDTH + x] & 0xffffff;
+            for (LONG x = 0; x < PROXY_FRAME_WIDTH; ++x) {
+                const auto index = y * PROXY_FRAME_WIDTH + x;
+                const auto pixel = rendered[index] & 0xffffff;
+                const auto tallerPixel = pixels[index] & 0xffffff;
+                if (y < imageTop || y >= imageBottom) {
+                    CHECK(pixel == 0x000000);
+                    if (tallerPixel == 0x000000) ++tallerWebPixels;
+                    continue;
+                }
                 if (pixel == 0x000000) ++blackPixels;
                 if (pixel == 0x224466) ++backgroundPixels;
-                if (pixel != 0x224466) {
-                    web.left = (std::min)(web.left, x);
-                    web.top = (std::min)(web.top, y);
-                    web.right = (std::max)(web.right, x + 1);
-                    web.bottom = (std::max)(web.bottom, y + 1);
-                }
+                if (tallerPixel == 0x000000) CHECK(pixel == 0x000000);
+                if (tallerPixel == 0xffffff) CHECK(pixel == 0x224466);
             }
         }
-        CHECK(blackPixels > 200 && backgroundPixels > 1000);
-        CHECK(web.top <= 2 && web.bottom >= PROXY_FRAME_HEIGHT - 2);
-        CHECK(web.left <= left + 2 && web.right >= right - 2);
-        CHECK((pixels[10 * PROXY_FRAME_WIDTH + 400] & 0xffffff) == 0);
+        CHECK(blackPixels > 200 && backgroundPixels > 1000 && tallerWebPixels > 200);
         SelectObject(dc, old);
         DeleteObject(bitmap);
         DeleteDC(dc);
