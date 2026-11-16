@@ -1,12 +1,12 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-16 18:18:43
-- 测试源码基准提交：91b928b0127a03faca121909239d81c6f8e2744e
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43927302084
+- 时间（UTC）：2026-11-16 18:38:49
+- 测试源码基准提交：7099c55133e0458adb01f90d1880898f75f505e5
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43930868272
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
-- 统计：通过 44 / 失败 0 / 跳过 0 / 共 44
+- 统计：通过 45 / 失败 0 / 跳过 0 / 共 45
 
 ## GitHub Actions 阶段状态
 
@@ -64,6 +64,7 @@
 | preview_icon_selection_restore | 通过 |
 | preview_icon_reseal_restore | 通过 |
 | preview_taskbar_icon_roundtrip | 通过 |
+| background_coordinator_roundtrip | 通过 |
 
 ## 失败详情
 
