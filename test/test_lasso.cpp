@@ -208,11 +208,12 @@ void run(const std::string& name) {
         ShowWindow(button, SW_HIDE);
         CHECK(!FindNativeShowDesktopBounds(tray, button, POINT{1099, 120}, bounds));
 
-        CHECK(IsShowDesktopAutomationElement(L"ShowDesktopStack", L"", UIA_PaneControlTypeId));
-        CHECK(IsShowDesktopAutomationElement(L"", L"显示桌面", UIA_ButtonControlTypeId));
-        CHECK(IsShowDesktopAutomationElement(L"", L"顯示桌面", UIA_ButtonControlTypeId));
-        CHECK(!IsShowDesktopAutomationElement(L"", L"Show desktop", UIA_TextControlTypeId));
-        CHECK(!IsShowDesktopAutomationElement(L"ClockButton", L"Clock", UIA_ButtonControlTypeId));
+        CHECK(IsShowDesktopAutomationElement(L"ShowDesktopStack", L"", UIA_PaneControlTypeId, L""));
+        CHECK(IsShowDesktopAutomationElement(L"", L"显示桌面", UIA_ButtonControlTypeId, L""));
+        CHECK(IsShowDesktopAutomationElement(L"", L"顯示桌面", UIA_ButtonControlTypeId, L""));
+        CHECK(IsShowDesktopAutomationElement(L"", L"Show desktop", UIA_CustomControlTypeId, L"SystemTray.IconView"));
+        CHECK(!IsShowDesktopAutomationElement(L"", L"Show desktop", UIA_TextControlTypeId, L""));
+        CHECK(!IsShowDesktopAutomationElement(L"ClockButton", L"Clock", UIA_ButtonControlTypeId, L"IconView"));
         return;
     }
     if (name == "uwp_frame_close") {

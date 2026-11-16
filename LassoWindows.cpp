@@ -2240,11 +2240,13 @@ static bool FindNativeShowDesktopBounds(HWND taskbar, HWND hit, POINT point, REC
 }
 
 static bool IsShowDesktopAutomationElement(const wchar_t* id, const wchar_t* name,
-                                           CONTROLTYPEID type) {
+                                           CONTROLTYPEID type, const wchar_t* className) {
     if (id && (wcscmp(id, L"ShowDesktopStack") == 0 ||
                wcscmp(id, L"ShowDesktopButton") == 0 ||
                wcscmp(id, L"ShowDesktopIcon") == 0)) return true;
-    if (!name || type != UIA_ButtonControlTypeId) return false;
+    const bool trayIcon = className && (wcscmp(className, L"SystemTray.IconView") == 0 ||
+        wcscmp(className, L"IconView") == 0);
+    if (!name || (type != UIA_ButtonControlTypeId && !trayIcon)) return false;
     return _wcsicmp(name, L"Show desktop") == 0 ||
         wcscmp(name, L"显示桌面") == 0 || wcscmp(name, L"顯示桌面") == 0;
 }
@@ -2260,7 +2262,7 @@ static bool FindXamlShowDesktopBounds(HWND taskbar, POINT point, RECT& bounds) {
     if (FAILED(automation->CreateCacheRequest(cache.put()))) return false;
     for (PROPERTYID property : {UIA_AutomationIdPropertyId, UIA_NamePropertyId,
             UIA_ControlTypePropertyId, UIA_IsEnabledPropertyId, UIA_BoundingRectanglePropertyId,
-            UIA_ProcessIdPropertyId})
+            UIA_ProcessIdPropertyId, UIA_ClassNamePropertyId})
         if (FAILED(cache->AddProperty(property))) return false;
 
     winrt::com_ptr<IUIAutomationElement> element;
@@ -2273,16 +2275,18 @@ static bool FindXamlShowDesktopBounds(HWND taskbar, POINT point, RECT& bounds) {
         int process = 0;
         if (FAILED(element->get_CachedProcessId(&process)) ||
             static_cast<DWORD>(process) != explorer) break;
-        BSTR id = nullptr, name = nullptr;
+        BSTR id = nullptr, name = nullptr, className = nullptr;
         CONTROLTYPEID type = 0;
         BOOL enabled = FALSE;
         element->get_CachedAutomationId(&id);
         element->get_CachedName(&name);
         element->get_CachedControlType(&type);
         element->get_CachedIsEnabled(&enabled);
-        const bool matched = enabled && IsShowDesktopAutomationElement(id, name, type);
+        element->get_CachedClassName(&className);
+        const bool matched = enabled && IsShowDesktopAutomationElement(id, name, type, className);
         SysFreeString(id);
         SysFreeString(name);
+        SysFreeString(className);
         if (matched && SUCCEEDED(element->get_CachedBoundingRectangle(&bounds)) &&
             PtInRect(&bounds, point)) return true;
         winrt::com_ptr<IUIAutomationElement> parent;
@@ -2396,18 +2400,11 @@ static bool HidePrimaryWindow(HWND h) {
 static bool RestorePrimaryWindow(const PrimaryWindowTransparency& state) {
     const HWND h = state.window;
     if (!IsWindow(h)) return true;
-    if (state.extendedStyle & WS_EX_LAYERED) {
-        if (!SetLayeredWindowAttributes(h, state.colorKey, state.alpha, state.layerFlags)) return false;
-        if (!SetPrimaryExtendedStyle(h, state.extendedStyle)) {
-            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-            return false;
-        }
-    } else {
-        if (!SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA)) return false;
-        if (!SetPrimaryExtendedStyle(h, state.extendedStyle)) {
-            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-            return false;
-        }
+    const DWORD flags = (state.extendedStyle & WS_EX_LAYERED) ? state.layerFlags : LWA_ALPHA;
+    if (!SetLayeredWindowAttributes(h, state.colorKey, state.alpha, flags)) return false;
+    if (!SetPrimaryExtendedStyle(h, state.extendedStyle)) {
+        SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+        return false;
     }
     RefreshPrimaryWindowFrame(h);
     return true;
