@@ -146,7 +146,7 @@ static std::wstring cachedAppId = []() {
  * @param outIconIndex 返回图标索引
  * @return 是否解析成功
  */
-bool GetIconResourceFromIni(std::wstring& outIconPath, int& outIconIndex) {
+static bool GetIconResourceFromIni(std::wstring& outIconPath, int& outIconIndex) {
 	outIconPath.clear();
 	outIconIndex = 0;
 
@@ -200,7 +200,7 @@ bool GetIconResourceFromIni(std::wstring& outIconPath, int& outIconIndex) {
 	return false;
 }
 
-HRESULT RegisterAppShortcut() {
+static HRESULT RegisterAppShortcut() {
 	wchar_t exePath[MAX_PATH];
 	GetModuleFileNameW(NULL, exePath, MAX_PATH);
 
@@ -294,7 +294,7 @@ static constexpr wchar_t PROP_ORIGINAL_APPID[] = L"MTU_ORIGINAL_APPID";
  * @param hwnd 目标窗口句柄
  * @param isNewlyExtracted 返回值：本次是否新创建了图标句柄（需外部或销毁逻辑关注）
  */
-HICON GetOriginalWindowIcon(HWND hwnd, bool& isNewlyExtracted) {
+static HICON GetOriginalWindowIcon(HWND hwnd, bool& isNewlyExtracted) {
 	isNewlyExtracted = false;
 
 	// --- 1. 尝试从缓存读取 (LassoWindows 状态持久化) ---
@@ -369,7 +369,7 @@ HICON GetOriginalWindowIcon(HWND hwnd, bool& isNewlyExtracted) {
 // 任务栏图标变窗口+小图标
 #pragma comment(lib, "dwmapi.lib")
 // 辅助函数：更加健壮的 ITaskbarList3 初始化
-ITaskbarList3* GetTaskbarList() {
+static ITaskbarList3* GetTaskbarList() {
 	static ITaskbarList3* pTaskList = nullptr;
 	if (!pTaskList) {
 		// 使用 CoInitializeEx 代替 CoInitialize
@@ -388,7 +388,7 @@ ITaskbarList3* GetTaskbarList() {
 	return pTaskList;
 }
 //"剪影窗口"+右上角小图标提醒
-void SetWindowSnapshotWithOverlay(HWND hwnd, HICON hCurrentIcon) {
+static void SetWindowSnapshotWithOverlay(HWND hwnd, HICON hCurrentIcon) {
 	if (!IsWindow(hwnd)) return;
 	// 确保我们操作的是顶级所有者窗口，任务栏图标挂载在它上面
 	HWND hRoot = GetAncestor(hwnd, GA_ROOTOWNER);
@@ -482,7 +482,7 @@ void SetWindowSnapshotWithOverlay(HWND hwnd, HICON hCurrentIcon) {
 }
 
 //新设appid，使得任务栏图标独立
-HRESULT SetWindowAppIdWithBackup(HWND hwnd, PCWSTR newAppId) {
+static HRESULT SetWindowAppIdWithBackup(HWND hwnd, PCWSTR newAppId) {
 	if (!IsWindow(hwnd)) return E_INVALIDARG;
 
 	// 获取并还原原始图标
@@ -536,7 +536,7 @@ HRESULT SetWindowAppIdWithBackup(HWND hwnd, PCWSTR newAppId) {
 ///**
 // * 彻底注销显式 ID 并使窗口“归队”
 // */
-void RestoreWindowAppId(HWND hwnd) {
+static void RestoreWindowAppId(HWND hwnd) {
 	HANDLE hData = GetPropW(hwnd, PROP_ORIGINAL_APPID);
 	if (!hData) return;
 	// --- 1. 显式清除 Overlay (防止归队后把 Overlay 带回原组) ---
@@ -589,7 +589,7 @@ void RestoreWindowAppId(HWND hwnd) {
 #pragma comment(lib, "dwmapi.lib")
 
 // 判断窗口是否在当前活跃的虚拟桌面
-bool IsWindowOnCurrentVirtualDesktop(HWND hWnd) {
+static bool IsWindowOnCurrentVirtualDesktop(HWND hWnd) {
 	IVirtualDesktopManager* pDesktopManager = nullptr;
 	HRESULT hr = CoCreateInstance(CLSID_VirtualDesktopManager, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pDesktopManager));
 
@@ -1165,7 +1165,7 @@ static void DiscardWindowSealedIcon(HWND h) {
 }
 
 // Keep the snapshot and tags during the temporary native switcher preview.
-bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
+static bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     auto it = g_sealedWindowStates.find(h);
     if (it == g_sealedWindowStates.end()) return false;
     if (!IsWindow(h)) { g_sealedWindowStates.erase(it); return false; }
@@ -1203,7 +1203,7 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     return true;
 }
 
-bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
+static bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
     if (!SnapshotWindowState(h)) return false;
     auto& original = g_sealedWindowStates.at(h);
     LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
@@ -1245,7 +1245,7 @@ static void RestoreAllSealedWindows() {
 }
 
 // --- 逻辑 1：全局压制逻辑 ---
-void SuppressHiddenWindows(HWND hwnd, DWORD event) {
+static void SuppressHiddenWindows(HWND hwnd, DWORD event) {
 	// 只有在非任务视图模式下才执行压制
 	if (event == EVENT_OBJECT_SHOW && !g_InSnapWindows && CanUnsealOnCurrentDesktop(hwnd)) {
 		// 关键：只要 GetPropW 返回非空，说明窗口已被标记，直接压制
@@ -1255,7 +1255,7 @@ void SuppressHiddenWindows(HWND hwnd, DWORD event) {
 	}
 }
 
-void RefreshWindowCache() {
+static void RefreshWindowCache() {
 	g_HiddenWindowsCache.clear();
 
 	// 1. 初始化 COM 接口（建议在主线程初始化一次，这里为了演示逻辑完整性）
@@ -1312,7 +1312,7 @@ struct UWP_SPY_INFO {
 };
 
 // 示例：获取窗口对应的真实进程名（已穿透 ApplicationFrameHost）
-std::wstring GetRealProcessName(HWND hwnd) {
+static std::wstring GetRealProcessName(HWND hwnd) {
 	DWORD processId = 0;
 	GetWindowThreadProcessId(hwnd, &processId);
 	if (processId == 0) return L"Unknown";
@@ -1580,7 +1580,7 @@ struct HideCurrentFilter {
     ReadWindowDesktop readDesktop = GetWindowDesktopGuid;
 };
 
-BOOL CALLBACK EnumHideWindowsProc(HWND h, LPARAM lParam) {
+static BOOL CALLBACK EnumHideWindowsProc(HWND h, LPARAM lParam) {
     const auto* filter = reinterpret_cast<const HideCurrentFilter*>(lParam);
     if (!filter) return FALSE;
     if (!IsWindowVisible(h) || GetParent(h) != nullptr) return TRUE;
@@ -1603,7 +1603,7 @@ BOOL CALLBACK EnumHideWindowsProc(HWND h, LPARAM lParam) {
 }
 
 // 反向隐藏：隐藏所有【不属于】当前 App 进程名的窗口
-BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
+static BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
     auto* filter = reinterpret_cast<CloseFilter*>(lParam);
     if (!filter) return FALSE;
     if (!IsWindowVisible(hWnd) || GetParent(hWnd) != nullptr) return TRUE;
@@ -1852,6 +1852,7 @@ struct ProxyCaptureRequest {
 // PrintWindow can block in an application. Capture off the switcher thread and
 // cap outstanding work so unavailable targets leave an immediately usable card.
 static void CALLBACK CaptureAltTabProxyFrame(PTP_CALLBACK_INSTANCE, void* data) noexcept {
+    if (!data) return;
     std::unique_ptr<ProxyCaptureRequest> request(static_cast<ProxyCaptureRequest*>(data));
     struct ReleaseSlot { ~ReleaseSlot() { --g_proxyCaptures; } } slot;
     RECT rect{};
@@ -1885,7 +1886,8 @@ static void CALLBACK CaptureAltTabProxyFrame(PTP_CALLBACK_INSTANCE, void* data) 
                         for (int y = 0; y < h; ++y)
                             for (int x = 0; x < w; ++x)
                                 scaledPixels[static_cast<size_t>(y) * w + x] =
-                                    pixels[static_cast<size_t>(y * height / h) * width + x * width / w];
+                                    pixels[(static_cast<size_t>(y) * height / h) * width +
+                                           static_cast<size_t>(x) * width / w];
                         const std::lock_guard guard(frame.lock);
                         frame.pixels = std::move(scaledPixels);
                         frame.width = w;
@@ -1945,12 +1947,15 @@ static std::unique_ptr<AltTabProxy> CreateAltTabProxy(HWND target, bool capture)
     if (!IsWindowVisible(h)) return nullptr;
 
     if (capture && g_proxyCaptures.fetch_add(1) < 4) {
-        auto* request = new (std::nothrow) ProxyCaptureRequest{h, target,
-            GetWindowThreadProcessId(target, nullptr), proxy->frame};
-        if (!request || !TrySubmitThreadpoolCallback(CaptureAltTabProxyFrame, request, nullptr)) {
+        try {
+            auto* request = new ProxyCaptureRequest{h, target,
+                GetWindowThreadProcessId(target, nullptr), proxy->frame};
+            if (TrySubmitThreadpoolCallback(CaptureAltTabProxyFrame, request, nullptr)) return proxy;
             delete request;
-            --g_proxyCaptures;
+        } catch (const std::bad_alloc&) {
+            // The existing icon-and-title card is still available.
         }
+        --g_proxyCaptures;
     } else if (capture) {
         --g_proxyCaptures;
     }
@@ -1987,7 +1992,7 @@ static size_t BuildAltTabInput(INPUT (&inputs)[6], bool altDown, bool shiftDown,
 }
 
 // 模拟无名键以消除 Win 键抬起时触发开始菜单的干扰
-void SuppressWinKeyMenuModern() {
+static void SuppressWinKeyMenuModern() {
 	INPUT inputs[2] = {};
 
 	inputs[0].type = INPUT_KEYBOARD;
@@ -2082,7 +2087,7 @@ static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDeskt
     g_InSnapWindows = false;
 }
 
-void ExecuteCollectRestore() {
+static void ExecuteCollectRestore() {
     CancelAltTabCollectTimer(g_hLassoCoordinator);
     FinishAltTabPreview(nullptr);
 }
@@ -2118,7 +2123,7 @@ static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
 #define WM_LASSO_ESCAPE       (WM_APP + 16)
 #define WM_LASSO_TOGGLE_PRIMARY (WM_APP + 17)
 
-LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
+static LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
         return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
     const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
@@ -2166,7 +2171,7 @@ LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 // 检查窗口是否是用户可见的、合法的普通主窗口
-BOOL IsValidAppWindow(HWND hWnd) {
+static BOOL IsValidAppWindow(HWND hWnd) {
 	if (GetParent(hWnd) != NULL) return FALSE;
 
 	wchar_t className[256];
@@ -2194,7 +2199,7 @@ BOOL IsValidAppWindow(HWND hWnd) {
 static bool g_bSystemHasDpiScaling = false;
 
 // 在协调线程启动时检测显示器缩放状态。
-void UpdateSystemDpiScalingStatus() {
+static void UpdateSystemDpiScalingStatus() {
 	g_bSystemHasDpiScaling = false;
 	EnumDisplayMonitors(NULL, NULL, [](HMONITOR hMon, HDC, LPRECT, LPARAM pData) -> BOOL {
 		UINT dpiX = 96, dpiY = 96;
@@ -2209,7 +2214,7 @@ void UpdateSystemDpiScalingStatus() {
 }
 
 // 精简后的 GetPhysicalRect
-BOOL GetPhysicalRect(HWND hWnd, RECT* pRect) {
+static BOOL GetPhysicalRect(HWND hWnd, RECT* pRect) {
 	if (!hWnd || !pRect) return FALSE;
 
 	// 存在缩放 -> 优先 DWM；纯 100% 屏幕 -> 直接 GetWindowRect
@@ -2446,7 +2451,7 @@ struct ToggleContext {
     HMONITOR hPrimaryMonitor;
 };
 
-BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
+static BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
     auto* pCtx = reinterpret_cast<ToggleContext*>(lParam);
     if (!pCtx || !pCtx->pVector || !IsValidAppWindow(hWnd)) return TRUE;
     if (IsSwitcherWindow(hWnd) || FindAltTabProxyTarget(hWnd) ||
@@ -2484,7 +2489,7 @@ static void TogglePrimaryWindows() {
     g_primaryHideCompletedAt = GetTickCount64();
 }
 
-LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION || !g_hLassoCoordinator)
         return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 
@@ -2555,7 +2560,7 @@ std::mutex g_fileMutex;
 } while(0)
 
 // 辅助函数：通过 PID 获取进程名
-std::wstring GetProcessNameByPid(DWORD pid) {
+[[maybe_unused]] static std::wstring GetProcessNameByPid(DWORD pid) {
 	if (pid == 0) return L"";
 
 	// 优先尝试获取完整信息的权限，如果失败（如系统进程或保护进程），降级为仅查询信息权限
@@ -2587,7 +2592,7 @@ std::wstring GetProcessNameByPid(DWORD pid) {
 // =========================================================================
 // 【核心新增】：高可靠性窗口显示状态判定函数（带微秒级自旋校验）
 // =========================================================================
-bool IsHiddenWindowReallyVisiable(HWND hwnd) {
+[[maybe_unused]] static bool IsHiddenWindowReallyVisiable(HWND hwnd) {
 	if (!IsWindow(hwnd)) return false;
 
 	// 自旋重试 5 次，每次如果未就绪则让出 CPU 核心，给 Windows 样式刷新留出微秒级时间
@@ -2617,7 +2622,7 @@ bool IsHiddenWindowReallyVisiable(HWND hwnd) {
 
 static HWND g_taskViewWindow = nullptr;
 
-void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
+static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
     if (event == EVENT_OBJECT_DESTROY && idC == CHILDID_SELF) {
