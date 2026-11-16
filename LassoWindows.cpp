@@ -1686,7 +1686,7 @@ static BITMAPINFO ProxyBitmapInfo(int width, int height) {
     return info;
 }
 
-// Stretch the actual Webdings ink to the image bounds, with no padding from the font box.
+// Fit the Webdings ink to the image height. Clip horizontally on narrow images.
 static void DrawPreviewWeb(HDC destination, const RECT& bounds) {
     const int width = bounds.right - bounds.left;
     const int height = bounds.bottom - bounds.top;
@@ -1727,9 +1727,18 @@ static void DrawPreviewWeb(HDC destination, const RECT& bounds) {
                 }
             }
             if (ink.right > ink.left && ink.bottom > ink.top) {
-                const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-                AlphaBlend(destination, bounds.left, bounds.top, width, height,
-                    dc, ink.left, ink.top, ink.right - ink.left, ink.bottom - ink.top, blend);
+                const int webWidth = (std::max)(1, MulDiv(height,
+                    ink.right - ink.left, ink.bottom - ink.top));
+                const int left = bounds.left + (width - webWidth) / 2;
+                if (const int saved = SaveDC(destination)) {
+                    if (IntersectClipRect(destination, bounds.left, bounds.top,
+                            bounds.right, bounds.bottom) != ERROR) {
+                        const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+                        AlphaBlend(destination, left, bounds.top, webWidth, height,
+                            dc, ink.left, ink.top, ink.right - ink.left, ink.bottom - ink.top, blend);
+                    }
+                    RestoreDC(destination, saved);
+                }
             }
         }
         if (oldFont && oldFont != HGDI_ERROR) SelectObject(dc, oldFont);
