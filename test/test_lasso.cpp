@@ -85,6 +85,11 @@ static HWND ProxyFor(HWND target) {
     return nullptr;
 }
 
+static DWORD WINAPI RunTestCoordinator(void* readyPtr) {
+    winrt::handle ready(static_cast<HANDLE>(readyPtr));
+    return RunCoordinator(ready.get(), false);
+}
+
 void run(const std::string& name) {
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
     if (name == "hide_others_all_desktops") {
@@ -125,6 +130,32 @@ void run(const std::string& name) {
 
         RestoreAllSealedWindows();
         g_testWindowDesktopIds.clear();
+        return;
+    }
+    if (name == "background_coordinator_roundtrip") {
+        winrt::handle ready(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        CHECK(ready);
+        HANDLE workerReady = nullptr;
+        const HANDLE process = GetCurrentProcess();
+        CHECK(DuplicateHandle(process, ready.get(), process, &workerReady, 0, FALSE, DUPLICATE_SAME_ACCESS));
+        winrt::handle worker(CreateThread(nullptr, 0, RunTestCoordinator, workerReady, 0, nullptr));
+        if (!worker) CloseHandle(workerReady);
+        CHECK(worker);
+        const HANDLE startup[] = {ready.get(), worker.get()};
+        CHECK(WaitForMultipleObjects(2, startup, FALSE, 5000) == WAIT_OBJECT_0);
+        const HWND coordinator = g_hLassoCoordinator.load();
+        CHECK(coordinator);
+        for (int i = 0; i < 5; ++i) {
+            CHECK(PostMessageW(coordinator, WM_LASSO_ALT_UP, 0, 0));
+            CHECK(PostMessageW(coordinator, WM_LASSO_ESCAPE, 0, 0));
+        }
+        CHECK(WaitForSingleObject(worker.get(), 200) == WAIT_TIMEOUT);
+        CHECK(g_hLassoCoordinator.load() == coordinator);
+        CHECK(PostMessageW(coordinator, WM_CLOSE, 0, 0));
+        CHECK(WaitForSingleObject(worker.get(), 5000) == WAIT_OBJECT_0);
+        DWORD exitCode = 1;
+        CHECK(GetExitCodeThread(worker.get(), &exitCode) && exitCode == 0);
+        CHECK(!g_hLassoCoordinator.load());
         return;
     }
     if (name == "primary_hide_roundtrip") {
@@ -731,30 +762,42 @@ void run(const std::string& name) {
         const auto rendered = std::vector<DWORD>(pixels, pixels +
             static_cast<size_t>(PROXY_FRAME_WIDTH) * PROXY_FRAME_HEIGHT);
 
-        // Rendering with a taller clip must leave the common rows identical.
+        // The same glyph height yields the same centered pixels in a narrower box.
         PatBlt(dc, 0, 0, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, WHITENESS);
-        DrawPreviewWeb(dc, RECT{0, 0, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT});
+        constexpr int inset = 120;
+        DrawPreviewWeb(dc, RECT{inset, imageTop, PROXY_FRAME_WIDTH - inset, imageBottom});
         GdiFlush();
+        RECT web{PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, 0, 0};
         size_t blackPixels = 0;
         size_t backgroundPixels = 0;
-        size_t tallerWebPixels = 0;
         for (LONG y = 0; y < PROXY_FRAME_HEIGHT; ++y) {
             for (LONG x = 0; x < PROXY_FRAME_WIDTH; ++x) {
                 const auto index = y * PROXY_FRAME_WIDTH + x;
                 const auto pixel = rendered[index] & 0xffffff;
-                const auto tallerPixel = pixels[index] & 0xffffff;
+                const auto narrowPixel = pixels[index] & 0xffffff;
                 if (y < imageTop || y >= imageBottom) {
                     CHECK(pixel == 0x000000);
-                    if (tallerPixel == 0x000000) ++tallerWebPixels;
+                    CHECK(narrowPixel == 0xffffff);
                     continue;
                 }
                 if (pixel == 0x000000) ++blackPixels;
                 if (pixel == 0x224466) ++backgroundPixels;
-                if (tallerPixel == 0x000000) CHECK(pixel == 0x000000);
-                if (tallerPixel == 0xffffff) CHECK(pixel == 0x224466);
+                else {
+                    web.left = (std::min)(web.left, x);
+                    web.top = (std::min)(web.top, y);
+                    web.right = (std::max)(web.right, x + 1);
+                    web.bottom = (std::max)(web.bottom, y + 1);
+                }
+                if (x >= inset && x < PROXY_FRAME_WIDTH - inset) {
+                    if (narrowPixel == 0x000000) CHECK(pixel == 0x000000);
+                    if (narrowPixel == 0xffffff) CHECK(pixel == 0x224466);
+                }
             }
         }
-        CHECK(blackPixels > 200 && backgroundPixels > 1000 && tallerWebPixels > 200);
+        CHECK(blackPixels > 100 && backgroundPixels > 1000);
+        CHECK(web.top <= imageTop + 1 && web.bottom >= imageBottom - 1);
+        CHECK(web.left > inset && web.right < PROXY_FRAME_WIDTH - inset);
+        CHECK(abs(web.left + web.right - PROXY_FRAME_WIDTH) <= 3);
         SelectObject(dc, old);
         DeleteObject(bitmap);
         DeleteDC(dc);
