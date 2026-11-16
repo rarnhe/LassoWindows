@@ -53,6 +53,14 @@ static void RegisterFixtureClass(const wchar_t* name) {
         throw std::runtime_error("RegisterClassW failed");
 }
 
+static std::wstring ReadStringProperty(IPropertyStore* store, REFPROPERTYKEY key) {
+    PROPVARIANT value{};
+    CHECK(SUCCEEDED(store->GetValue(key, &value)));
+    const std::wstring result = value.vt == VT_LPWSTR && value.pwszVal ? value.pwszVal : L"";
+    PropVariantClear(&value);
+    return result;
+}
+
 void iniTest(const std::string& name) {
     Ini ini;
     std::wstring expected;
@@ -165,22 +173,41 @@ void run(const std::string& name) {
         const POINT icon{100, 100}, blank{200, 200};
 
         CHECK(ApplyPrimaryWindowTransparency(w));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 1000, isIcon);
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 1000, nullptr, isIcon);
         CHECK(g_transparentPrimaryWindows.contains(w.h));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1100, isIcon);
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1100, nullptr, isIcon);
         CHECK(g_transparentPrimaryWindows.contains(w.h));
         // Repeated right-clicks on the same desktop icon remain exceptions.
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1150, isIcon);
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1150, nullptr, isIcon);
         CHECK(g_transparentPrimaryWindows.contains(w.h));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, blank, 1200, isIcon);
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, blank, 1200, nullptr, isIcon);
         CHECK(g_transparentPrimaryWindows.empty());
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
 
         CHECK(ApplyPrimaryWindowTransparency(w));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2000, isIcon);
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2000, nullptr, isIcon);
         CHECK(g_transparentPrimaryWindows.contains(w.h));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2001, isIcon);
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2001, nullptr, isIcon);
         CHECK(g_transparentPrimaryWindows.empty());
+
+        RegisterFixtureClass(L"PrimaryTaskbarFixture");
+        Window taskbar(0, nullptr, L"PrimaryTaskbarFixture", 50, 80, 1000, 40, WS_POPUP);
+        Window sibling;
+        ShowWindow(taskbar, SW_SHOWNOACTIVATE);
+        const LONG_PTR siblingStyle = GetWindowLongPtrW(sibling, GWL_EXSTYLE);
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        CHECK(ApplyPrimaryWindowTransparency(sibling));
+        // Taskbar hit takes priority over any desktop-icon accessibility result.
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 3000, taskbar, isIcon);
+        CHECK(g_transparentPrimaryWindows.empty());
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
+        CHECK(GetWindowLongPtrW(sibling, GWL_EXSTYLE) == siblingStyle);
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        CHECK(ApplyPrimaryWindowTransparency(sibling));
+        CoordinatorWndProc(w, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
+        CHECK(g_transparentPrimaryWindows.empty());
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
+        CHECK(GetWindowLongPtrW(sibling, GWL_EXSTYLE) == siblingStyle);
 
         CHECK(ApplyPrimaryWindowTransparency(w));
         CHECK(!IsPrimaryDesktopIconAt(POINT{-100000, -100000}));
@@ -223,29 +250,19 @@ void run(const std::string& name) {
         return;
     }
     if (name == "show_desktop_button_hit_test") {
-        RegisterFixtureClass(L"Shell_TrayWnd");
-        RegisterFixtureClass(L"TrayNotifyWnd");
-        RegisterFixtureClass(L"TrayClockWClass");
-        RegisterFixtureClass(L"TrayShowDesktopButtonWClass");
-        Window tray(0, nullptr, L"Shell_TrayWnd", 100, 100, 1000, 40, WS_POPUP);
-        Window notify(0, tray, L"TrayNotifyWnd", 850, 0, 150, 40);
-        Window clock(0, notify, L"TrayClockWClass", 0, 0, 135, 40);
-        Window button(0, notify, L"TrayShowDesktopButtonWClass", 140, 0, 10, 40);
-        for (HWND h : {tray.h, notify.h, clock.h, button.h})
-            ShowWindow(h, SW_SHOWNOACTIVATE);
-
-        CHECK(FindShowDesktopButton(tray) == button.h);
-        RECT buttonRect{}, clockRect{}, trayRect{};
-        CHECK(GetWindowRect(button, &buttonRect));
-        CHECK(GetWindowRect(clock, &clockRect));
-        CHECK(GetWindowRect(tray, &trayRect));
-        CHECK(buttonRect.left == 1090 && buttonRect.right == 1100);
-        const POINT clockPoint{trayRect.right - 25, 120};
-        CHECK(PtInRect(&clockRect, clockPoint));
-        CHECK(clockPoint.x >= trayRect.right - 30);
-        CHECK(!IsPointInsideShowDesktopButton(tray, clockPoint));
-        CHECK(IsPointInsideShowDesktopButton(tray, POINT{1095, 120}));
-        CHECK(!IsPointInsideShowDesktopButton(tray, POINT{1100, 120}));
+        RegisterFixtureClass(L"PrimaryTaskbarFixture");
+        Window tray(0, nullptr, L"PrimaryTaskbarFixture", 100, 100, 1000, 40, WS_POPUP);
+        ShowWindow(tray, SW_SHOWNOACTIVATE);
+        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1085, 120})); // Old band.
+        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1089, 120}));
+        CHECK(IsPointInShowDesktopEdge(tray, POINT{1090, 120}));
+        CHECK(IsPointInShowDesktopEdge(tray, POINT{1099, 139}));
+        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1100, 120}));
+        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1099, 99}));
+        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1099, 140}));
+        CHECK(!IsPointInShowDesktopEdge(nullptr, POINT{1099, 120}));
+        ShowWindow(tray, SW_HIDE);
+        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1099, 120}));
         return;
     }
     if (name == "uwp_frame_close") {
@@ -760,6 +777,42 @@ void run(const std::string& name) {
         CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
         CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
         CHECK(!g_sealedPreviewIcons.contains(w.h));
+    } else if (name == "preview_taskbar_icon_roundtrip") {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        RegisterFixtureClass(L"PreviewTaskbarIconFixture");
+        Window w(WS_EX_APPWINDOW, nullptr, L"PreviewTaskbarIconFixture");
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        winrt::com_ptr<IPropertyStore> store;
+        CHECK(SUCCEEDED(SHGetPropertyStoreForWindow(w, IID_IPropertyStore, store.put_void())));
+        const std::wstring originalId = L"LassoWindows.Test.Original";
+        PROPVARIANT value{};
+        CHECK(SUCCEEDED(InitPropVariantFromString(originalId.c_str(), &value)));
+        CHECK(SUCCEEDED(store->SetValue(PKEY_AppUserModel_ID, value)));
+        PropVariantClear(&value);
+        CHECK(!SendMessageW(w, WM_GETICON, ICON_BIG, 0));
+        CHECK(SetWindowSealedIcon(w));
+        const auto& state = g_sealedPreviewIcons.at(w.h);
+        CHECK(state.taskbar);
+        const auto iconFile = state.taskbar->iconFile;
+        const auto previewId = ReadStringProperty(store.get(), PKEY_AppUserModel_ID);
+        CHECK(previewId.starts_with(L"LassoWindows.SealedPreview."));
+        CHECK(ReadStringProperty(store.get(), PKEY_AppUserModel_RelaunchIconResource) ==
+            iconFile.native() + L",0");
+        HICON writtenIcon = reinterpret_cast<HICON>(LoadImageW(nullptr, iconFile.c_str(),
+            IMAGE_ICON, 0, 0, LR_LOADFROMFILE));
+        CHECK(writtenIcon);
+        DestroyIcon(writtenIcon);
+        CHECK(SetWindowSealedIcon(w));
+        CHECK(ReadStringProperty(store.get(), PKEY_AppUserModel_ID) == previewId);
+        RestoreWindowSealedIcon(w);
+        CHECK(!SendMessageW(w, WM_GETICON, ICON_BIG, 0));
+        CHECK(ReadStringProperty(store.get(), PKEY_AppUserModel_ID) == originalId);
+        CHECK(ReadStringProperty(store.get(), PKEY_AppUserModel_RelaunchIconResource).empty());
+        CHECK(!std::filesystem::exists(iconFile));
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
+        CHECK(SUCCEEDED(store->SetValue(PKEY_AppUserModel_ID, value))); // VT_EMPTY
+        store = nullptr;
+        winrt::uninit_apartment();
     } else if (name == "preview_icon_selection_restore") {
         RegisterFixtureClass(L"SealedPreviewIconFixture");
         Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");

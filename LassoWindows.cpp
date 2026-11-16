@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <iterator>
 #include <algorithm>
+#include <memory>
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
@@ -766,6 +767,26 @@ static void UpdateTaskbarButton(HWND h, bool visible) {
 }
 
 
+// These properties supply Explorer with a different icon source for the
+// temporary button. The shell refreshes the group when its ID is set last.
+static const PROPERTYKEY PREVIEW_TASKBAR_KEYS[] = {
+    PKEY_AppUserModel_PreventPinning,
+    PKEY_AppUserModel_RelaunchCommand,
+    PKEY_AppUserModel_RelaunchDisplayNameResource,
+    PKEY_AppUserModel_RelaunchIconResource,
+    PKEY_AppUserModel_ID
+};
+
+struct PreviewTaskbarState {
+    PROPVARIANT original[std::size(PREVIEW_TASKBAR_KEYS)]{};
+    std::filesystem::path iconFile;
+
+    ~PreviewTaskbarState() {
+        for (auto& value : original) PropVariantClear(&value);
+        if (!iconFile.empty()) DeleteFileW(iconFile.c_str());
+    }
+};
+
 struct SealedPreviewIconState {
     HICON originalBig = nullptr;
     HICON originalSmall = nullptr;
@@ -773,6 +794,7 @@ struct SealedPreviewIconState {
     HICON previewSmall = nullptr;
     bool bigApplied = false;
     bool smallApplied = false;
+    std::unique_ptr<PreviewTaskbarState> taskbar;
 };
 
 static std::unordered_map<HWND, SealedPreviewIconState> g_sealedPreviewIcons;
@@ -931,13 +953,128 @@ static HICON CreateSealedPreviewIcon(HICON sourceIcon, int iconSize, COLORREF ac
     return result;
 }
 
+// Explorer's RelaunchIconResource accepts a file path. Store the generated
+// 32-bit icon with its alpha channel and an AND mask in a single-image .ico.
+static bool WritePreviewIconFile(HICON icon, const std::filesystem::path& path) {
+    struct IconDirectoryEntry {
+        BYTE width, height, colors, reserved;
+        WORD planes, bitsPerPixel;
+        DWORD dataSize, dataOffset;
+    };
+    static_assert(sizeof(IconDirectoryEntry) == 16);
+    constexpr WORD directory[] = {0, 1, 1};
+
+    ICONINFO info{};
+    if (!GetIconInfo(icon, &info)) return false;
+    BITMAP bitmap{};
+    const bool hasBitmap = GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap) == sizeof(bitmap);
+    constexpr int maxSide = 256;
+    std::vector<DWORD> pixels;
+    bool read = false;
+    BITMAPINFO dib{};
+    if (hasBitmap && bitmap.bmWidth > 0 && bitmap.bmWidth <= maxSide &&
+        bitmap.bmHeight > 0 && bitmap.bmHeight <= maxSide) {
+        const int width = bitmap.bmWidth, height = bitmap.bmHeight;
+        dib.bmiHeader = {sizeof(BITMAPINFOHEADER), width, height, 1, 32, BI_RGB, 0, 0, 0, 0, 0};
+        pixels.resize(static_cast<size_t>(width) * height);
+        HDC dc = GetDC(nullptr);
+        if (dc) {
+            read = GetDIBits(dc, info.hbmColor, 0, height, pixels.data(), &dib, DIB_RGB_COLORS) == height;
+            ReleaseDC(nullptr, dc);
+        }
+    }
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    if (info.hbmMask) DeleteObject(info.hbmMask);
+    if (!read) return false;
+
+    const int width = bitmap.bmWidth, height = bitmap.bmHeight;
+    const int maskStride = ((width + 31) / 32) * 4;
+    std::vector<BYTE> mask(static_cast<size_t>(maskStride) * height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            if (!(pixels[static_cast<size_t>(y) * width + x] & 0xff000000))
+                mask[static_cast<size_t>(y) * maskStride + x / 8] |= static_cast<BYTE>(0x80 >> (x % 8));
+        }
+    }
+    const auto pixelBytes = static_cast<DWORD>(pixels.size() * sizeof(DWORD));
+    dib.bmiHeader.biHeight = height * 2; // XOR pixels followed by the AND mask.
+    dib.bmiHeader.biSizeImage = 0;
+    const IconDirectoryEntry image{static_cast<BYTE>(width), static_cast<BYTE>(height),
+        0, 0, 1, 32, static_cast<DWORD>(sizeof(BITMAPINFOHEADER) + pixelBytes + mask.size()),
+        sizeof(directory) + sizeof(IconDirectoryEntry)};
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(directory), sizeof(directory));
+    file.write(reinterpret_cast<const char*>(&image), sizeof(image));
+    file.write(reinterpret_cast<const char*>(&dib.bmiHeader), sizeof(dib.bmiHeader));
+    file.write(reinterpret_cast<const char*>(pixels.data()), pixelBytes);
+    file.write(reinterpret_cast<const char*>(mask.data()), mask.size());
+    file.close();
+    return file.good();
+}
+
+static bool RestorePreviewTaskbarProperties(IPropertyStore* store, const PreviewTaskbarState& state) {
+    bool restored = true;
+    for (size_t i = 0; i < std::size(PREVIEW_TASKBAR_KEYS); ++i)
+        restored = SUCCEEDED(store->SetValue(PREVIEW_TASKBAR_KEYS[i], state.original[i])) && restored;
+    return restored;
+}
+
+static void SetPreviewTaskbarIcon(HWND h, SealedPreviewIconState& icons) {
+    if (icons.taskbar) return;
+    winrt::com_ptr<IPropertyStore> store;
+    if (FAILED(SHGetPropertyStoreForWindow(h, IID_IPropertyStore, store.put_void()))) return;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    winrt::handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    wchar_t exe[MAX_PATH]{};
+    DWORD exeSize = static_cast<DWORD>(std::size(exe));
+    if (!process || !QueryFullProcessImageNameW(process.get(), 0, exe, &exeSize)) return;
+
+    GUID unique{};
+    wchar_t id[40]{}, temp[MAX_PATH]{};
+    const DWORD tempSize = GetTempPathW(static_cast<DWORD>(std::size(temp)), temp);
+    if (!tempSize || tempSize >= std::size(temp) || FAILED(CoCreateGuid(&unique)) ||
+        !StringFromGUID2(unique, id, static_cast<int>(std::size(id)))) return;
+
+    auto state = std::make_unique<PreviewTaskbarState>();
+    for (size_t i = 0; i < std::size(PREVIEW_TASKBAR_KEYS); ++i) {
+        if (FAILED(store->GetValue(PREVIEW_TASKBAR_KEYS[i], &state->original[i]))) return;
+    }
+    const std::wstring suffix = std::wstring(id + 1, 36);
+    state->iconFile = std::filesystem::path(temp) / (L"LassoPreview-" + suffix + L".ico");
+    if (!WritePreviewIconFile(icons.previewBig, state->iconFile)) return;
+
+    wchar_t title[256]{};
+    const std::wstring displayName = GetWindowTextW(h, title, static_cast<int>(std::size(title))) ?
+        title : std::filesystem::path(exe).filename().wstring();
+    const std::wstring properties[] = {
+        L"\"" + std::wstring(exe) + L"\"",
+        displayName,
+        state->iconFile.native() + L",0",
+        L"LassoWindows.SealedPreview." + suffix
+    };
+    for (size_t i = 0; i < std::size(PREVIEW_TASKBAR_KEYS); ++i) {
+        PROPVARIANT value{};
+        // An empty PreventPinning lets Explorer use RelaunchIconResource.
+        HRESULT result = i == 0 ? S_OK : InitPropVariantFromString(properties[i - 1].c_str(), &value);
+        if (SUCCEEDED(result)) result = store->SetValue(PREVIEW_TASKBAR_KEYS[i], value);
+        PropVariantClear(&value);
+        if (FAILED(result)) {
+            if (!RestorePreviewTaskbarProperties(store.get(), *state)) icons.taskbar = std::move(state);
+            return;
+        }
+    }
+    icons.taskbar = std::move(state);
+}
+
 static void DestroySealedPreviewIconState(const SealedPreviewIconState& state) {
     if (state.previewBig) DestroyIcon(state.previewBig);
     if (state.previewSmall && state.previewSmall != state.previewBig)
         DestroyIcon(state.previewSmall);
 }
 
-// Apply a temporary, AccentColor-tinted Webdings web to the taskbar icon.
+// Apply a temporary, AccentColor-tinted Webdings web to the switcher icon.
 // The pre-preview icon handles are borrowed from the target window and are
 // restored before the generated preview icons are destroyed.
 static bool SetWindowSealedIcon(HWND h) {
@@ -947,13 +1084,12 @@ static bool SetWindowSealedIcon(HWND h) {
     SealedPreviewIconState state;
     state.originalBig = QueryWindowIconForPreview(h, ICON_BIG);
     state.originalSmall = QueryWindowIconForPreview(h, ICON_SMALL);
-    if (!state.originalBig)
-        state.originalBig = reinterpret_cast<HICON>(GetClassLongPtrW(h, GCLP_HICON));
-    if (!state.originalSmall)
-        state.originalSmall = reinterpret_cast<HICON>(GetClassLongPtrW(h, GCLP_HICONSM));
-
-    HICON bigSource = state.originalBig ? state.originalBig : state.originalSmall;
-    HICON smallSource = state.originalSmall ? state.originalSmall : state.originalBig;
+    HICON bigSource = state.originalBig ? state.originalBig :
+        reinterpret_cast<HICON>(GetClassLongPtrW(h, GCLP_HICON));
+    HICON smallSource = state.originalSmall ? state.originalSmall :
+        reinterpret_cast<HICON>(GetClassLongPtrW(h, GCLP_HICONSM));
+    if (!bigSource) bigSource = smallSource;
+    if (!bigSource) bigSource = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
     if (!bigSource) return false;
 
     const COLORREF accent = GetTaskbarAccentColor();
@@ -981,11 +1117,12 @@ static bool SetWindowSealedIcon(HWND h) {
             DestroyIcon(state.previewSmall);
             state.previewSmall = nullptr;
         }
-        g_sealedPreviewIcons.emplace(h, state);
+        g_sealedPreviewIcons.emplace(h, std::move(state));
         return false;
     }
     state.smallApplied = true;
-    g_sealedPreviewIcons.emplace(h, state);
+    auto it = g_sealedPreviewIcons.emplace(h, std::move(state)).first;
+    SetPreviewTaskbarIcon(h, it->second);
     return true;
 }
 
@@ -998,14 +1135,19 @@ static void RestoreWindowSealedIcon(HWND h) {
         return;
     }
 
-    const auto& state = it->second;
-    bool restored = true;
+    auto& state = it->second;
+    if (state.taskbar) {
+        winrt::com_ptr<IPropertyStore> store;
+        if (SUCCEEDED(SHGetPropertyStoreForWindow(h, IID_IPropertyStore, store.put_void())) &&
+            RestorePreviewTaskbarProperties(store.get(), *state.taskbar))
+            state.taskbar.reset();
+    }
     if (state.bigApplied)
-        restored = SendWindowIconForPreview(h, ICON_BIG, state.originalBig) && restored;
+        state.bigApplied = !SendWindowIconForPreview(h, ICON_BIG, state.originalBig);
     if (state.smallApplied)
-        restored = SendWindowIconForPreview(h, ICON_SMALL, state.originalSmall) && restored;
+        state.smallApplied = !SendWindowIconForPreview(h, ICON_SMALL, state.originalSmall);
     // Keep generated handles alive if a hung target could still be using them.
-    if (!restored) return;
+    if (state.bigApplied || state.smallApplied || state.taskbar) return;
 
     DestroySealedPreviewIconState(state);
     g_sealedPreviewIcons.erase(it);
@@ -1039,14 +1181,14 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     if (original.hasLayerAttributes &&
         !SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags))
         return false;
+    if (preview) SetWindowSealedIcon(h);
+    else RestoreWindowSealedIcon(h);
     if (preview || original.hiddenByLasso) {
         if (!SetWindowPresented(h, true, SWP_FRAMECHANGED) || !IsWindowVisible(h)) return false;
         original.hiddenByLasso = false;
     } else if (!SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED)) {
         return false;
     }
-    if (preview) SetWindowSealedIcon(h);
-    else RestoreWindowSealedIcon(h);
     if (original.wasVisible && IsWindowVisible(h) && !(targetStyle & WS_EX_TOOLWINDOW))
         UpdateTaskbarButton(h, true);
     InvalidateRect(h, nullptr, TRUE);
@@ -1058,7 +1200,6 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
 }
 
 bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
-    RestoreWindowSealedIcon(h);
     if (!SnapshotWindowState(h)) return false;
     auto& original = g_sealedWindowStates.at(h);
     LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
@@ -1066,6 +1207,7 @@ bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
     // Do it only for a live preview so the initial cross-desktop seal never shows a window.
     if (afterPreview && IsWindowVisible(h) && !IsIconic(h) && !(exStyle & WS_EX_TOOLWINDOW) &&
         SetWindowPresented(h, false)) original.hiddenByLasso = true;
+    RestoreWindowSealedIcon(h);
 
     exStyle &= ~WS_EX_APPWINDOW;
     exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT;
@@ -1091,6 +1233,10 @@ static void RestoreAllSealedWindows() {
     for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
         const HWND h = (it++)->first;
         ShowWindowAndShowTaskbarIcon(h);
+    }
+    for (auto it = g_sealedPreviewIcons.begin(); it != g_sealedPreviewIcons.end();) {
+        const HWND h = (it++)->first;
+        RestoreWindowSealedIcon(h);
     }
 }
 
@@ -1717,32 +1863,18 @@ BOOL GetPhysicalRect(HWND hWnd, RECT* pRect) {
 	return GetWindowRect(hWnd, pRect);
 }
 
-// The native Show Desktop button is a real child HWND on the primary taskbar.
-// Fail closed when Explorer does not expose it; never guess a broad right-edge band.
-static constexpr wchar_t SHOW_DESKTOP_BUTTON_CLASS[] = L"TrayShowDesktopButtonWClass";
+static constexpr LONG SHOW_DESKTOP_EDGE_WIDTH = 10;
 static bool g_showDesktopClickCaptured = false;
 
-static HWND FindShowDesktopButton(HWND primaryTaskbar) {
-    if (!IsWindow(primaryTaskbar)) return nullptr;
-    struct SearchContext { HWND button = nullptr; } context;
-    EnumChildWindows(primaryTaskbar, [](HWND child, LPARAM parameter) -> BOOL {
-        auto* search = reinterpret_cast<SearchContext*>(parameter);
-        if (!IsWindowVisible(child)) return TRUE;
-        wchar_t className[96]{};
-        if (GetClassNameW(child, className, static_cast<int>(std::size(className))) &&
-            wcscmp(className, SHOW_DESKTOP_BUTTON_CLASS) == 0) {
-            search->button = child;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&context));
-    return context.button;
+static bool IsPointInPrimaryTaskbar(HWND taskbar, POINT point, RECT& bounds) {
+    return taskbar && IsWindowVisible(taskbar) && GetWindowRect(taskbar, &bounds) &&
+        PtInRect(&bounds, point);
 }
 
-static bool IsPointInsideShowDesktopButton(HWND primaryTaskbar, POINT point) {
-    const HWND button = FindShowDesktopButton(primaryTaskbar);
+static bool IsPointInShowDesktopEdge(HWND primaryTaskbar, POINT point) {
     RECT bounds{};
-    return button && GetWindowRect(button, &bounds) && PtInRect(&bounds, point);
+    return IsPointInPrimaryTaskbar(primaryTaskbar, point, bounds) &&
+        point.x >= bounds.right - SHOW_DESKTOP_EDGE_WIDTH;
 }
 
 struct PrimaryWindowTransparencyState {
@@ -1887,8 +2019,13 @@ static RECT MouseGestureBounds(POINT point, int widthMetric, int heightMetric) {
 }
 
 static void HandlePrimaryDesktopClick(UINT button, POINT point, DWORD time,
-    bool (*isDesktopIconAt)(POINT) = IsPrimaryDesktopIconAt) {
+    HWND primaryTaskbar, bool (*isDesktopIconAt)(POINT) = IsPrimaryDesktopIconAt) {
     if (g_transparentPrimaryWindows.empty()) return;
+    RECT taskbarBounds{};
+    if (IsPointInPrimaryTaskbar(primaryTaskbar, point, taskbarBounds)) {
+        RestoreAllPrimaryWindowTransparency();
+        return; // Explorer still receives the original taskbar click.
+    }
     const RECT doubleClickBounds = MouseGestureBounds(g_lastDesktopIconClick.point,
         SM_CXDOUBLECLK, SM_CYDOUBLECLK);
     // A right-click is always an allowed desktop-icon operation. Only a
@@ -1905,7 +2042,7 @@ static void HandlePrimaryDesktopClick(UINT button, POINT point, DWORD time,
 }
 
 // Keep the original candidate filters: current desktop, visible, not minimized,
-// no MTU_EXE_TAG, no owner, and strictly on the primary monitor.
+// no MTU_EXE_TAG, no owner, and primarily on the main monitor.
 struct ToggleContext {
     std::vector<HWND>* pVector;
     HMONITOR hPrimaryMonitor;
@@ -1942,6 +2079,11 @@ static void TogglePrimaryWindows() {
     EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
     for (HWND h : candidates)
         ApplyPrimaryWindowTransparency(h);
+
+    // Explorer otherwise treats a click on the still-active transparent
+    // window's button as a minimize command.
+    if (g_transparentPrimaryWindows.contains(GetAncestor(GetForegroundWindow(), GA_ROOT)))
+        SetForegroundWindow(GetShellWindow());
 }
 
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -1959,7 +2101,7 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         switch (wParam) {
         case WM_LBUTTONDOWN: {
             const HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-            if (IsPointInsideShowDesktopButton(primaryTaskbar, mouse->pt) &&
+            if (IsPointInShowDesktopEdge(primaryTaskbar, mouse->pt) &&
                 PostMessageW(coordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0)) {
                 g_showDesktopClickCaptured = true;
                 pressedButton = 0;
@@ -2183,7 +2325,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 	if (idC == CHILDID_SELF) {
         // A Shell minimize event from another desktop must not wake or regroup it.
         if ((event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND) &&
-            !IsWindowOnCurrentVirtualDesktop(hwnd)) return;
+            (g_sealedPreviewIcons.contains(hwnd) || !IsWindowOnCurrentVirtualDesktop(hwnd))) return;
 		// 最小化开始：触发 AppID 独立化
 		if (event == EVENT_SYSTEM_MINIMIZESTART) {
 
@@ -2213,23 +2355,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 			// B. 排除点击任务栏导致的最小化
 			POINT pt;
 			GetCursorPos(&pt);
-			HWND hUnderMouse = WindowFromPoint(pt);
-			wchar_t trayCls[256];
-			GetClassNameW(hUnderMouse, trayCls, 256);
-			std::wstring mouseOnClass = trayCls;
-			if (wcscmp(trayCls, L"Shell_TrayWnd") == 0) {
-				RECT trayRect;
-				GetPhysicalRect(hUnderMouse, &trayRect);
-				// 如果点击位置不在任务栏的最右侧边缘（通常右下角触发区很窄）
-				// 则认为是普通的点击任务栏图标最小化，可以选择 return
-				if (pt.x < trayRect.right - 15) {
-					return;
-				}
-				// 如果是在最右侧，说明是“显示桌面”，我们【不 return】，继续执行 AppID 分离
-			}
-			if (wcscmp(trayCls, L"Shell_SecondaryTrayWnd") == 0) {
-				return;
-			}
+			const HWND mouseRoot = GetAncestor(WindowFromPoint(pt), GA_ROOT);
+			wchar_t trayCls[256]{};
+			GetClassNameW(mouseRoot, trayCls, static_cast<int>(std::size(trayCls)));
+			if ((wcscmp(trayCls, L"Shell_TrayWnd") == 0 && !IsPointInShowDesktopEdge(mouseRoot, pt)) ||
+			    wcscmp(trayCls, L"Shell_SecondaryTrayWnd") == 0) return;
 
 			// C. 执行 AppID 分离逻辑
 			std::wstring uniqueId = L"MTU.AppSplit." + std::to_wstring((UINT_PTR)hwnd);
@@ -2357,7 +2487,7 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     case WM_LASSO_PRIMARY_LEFT_CLICK:
     case WM_LASSO_PRIMARY_RIGHT_CLICK:
         HandlePrimaryDesktopClick(msg, POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)},
-            static_cast<DWORD>(GetMessageTime()));
+            static_cast<DWORD>(GetMessageTime()), FindWindowW(L"Shell_TrayWnd", nullptr));
         return 0;
     case WM_TIMER:
         if (wp == TIMER_ID_COLLECT) {
