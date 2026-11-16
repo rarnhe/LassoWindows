@@ -20,7 +20,6 @@
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
-#include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -1023,7 +1022,7 @@ static bool RestorePreviewTaskbarProperties(IPropertyStore* store, const Preview
     return restored;
 }
 
-static void SetPreviewTaskbarIcon(HWND h, SealedPreviewIconState& icons, HWND source) {
+static void SetPreviewTaskbarIcon(HWND h, SealedPreviewIconState& icons, HWND source, HICON icon) {
     if (icons.taskbar) return;
     winrt::com_ptr<IPropertyStore> store;
     if (FAILED(SHGetPropertyStoreForWindow(h, IID_IPropertyStore, store.put_void()))) return;
@@ -1047,7 +1046,7 @@ static void SetPreviewTaskbarIcon(HWND h, SealedPreviewIconState& icons, HWND so
     }
     const std::wstring suffix = std::wstring(id + 1, 36);
     state->iconFile = std::filesystem::path(temp) / (L"LassoPreview-" + suffix + L".ico");
-    if (!WritePreviewIconFile(icons.previewBig, state->iconFile)) return;
+    if (!WritePreviewIconFile(icon, state->iconFile)) return;
 
     wchar_t title[256]{};
     const std::wstring displayName = GetWindowTextW(h, title, static_cast<int>(std::size(title))) ?
@@ -1078,10 +1077,10 @@ static void DestroySealedPreviewIconState(const SealedPreviewIconState& state) {
         DestroyIcon(state.previewSmall);
 }
 
-// Apply a temporary, AccentColor-tinted Webdings web to the switcher icon.
+// Proxy title icons use black. The taskbar reads a separate accent-colored icon.
 // The pre-preview icon handles are borrowed from the target window and are
 // restored before the generated preview icons are destroyed.
-static bool SetWindowSealedIcon(HWND h, HWND source = nullptr) {
+static bool SetWindowSealedIcon(HWND h, HWND proxyTarget = nullptr) {
     if (!IsWindow(h)) return false;
     if (g_sealedPreviewIcons.contains(h)) return true;
 
@@ -1097,11 +1096,12 @@ static bool SetWindowSealedIcon(HWND h, HWND source = nullptr) {
     if (!bigSource) return false;
 
     const COLORREF accent = GetTaskbarAccentColor();
-    state.previewBig = CreateSealedPreviewIcon(
-        bigSource, GetSystemMetrics(SM_CXICON), accent);
+    const COLORREF titleColor = proxyTarget ? RGB(0, 0, 0) : accent;
+    const int bigSize = GetSystemMetrics(SM_CXICON);
+    state.previewBig = CreateSealedPreviewIcon(bigSource, bigSize, titleColor);
     if (!state.previewBig) return false;
     state.previewSmall = CreateSealedPreviewIcon(
-        smallSource ? smallSource : bigSource, GetSystemMetrics(SM_CXSMICON), accent);
+        smallSource ? smallSource : bigSource, GetSystemMetrics(SM_CXSMICON), titleColor);
     // Some systems/fonts cannot render the glyph legibly at the small metric.
     // Reuse the already-marked large icon rather than showing an unmarked icon.
     if (!state.previewSmall) state.previewSmall = state.previewBig;
@@ -1126,7 +1126,14 @@ static bool SetWindowSealedIcon(HWND h, HWND source = nullptr) {
     }
     state.smallApplied = true;
     auto it = g_sealedPreviewIcons.emplace(h, std::move(state)).first;
-    SetPreviewTaskbarIcon(h, it->second, source ? source : h);
+    if (proxyTarget) {
+        if (const HICON taskbarIcon = CreateSealedPreviewIcon(bigSource, bigSize, accent)) {
+            SetPreviewTaskbarIcon(h, it->second, proxyTarget, taskbarIcon);
+            DestroyIcon(taskbarIcon);
+        }
+    } else {
+        SetPreviewTaskbarIcon(h, it->second, h, it->second.previewBig);
+    }
     return true;
 }
 
@@ -1658,7 +1665,6 @@ struct AltTabProxy {
     HWND window = nullptr;
     HWND target = nullptr;
     HICON sourceIcon = nullptr;
-    COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
     std::wstring title;
     std::shared_ptr<ProxyFrame> frame = std::make_shared<ProxyFrame>();
 
@@ -1680,9 +1686,10 @@ static BITMAPINFO ProxyBitmapInfo(int width, int height) {
     return info;
 }
 
-// Measure the actual Webdings ink so the symbol (not the font box) reaches
-// both thumbnail edges. AlphaBlend touches only pixels covered by the web.
-static void DrawCenteredPreviewWeb(HDC destination, int width, int height, COLORREF accent) {
+// Stretch the actual Webdings ink to the image bounds, with no padding from the font box.
+static void DrawPreviewWeb(HDC destination, const RECT& bounds) {
+    const int width = bounds.right - bounds.left;
+    const int height = bounds.bottom - bounds.top;
     if (width <= 0 || height <= 0) return;
     constexpr int maskSide = 256;
     HDC dc = CreateCompatibleDC(destination);
@@ -1716,19 +1723,13 @@ static void DrawCenteredPreviewWeb(HDC destination, int width, int height, COLOR
                         ink.right = (std::max)(ink.right, x + 1);
                         ink.bottom = (std::max)(ink.bottom, y + 1);
                     }
-                    pixel = (alpha << 24) |
-                        ((GetRValue(accent) * alpha / 255) << 16) |
-                        ((GetGValue(accent) * alpha / 255) << 8) |
-                        (GetBValue(accent) * alpha / 255);
+                    pixel = alpha << 24; // Premultiplied black.
                 }
             }
             if (ink.right > ink.left && ink.bottom > ink.top) {
-                const int inkWidth = ink.right - ink.left;
-                const int inkHeight = ink.bottom - ink.top;
-                const int webWidth = (std::min)(width, (std::max)(1, MulDiv(inkWidth, height, inkHeight)));
                 const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-                AlphaBlend(destination, (width - webWidth) / 2, 0, webWidth, height,
-                    dc, ink.left, ink.top, inkWidth, inkHeight, blend);
+                AlphaBlend(destination, bounds.left, bounds.top, width, height,
+                    dc, ink.left, ink.top, ink.right - ink.left, ink.bottom - ink.top, blend);
             }
         }
         if (oldFont && oldFont != HGDI_ERROR) SelectObject(dc, oldFont);
@@ -1741,6 +1742,7 @@ static void DrawCenteredPreviewWeb(HDC destination, int width, int height, COLOR
 
 static void PaintAltTabProxy(HDC dc, int width, int height, const AltTabProxy& proxy) {
     const RECT bounds{0, 0, width, height};
+    RECT imageBounds = bounds;
     FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
     bool captured = false;
     {
@@ -1750,25 +1752,31 @@ static void PaintAltTabProxy(HDC dc, int width, int height, const AltTabProxy& p
             const double scale = (std::min)(double(width) / frame.width, double(height) / frame.height);
             const int w = (std::max)(1, static_cast<int>(frame.width * scale));
             const int h = (std::max)(1, static_cast<int>(frame.height * scale));
+            const int x = (width - w) / 2, y = (height - h) / 2;
             const auto info = ProxyBitmapInfo(frame.width, frame.height);
             SetStretchBltMode(dc, HALFTONE);
-            captured = StretchDIBits(dc, (width - w) / 2, (height - h) / 2, w, h, 0, 0,
+            captured = StretchDIBits(dc, x, y, w, h, 0, 0,
                 frame.width, frame.height, frame.pixels.data(), &info, DIB_RGB_COLORS, SRCCOPY) > 0;
+            if (captured) imageBounds = {x, y, x + w, y + h};
         }
     }
 
     SetBkMode(dc, TRANSPARENT);
     if (!captured) {
+        if (const HBRUSH background = CreateSolidBrush(RGB(240, 240, 240))) {
+            FillRect(dc, &bounds, background);
+            DeleteObject(background);
+        }
         const int side = (std::max)(1, (std::min)(width, height) / 4);
         if (proxy.sourceIcon)
             DrawIconEx(dc, (width - side) / 2, height / 4, proxy.sourceIcon, side, side, 0, nullptr, DI_NORMAL);
-        SetTextColor(dc, RGB(255, 255, 255));
+        SetTextColor(dc, RGB(48, 48, 48));
         RECT title{width / 12, height / 2, width - width / 12, height * 5 / 6};
         DrawTextW(dc, proxy.title.c_str(), -1, &title,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
-    DrawCenteredPreviewWeb(dc, width, height, proxy.accent);
+    DrawPreviewWeb(dc, imageBounds);
 }
 
 static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT message,
@@ -1914,13 +1922,6 @@ static std::unique_ptr<AltTabProxy> CreateAltTabProxy(HWND target, bool capture)
 
     auto proxy = std::make_unique<AltTabProxy>();
     proxy->target = target;
-    try {
-        using namespace winrt::Windows::UI::ViewManagement;
-        const auto accent = UISettings().GetColorValue(UIColorType::Accent);
-        proxy->accent = RGB(accent.R, accent.G, accent.B);
-    } catch (const winrt::hresult_error&) {
-        proxy->accent = GetTaskbarAccentColor();
-    }
     wchar_t title[512]{};
     GetWindowTextW(target, title, static_cast<int>(std::size(title)));
     proxy->title = *title ? title : ReadTaggedExe(target);
