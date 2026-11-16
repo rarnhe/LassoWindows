@@ -687,6 +687,7 @@ static bool RequestHostedUwpClose(HWND h) {
 }
 
 static std::unordered_map<HWND, ULONGLONG> g_restoredWindowShows;
+static void RestoreAllPrimaryWindowTransparency();
 
 static bool SetWindowPresented(HWND h, bool visible, UINT flags = 0) {
     if (visible) {
@@ -827,6 +828,7 @@ bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
 }
 
 static void RestoreAllSealedWindows() {
+    RestoreAllPrimaryWindowTransparency();
     for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
         const HWND h = (it++)->first;
         ShowWindowAndShowTaskbarIcon(h);
@@ -1079,6 +1081,7 @@ static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
 //realname一致的同类窗口处理
 struct CloseFilter {
     std::wstring currentAppProcName;
+    ReadWindowDesktop readDesktop = GetWindowDesktopGuid;
 };
 
 static bool SetSealTag(HWND h, const wchar_t* property, const wchar_t* value) {
@@ -1153,64 +1156,37 @@ BOOL CALLBACK EnumHideWindowsProc(HWND h, LPARAM lParam) {
 
 // 反向隐藏：隐藏所有【不属于】当前 App 进程名的窗口
 BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
-	CloseFilter* filter = reinterpret_cast<CloseFilter*>(lParam);
-	if (!filter) return FALSE;
+    auto* filter = reinterpret_cast<CloseFilter*>(lParam);
+    if (!filter) return FALSE;
+    if (!IsWindowVisible(hWnd) || GetParent(hWnd) != nullptr) return TRUE;
 
-	const std::wstring& currentAppProcName = filter->currentAppProcName;
+    const std::wstring otherWndProcName = GetRealProcessName(hWnd);
+    if (_wcsicmp(otherWndProcName.c_str(), filter->currentAppProcName.c_str()) == 0)
+        return TRUE;
 
-	// 1. 基础过滤：跳过不可见窗口、子窗口、以及我们自己的管理窗口
-	if (!IsWindowVisible(hWnd) || GetParent(hWnd) != NULL) {
-		return TRUE;
-	}
+    // UWP frames use the conservative WM_CLOSE path regardless of desktop.
+    if (IsApplicationFrameWindow(hWnd)) {
+        if (filter->currentAppProcName != SHARED_UWP_HOST &&
+            otherWndProcName != L"Unknown" &&
+            _wcsicmp(otherWndProcName.c_str(), SHARED_UWP_HOST) != 0)
+            RequestHostedUwpClose(hWnd);
+        return TRUE;
+    }
 
-	// --- 【关键新增】：只处理当前虚拟桌面上的窗口 ---
-	// 如果窗口在其他桌面，直接跳过，不进行匹配和隐藏
-	if (!IsWindowOnCurrentVirtualDesktop(hWnd)) {
-		return TRUE;
-	}
+    // Keep the Explorer safety rule: only File Explorer windows are eligible.
+    if (_wcsicmp(otherWndProcName.c_str(), L"explorer.exe") == 0) {
+        wchar_t className[256]{};
+        if (!GetClassNameW(hWnd, className, static_cast<int>(std::size(className))) ||
+            wcscmp(className, L"CabinetWClass") != 0)
+            return TRUE;
+    }
 
-	// 2. 获取遍历到的窗口所属进程名
-	std::wstring otherWndProcName = GetRealProcessName(hWnd);
-
-	// 3. 核心逻辑：如果这个窗口【不属于】当前正在使用的 App
-	if (_wcsicmp(otherWndProcName.c_str(), currentAppProcName.c_str()) != 0) {
-		if (IsApplicationFrameWindow(hWnd)) {
-			if (_wcsicmp(currentAppProcName.c_str(), SHARED_UWP_HOST) != 0 &&
-				otherWndProcName != L"Unknown" &&
-				_wcsicmp(otherWndProcName.c_str(), SHARED_UWP_HOST) != 0)
-				RequestHostedUwpClose(hWnd);
-			return TRUE;
-		}
-
-		// --- 关键修正：仿照 EnumHideWindowsProc 的安全过滤 ---
-
-		// =========================================================================
-		// 【完美改进版】：反向隐藏遍历回调中的关闭/过滤逻辑
-		// =========================================================================
-		wchar_t className[256] = { 0 };
-		if (GetClassNameW(hWnd, className, 256)) {
-
-			// A. 针对 explorer.exe 的精准过滤
-			if (_wcsicmp(otherWndProcName.c_str(), L"explorer.exe") == 0) {
-				wchar_t className[256];
-				if (GetClassNameW(hWnd, className, 256)) {
-					// 在反向隐藏时，explorer 进程中我们只敢隐藏“文件夹窗口”
-					// 必须跳过 Shell_TrayWnd, Progman, WorkerW 等所有其他组件
-					if (_wcsicmp(className, L"CabinetWClass") != 0) {
-						return TRUE;
-					}
-				}
-			}
-
-		}
-
-        GUID desktop{};
-        if (GetWindowDesktopGuid(hWnd, desktop, true)) SealWindow(hWnd, otherWndProcName, desktop);
-	}
-
-	return TRUE;
+    // Do not require the current desktop. Tag each window with its own GUID.
+    GUID desktop{};
+    if (filter->readDesktop(hWnd, desktop, false))
+        SealWindow(hWnd, otherWndProcName, desktop);
+    return TRUE;
 }
-
 
 
 // 隐藏同类型窗口后，alt+tab临时查看下。
@@ -1260,6 +1236,7 @@ void SuppressWinKeyMenuModern() {
 
 bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = nullptr,
                               HWND foreground = GetForegroundWindow()) {
+    RestoreAllPrimaryWindowTransparency();
     // Repeated Tab advances the native switcher without rebuilding the preview.
     if (g_InSnapWindows) return true;
     if (g_sealedWindowStates.empty()) return false;
@@ -1420,11 +1397,6 @@ LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
 }
 
-// 主桌面右下角点击后显示桌面图标，这里做一个鼠标左键点击劫持
-// 表现为只将主桌面窗口隐藏，附加桌面不影响。
-// 全局状态控制
-const int TARGET_ZONE_WIDTH = 30; // 右下角触发区域宽度
-
 // 检查窗口是否是用户可见的、合法的普通主窗口
 BOOL IsValidAppWindow(HWND hWnd) {
 	if (GetParent(hWnd) != NULL) return FALSE;
@@ -1482,92 +1454,187 @@ BOOL GetPhysicalRect(HWND hWnd, RECT* pRect) {
 	return GetWindowRect(hWnd, pRect);
 }
 
-// 全局容器：记录被我们最小化的主屏窗口句柄
-std::vector<HWND> g_minimizedPrimaryWindows;
+// The native Show Desktop button is a real child HWND on the primary taskbar.
+// Fail closed when Explorer does not expose it; never guess a broad right-edge band.
+static constexpr wchar_t SHOW_DESKTOP_BUTTON_CLASS[] = L"TrayShowDesktopButtonWClass";
+static bool g_showDesktopClickCaptured = false;
 
-// 全局变量：记录上一次点击右下角“显示桌面”的时间戳（单位：毫秒）
-static ULONGLONG g_lastTrayClickTime = 0;
-
-// 1. 用于打包传递给回调函数的轻量级上下文结构体
-struct ToggleContext {
-	std::vector<HWND>* pVector;
-	HMONITOR hPrimaryMonitor; // 传入主显示器句柄
-};
-
-BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
-	auto* pCtx = reinterpret_cast<ToggleContext*>(lParam);
-	if (!pCtx || !pCtx->pVector || !IsValidAppWindow(hWnd)) {
-		return TRUE;
-	}
-
-	// Only current-desktop windows are eligible for the taskbar hot-zone.
-	if (!IsWindowOnCurrentVirtualDesktop(hWnd)) return TRUE;
-	if (IsIconic(hWnd) || !IsWindowVisible(hWnd)) return TRUE;
-
-	// 2. 核心过滤：如果外部已经赋予了 MTU_EXE_TAG 标签，直接跳过
-	HANDLE hProc = GetPropW(hWnd, L"MTU_EXE_TAG");
-	if (hProc != NULL) {
-		return TRUE;
-	}
-
-	// 3. 跳过有 Owner 的子窗口/弹窗
-	if (GetWindow(hWnd, GW_OWNER) != nullptr) return TRUE;
-
-	// 4. 精准计算外框渲染物理矩形（剔除 Win10/11 阴影）
-	RECT winRect{};
-	if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &winRect, sizeof(winRect)))) {
-		if (!GetPhysicalRect(hWnd, &winRect)) return TRUE;
-	}
-
-	// 5. 根据真实物理位置裁决所属显示器
-	HMONITOR hWinMonitor = MonitorFromRect(&winRect, MONITOR_DEFAULTTONULL);
-
-	// 6. 物理硬核防御：只收集严格位于主屏的窗口
-	if (hWinMonitor == NULL || hWinMonitor != pCtx->hPrimaryMonitor) {
-		return TRUE;
-	}
-
-	pCtx->pVector->push_back(hWnd);
-	return TRUE;
+static HWND FindShowDesktopButton(HWND primaryTaskbar) {
+    if (!IsWindow(primaryTaskbar)) return nullptr;
+    struct SearchContext { HWND button = nullptr; } context;
+    EnumChildWindows(primaryTaskbar, [](HWND child, LPARAM parameter) -> BOOL {
+        auto* search = reinterpret_cast<SearchContext*>(parameter);
+        if (!IsWindowVisible(child)) return TRUE;
+        wchar_t className[96]{};
+        if (GetClassNameW(child, className, static_cast<int>(std::size(className))) &&
+            wcscmp(className, SHOW_DESKTOP_BUTTON_CLASS) == 0) {
+            search->button = child;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&context));
+    return context.button;
 }
 
-// =========================================================================
-// 2. 极致纯粹的全局低级鼠标钩子（状态完全依赖外部监测同步）
-// =========================================================================
-// All collection and minimize/restore work runs on the coordinator thread.
-static void TogglePrimaryWindows() {
-    g_lastTrayClickTime = GetTickCount64();
-    if (g_minimizedPrimaryWindows.empty()) {
-        POINT origin{0, 0};
-        HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
-        ToggleContext context{&g_minimizedPrimaryWindows, primary};
-        EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
-        for (HWND h : g_minimizedPrimaryWindows) {
-            if (IsWindow(h)) PostMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+static bool IsPointInsideShowDesktopButton(HWND primaryTaskbar, POINT point) {
+    const HWND button = FindShowDesktopButton(primaryTaskbar);
+    RECT bounds{};
+    return button && GetWindowRect(button, &bounds) && PtInRect(&bounds, point);
+}
+
+struct PrimaryWindowTransparencyState {
+    LONG_PTR exStyle = 0;
+    BYTE alpha = 255;
+    COLORREF colorKey = 0;
+    DWORD layerFlags = 0;
+    bool hasLayerAttributes = false;
+};
+
+static std::unordered_map<HWND, PrimaryWindowTransparencyState> g_transparentPrimaryWindows;
+
+static bool SetWindowExtendedStyle(HWND h, LONG_PTR style) {
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous = SetWindowLongPtrW(h, GWL_EXSTYLE, style);
+    return previous != 0 || GetLastError() == ERROR_SUCCESS;
+}
+
+static bool ApplyPrimaryWindowTransparency(HWND h) {
+    if (!IsWindow(h)) return false;
+    if (g_transparentPrimaryWindows.contains(h)) return true;
+
+    PrimaryWindowTransparencyState original;
+    original.exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    if (original.exStyle & WS_EX_LAYERED) {
+        // Do not overwrite layered windows whose original attributes cannot
+        // be queried (for example, windows using UpdateLayeredWindow).
+        if (!GetLayeredWindowAttributes(h, &original.colorKey,
+                &original.alpha, &original.layerFlags)) return false;
+        original.hasLayerAttributes = true;
+    }
+
+    const LONG_PTR transparentStyle = original.exStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+    if (!SetWindowExtendedStyle(h, transparentStyle)) return false;
+
+    if (!SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA)) {
+        if (!(original.exStyle & WS_EX_LAYERED))
+            SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+        SetWindowExtendedStyle(h, original.exStyle);
+        SetWindowPos(h, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+            SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+        return false;
+    }
+
+    if (!SetWindowPos(h, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+            SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS)) {
+        if (original.exStyle & WS_EX_LAYERED)
+            SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
+        else
+            SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+        SetWindowExtendedStyle(h, original.exStyle);
+        return false;
+    }
+
+    // Preserve taskbar identity: never add/remove WS_EX_APPWINDOW or WS_EX_TOOLWINDOW.
+    g_transparentPrimaryWindows.emplace(h, original);
+    return true;
+}
+
+static bool RestorePrimaryWindowTransparency(HWND h) {
+    const auto it = g_transparentPrimaryWindows.find(h);
+    if (it == g_transparentPrimaryWindows.end()) return true;
+    if (!IsWindow(h)) {
+        g_transparentPrimaryWindows.erase(it);
+        return true;
+    }
+
+    const auto original = it->second;
+    if (!(original.exStyle & WS_EX_LAYERED)) {
+        if (!SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA)) return false;
+        if (!SetWindowExtendedStyle(h, original.exStyle)) {
+            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+            return false;
         }
     } else {
-        for (HWND h : g_minimizedPrimaryWindows) {
-            if (IsWindow(h) && IsIconic(h) && IsWindowOnCurrentVirtualDesktop(h))
-                ShowWindowAsync(h, SW_RESTORE);
+        if (!SetWindowExtendedStyle(h, original.exStyle)) return false;
+        if (original.hasLayerAttributes &&
+            !SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags)) {
+            SetWindowExtendedStyle(h, original.exStyle | WS_EX_TRANSPARENT);
+            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+            return false;
         }
-        g_minimizedPrimaryWindows.clear();
+    }
+
+    SetWindowPos(h, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+        SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+    g_transparentPrimaryWindows.erase(it);
+    return true;
+}
+
+static void RestoreAllPrimaryWindowTransparency() {
+    for (auto it = g_transparentPrimaryWindows.begin();
+         it != g_transparentPrimaryWindows.end();) {
+        const HWND h = it->first;
+        ++it;
+        RestorePrimaryWindowTransparency(h);
     }
 }
 
+// Keep the original candidate filters: current desktop, visible, not minimized,
+// no MTU_EXE_TAG, no owner, and strictly on the primary monitor.
+struct ToggleContext {
+    std::vector<HWND>* pVector;
+    HMONITOR hPrimaryMonitor;
+};
+
+BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
+    auto* pCtx = reinterpret_cast<ToggleContext*>(lParam);
+    if (!pCtx || !pCtx->pVector || !IsValidAppWindow(hWnd)) return TRUE;
+    if (!IsWindowOnCurrentVirtualDesktop(hWnd)) return TRUE;
+    if (IsIconic(hWnd) || !IsWindowVisible(hWnd)) return TRUE;
+    if (GetPropW(hWnd, L"MTU_EXE_TAG") != nullptr) return TRUE;
+    if (GetWindow(hWnd, GW_OWNER) != nullptr) return TRUE;
+
+    RECT winRect{};
+    if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+            &winRect, sizeof(winRect))) && !GetPhysicalRect(hWnd, &winRect))
+        return TRUE;
+    const HMONITOR hWinMonitor = MonitorFromRect(&winRect, MONITOR_DEFAULTTONULL);
+    if (!hWinMonitor || hWinMonitor != pCtx->hPrimaryMonitor) return TRUE;
+    pCtx->pVector->push_back(hWnd);
+    return TRUE;
+}
+
+static void TogglePrimaryWindows() {
+    if (!g_transparentPrimaryWindows.empty()) {
+        RestoreAllPrimaryWindowTransparency();
+        return;
+    }
+
+    POINT origin{0, 0};
+    const HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+    std::vector<HWND> candidates;
+    ToggleContext context{&candidates, primary};
+    EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
+    for (HWND h : candidates)
+        ApplyPrimaryWindowTransparency(h);
+}
+
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION &&
-        (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) &&
-        g_hLassoCoordinator) {
+    if (nCode == HC_ACTION && wParam == WM_LBUTTONUP && g_showDesktopClickCaptured) {
+        g_showDesktopClickCaptured = false;
+        return 1;
+    }
+
+    if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN && g_hLassoCoordinator) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-        RECT bounds{};
-        if (tray && GetPhysicalRect(tray, &bounds) &&
-            mouse->pt.x >= bounds.right - TARGET_ZONE_WIDTH &&
-            mouse->pt.x <= bounds.right &&
-            mouse->pt.y >= bounds.top && mouse->pt.y <= bounds.bottom) {
-            if (wParam == WM_LBUTTONUP) return 1;
-            if (PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0))
-                return 1;
+        const HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (primaryTaskbar && IsPointInsideShowDesktopButton(primaryTaskbar, mouse->pt) &&
+            PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0)) {
+            g_showDesktopClickCaptured = true;
+            return 1;
         }
     }
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
@@ -1694,7 +1761,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
         };
         forget(g_HiddenWindowsCache);
         forget(g_snapUnhiddenWindows);
-        forget(g_minimizedPrimaryWindows);
+        g_transparentPrimaryWindows.erase(hwnd);
         return;
     }
 
@@ -1703,93 +1770,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 		UpdateSystemDpiScalingStatus(); // 刷新屏幕缩放标志位
 		return;
 	}
-
-	//// =========================================================================
-	//// 🔴【新增强制联动】：监控主屏事件变动，触发一键全屏还原大部队
-	//// =========================================================================
-	//// 注意：请确保 g_minimizedPrimaryWindows 属于全局变量（或在当前上下文中可达）
-	//// 🔴 核心防御：如果距离上次点击右下角还不到 300ms，说明处于“显示桌面”的消息流中，直接跳过！
-	//if (!g_minimizedPrimaryWindows.empty() && idC == CHILDID_SELF) {
-
-	//	// 1. 仅保留前台焦点切换
-	//	if (event == EVENT_SYSTEM_FOREGROUND)
-	//	{
-	//		if (IsWindow(hwnd)) {
-	//			// 🎯 1. 过滤物理右键按下状态
-	//			if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0) {
-	//				goto EXIT_RESTORE_CHECK;
-	//			}
-
-	//			// 🎯 2. 过滤右键菜单窗口（Windows 系统标准菜单类名 "#32768"）
-	//			wchar_t className[256] = { 0 };
-	//			GetClassNameW(hwnd, className, 256);
-	//			if (wcscmp(className, L"#32768") == 0) {
-	//				goto EXIT_RESTORE_CHECK; // 菜单本身获得焦点，忽略
-	//			}
-
-	//			// 🎯 3. 确认当前真正的前台窗口（Foreground Window）不是右键菜单
-	//			HWND hFG = GetForegroundWindow();
-	//			wchar_t fgClassName[256] = { 0 };
-	//			if (hFG && IsWindow(hFG)) {
-	//				GetClassNameW(hFG, fgClassName, 256);
-	//				if (wcscmp(fgClassName, L"#32768") == 0) {
-	//					goto EXIT_RESTORE_CHECK; // 菜单处于前台，忽略
-	//				}
-	//			}
-
-	//			// 获取主显示器句柄
-	//			POINT ptZero = { 0, 0 };
-	//			HMONITOR hPrimaryMonitor = MonitorFromPoint(ptZero, MONITOR_DEFAULTTOPRIMARY);
-
-	//			bool isDesktop = (wcscmp(className, L"Progman") == 0 || wcscmp(className, L"WorkerW") == 0);
-	//			bool isValidApp = IsValidAppWindow(hwnd);
-
-	//			if (isValidApp || isDesktop) {
-
-	//				HMONITOR hTargetMonitor = NULL;
-
-	//				if (isDesktop) {
-	//					// 获取事件产生那一刻的物理坐标
-	//					DWORD pos = GetMessagePos();
-	//					POINT ptEvent = { GET_X_LPARAM(pos), GET_Y_LPARAM(pos) };
-
-	//					hTargetMonitor = MonitorFromPoint(ptEvent, MONITOR_DEFAULTTONEAREST);
-	//				}
-	//				else {
-	//					// 普通 App 窗口按其空间物理矩形裁决
-	//					hTargetMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-	//				}
-
-	//				HMONITOR hFGMonitor = MonitorFromWindow(hFG, MONITOR_DEFAULTTONEAREST);
-
-	//				// 确保触发目标和前台窗口均在主屏
-	//				if (hTargetMonitor == hPrimaryMonitor && hFGMonitor == hPrimaryMonitor) {
-
-	//					// 🔴 防误触发：300ms 冷却保护
-	//					if (GetTickCount64() - g_lastTrayClickTime < 300) {
-	//						goto EXIT_RESTORE_CHECK;
-	//					}
-
-	//					// 4. 批量拉回主屏幕所有最小化的窗口
-	//					for (HWND hWnd : g_minimizedPrimaryWindows) {
-	//						if (IsWindow(hWnd) && IsIconic(hWnd)) {
-	//							ShowWindowAsync(hWnd, SW_RESTORE);
-	//						}
-	//					}
-
-	//					// 5. 清空列表
-	//					g_minimizedPrimaryWindows.clear();
-
-	//					return;
-	//				}
-	//			}
-	//		}
-	//	}
-	//}
-
-	//EXIT_RESTORE_CHECK:;
-	//// 🔽 这里下方可以继续放你其他的 WinEvent 事件监控代码（如 MINIMIZEEND、DESTROY 等）
-	//// 这样其他监控逻辑 100% 正常运行，不受 300ms 冷却影响！
 
 	// --- 1. 获取基础信息 ---
 	wchar_t cls[256] = { 0 };
@@ -1951,6 +1931,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 // taskbar and hide/restore work. Hook callbacks live on the main message thread.
 static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDesktop = GetWindowDesktopGuid,
                                    bool (*isOnCurrentDesktop)(HWND) = IsWindowOnCurrentVirtualDesktop) {
+    RestoreAllPrimaryWindowTransparency();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !isOnCurrentDesktop(root)) return;
@@ -1972,6 +1953,7 @@ static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDeskto
 }
 
 static void HideOtherApplications(HWND foreground) {
+    RestoreAllPrimaryWindowTransparency();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;

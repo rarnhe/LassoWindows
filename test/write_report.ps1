@@ -49,7 +49,7 @@ foreach ($case in $failed) {
 if ($failed.Count -eq 0) { $lines.Add("无用例失败详情；若整体失败，请检查 Actions 阶段和构建日志。") }
 $lines.Add("")
 $lines.Add("## 覆盖范围")
-$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、EXE 文件名与虚拟桌面 GUID 双标签、跨虚拟桌面同名 EXE 封印、会话级虚拟桌面 GUID 优先解析、切换桌面后 Alt+Tab 仅预览当前桌面窗口、同进程解封、连续预览、临时应用窗口样式和最终原样恢复、收网计时器隔离、UWP 外框 WM_CLOSE 保守策略、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
+$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、EXE 文件名与虚拟桌面 GUID 双标签、跨虚拟桌面同名 EXE 封印、Shift+Win+C 跨全部虚拟桌面隐藏其他应用及 UWP WM_CLOSE、会话级虚拟桌面 GUID 优先解析、切换桌面后 Alt+Tab 仅预览当前桌面窗口、主屏原生 Show Desktop 按钮精确命中、主屏窗口透明化/鼠标穿透及原始扩展样式与 Alpha 恢复、任务栏图标样式保留、同进程解封、连续预览、收网计时器隔离、图标缓存和主屏筛选条件。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
 $lines.Add("")
 $lines.Add("全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。")
 $content = $lines -join [Environment]::NewLine

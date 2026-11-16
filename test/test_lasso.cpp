@@ -6,10 +6,11 @@
 
 struct Window {
     HWND h;
-    explicit Window(DWORD ex = WS_EX_APPWINDOW, HWND parent = nullptr, const wchar_t* windowClass = L"STATIC") {
+    explicit Window(DWORD ex = WS_EX_APPWINDOW, HWND parent = nullptr, const wchar_t* windowClass = L"STATIC",
+        int x = 50, int y = 50, int width = 240, int height = 160, DWORD styleOverride = 0) {
         h = CreateWindowExW(ex, windowClass, L"Lasso fixture",
-            parent ? WS_CHILD : WS_OVERLAPPEDWINDOW, 50, 50, 240, 160,
-            parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+            styleOverride ? styleOverride : (parent ? WS_CHILD : WS_OVERLAPPEDWINDOW),
+            x, y, width, height, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
         CHECK(h);
     }
     ~Window() { DestroyWindow(h); }
@@ -30,6 +31,28 @@ struct Ini {
     }
     ~Ini() { std::error_code ec; std::filesystem::remove(path, ec); }
 };
+
+static std::unordered_map<HWND, GUID> g_testWindowDesktopIds;
+static UINT g_testDesktopReadCount = 0;
+
+static bool ReadTestWindowDesktop(HWND h, GUID& desktop, bool requireCurrent) {
+    if (requireCurrent) return false;
+    const auto it = g_testWindowDesktopIds.find(h);
+    if (it == g_testWindowDesktopIds.end()) return false;
+    ++g_testDesktopReadCount;
+    desktop = it->second;
+    return true;
+}
+
+static void RegisterFixtureClass(const wchar_t* name) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = name;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        throw std::runtime_error("RegisterClassW failed");
+}
+
 void iniTest(const std::string& name) {
     Ini ini;
     std::wstring expected;
@@ -50,6 +73,114 @@ void iniTest(const std::string& name) {
 }
 void run(const std::string& name) {
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
+    if (name == "hide_others_all_desktops") {
+        RegisterFixtureClass(L"ApplicationFrameWindow");
+        Window desktopA, desktopB, uwpA(WS_EX_APPWINDOW, nullptr, L"ApplicationFrameWindow"),
+            uwpB(WS_EX_APPWINDOW, nullptr, L"ApplicationFrameWindow"), sameApp;
+        for (HWND h : {desktopA.h, desktopB.h, uwpA.h, uwpB.h, sameApp.h})
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+
+        static constexpr GUID deskA{0x17fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xf9}};
+        static constexpr GUID deskB{0x17fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xfa}};
+        g_testWindowDesktopIds[desktopA.h] = deskA;
+        g_testWindowDesktopIds[desktopB.h] = deskB;
+        g_testDesktopReadCount = 0;
+
+        CloseFilter filter;
+        filter.currentAppProcName = L"active-app.exe";
+        filter.readDesktop = ReadTestWindowDesktop;
+        CHECK(EnumHideOthersProc(desktopA, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(EnumHideOthersProc(desktopB, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(g_testDesktopReadCount == 2);
+        GUID actualA{}, actualB{};
+        CHECK(ReadTaggedDesktopGuid(desktopA, actualA) && IsEqualGUID(actualA, deskA));
+        CHECK(ReadTaggedDesktopGuid(desktopB, actualB) && IsEqualGUID(actualB, deskB));
+        CHECK(ReadTaggedExe(desktopA) == GetRealProcessName(desktopA));
+        CHECK(ReadTaggedExe(desktopB) == GetRealProcessName(desktopB));
+
+        CHECK(EnumHideOthersProc(uwpA, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(EnumHideOthersProc(uwpB, reinterpret_cast<LPARAM>(&filter)));
+        MSG messageA{}, messageB{};
+        CHECK(PeekMessageW(&messageA, uwpA, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+        CHECK(PeekMessageW(&messageB, uwpB, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+        CHECK(messageA.hwnd == uwpA.h && messageB.hwnd == uwpB.h);
+
+        filter.currentAppProcName = GetRealProcessName(sameApp);
+        CHECK(EnumHideOthersProc(sameApp, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(!g_sealedWindowStates.contains(sameApp.h));
+
+        RestoreAllSealedWindows();
+        g_testWindowDesktopIds.clear();
+        return;
+    }
+    if (name == "primary_transparency_roundtrip") {
+        Window plain;
+        Window layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
+        ShowWindow(plain, SW_SHOWNOACTIVATE);
+        ShowWindow(layered, SW_SHOWNOACTIVATE);
+
+        const LONG_PTR plainStyle = GetWindowLongPtrW(plain, GWL_EXSTYLE);
+        CHECK(plainStyle & WS_EX_APPWINDOW);
+        CHECK(!(plainStyle & WS_EX_TOOLWINDOW));
+        CHECK(ApplyPrimaryWindowTransparency(plain));
+        CHECK(ApplyPrimaryWindowTransparency(plain));
+        LONG_PTR style = GetWindowLongPtrW(plain, GWL_EXSTYLE);
+        CHECK((style & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) ==
+            (WS_EX_LAYERED | WS_EX_TRANSPARENT));
+        CHECK((style & WS_EX_APPWINDOW) == (plainStyle & WS_EX_APPWINDOW));
+        CHECK(!(style & WS_EX_TOOLWINDOW));
+        BYTE alpha = 255; DWORD flags = 0;
+        CHECK(GetLayeredWindowAttributes(plain, nullptr, &alpha, &flags));
+        CHECK(alpha == 0 && (flags & LWA_ALPHA));
+        CHECK(IsWindowVisible(plain) && !IsIconic(plain));
+
+        const LONG_PTR layeredStyle = GetWindowLongPtrW(layered, GWL_EXSTYLE);
+        const COLORREF originalKey = RGB(13, 42, 71);
+        CHECK(SetLayeredWindowAttributes(layered, originalKey, 173, LWA_ALPHA | LWA_COLORKEY));
+        CHECK(ApplyPrimaryWindowTransparency(layered));
+        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) & WS_EX_APPWINDOW);
+        CHECK(!(GetWindowLongPtrW(layered, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        alpha = 255; flags = 0;
+        CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
+        CHECK(alpha == 0 && flags == LWA_ALPHA);
+
+        CHECK(RestorePrimaryWindowTransparency(plain));
+        CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
+        CHECK(RestorePrimaryWindowTransparency(layered));
+        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
+        COLORREF restoredKey{}; alpha = 0; flags = 0;
+        CHECK(GetLayeredWindowAttributes(layered, &restoredKey, &alpha, &flags));
+        CHECK(restoredKey == originalKey && alpha == 173);
+        CHECK(flags == (LWA_ALPHA | LWA_COLORKEY));
+        CHECK(g_transparentPrimaryWindows.empty());
+        return;
+    }
+    if (name == "show_desktop_button_hit_test") {
+        RegisterFixtureClass(L"Shell_TrayWnd");
+        RegisterFixtureClass(L"TrayNotifyWnd");
+        RegisterFixtureClass(L"TrayClockWClass");
+        RegisterFixtureClass(L"TrayShowDesktopButtonWClass");
+        Window tray(0, nullptr, L"Shell_TrayWnd", 100, 100, 1000, 40, WS_POPUP);
+        Window notify(0, tray, L"TrayNotifyWnd", 850, 0, 150, 40);
+        Window clock(0, notify, L"TrayClockWClass", 0, 0, 135, 40);
+        Window button(0, notify, L"TrayShowDesktopButtonWClass", 140, 0, 10, 40);
+        for (HWND h : {tray.h, notify.h, clock.h, button.h})
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+
+        CHECK(FindShowDesktopButton(tray) == button.h);
+        RECT buttonRect{}, clockRect{}, trayRect{};
+        CHECK(GetWindowRect(button, &buttonRect));
+        CHECK(GetWindowRect(clock, &clockRect));
+        CHECK(GetWindowRect(tray, &trayRect));
+        CHECK(buttonRect.left == 1090 && buttonRect.right == 1100);
+        const POINT clockPoint{trayRect.right - 25, 120};
+        CHECK(PtInRect(&clockRect, clockPoint));
+        CHECK(clockPoint.x >= trayRect.right - 30);
+        CHECK(!IsPointInsideShowDesktopButton(tray, clockPoint));
+        CHECK(IsPointInsideShowDesktopButton(tray, POINT{1095, 120}));
+        CHECK(!IsPointInsideShowDesktopButton(tray, POINT{1100, 120}));
+        return;
+    }
     if (name == "uwp_frame_close") {
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
