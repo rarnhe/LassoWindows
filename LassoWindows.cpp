@@ -1831,13 +1831,13 @@ static void CALLBACK CaptureAltTabProxyFrame(PTP_CALLBACK_INSTANCE, void* data) 
                     const int w = (std::max)(1, static_cast<int>(width * scale));
                     const int h = (std::max)(1, static_cast<int>(height * scale));
                     try {
-                        std::vector<DWORD> small(static_cast<size_t>(w) * h);
+                        std::vector<DWORD> scaledPixels(static_cast<size_t>(w) * h);
                         for (int y = 0; y < h; ++y)
                             for (int x = 0; x < w; ++x)
-                                small[static_cast<size_t>(y) * w + x] =
+                                scaledPixels[static_cast<size_t>(y) * w + x] =
                                     pixels[static_cast<size_t>(y * height / h) * width + x * width / w];
                         const std::lock_guard guard(frame.lock);
-                        frame.pixels = std::move(small);
+                        frame.pixels = std::move(scaledPixels);
                         frame.width = w;
                         frame.height = h;
                     } catch (const std::bad_alloc&) {}
