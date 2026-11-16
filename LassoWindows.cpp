@@ -740,12 +740,12 @@ static void ClearSealMarkers(HWND h) {
     if (p) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(p)));
     HANDLE vd = RemovePropW(h, L"MTU_VD_TAG");
     if (vd) GlobalDeleteAtom(static_cast<ATOM>(reinterpret_cast<UINT_PTR>(vd)));
-    wchar_t title[512]{};
-    if (GetWindowTextW(h, title, 512) > 0) {
-        const std::wstring prefix = L"🕸";
-        if (wcsncmp(title, prefix.c_str(), prefix.length()) == 0)
-            SetWindowTextW(h, title + prefix.length());
-    }
+    //wchar_t title[512]{};
+    //if (GetWindowTextW(h, title, 512) > 0) {
+    //    const std::wstring prefix = L"🕸";
+    //    if (wcsncmp(title, prefix.c_str(), prefix.length()) == 0)
+    //        SetWindowTextW(h, title + prefix.length());
+    //}
 }
 
 static bool IsOriginalWindowEligibleForPreview(HWND h) {
@@ -1378,11 +1378,11 @@ static bool SealWindow(HWND h, const std::wstring& process, REFGUID desktop) {
         return false;
     }
 
-    wchar_t title[512]{};
-    const std::wstring prefix = L"🕸";
-    if (GetWindowTextW(h, title, static_cast<int>(std::size(title))) > 0 &&
-        wcsncmp(title, prefix.c_str(), prefix.length()) != 0)
-        SetWindowTextW(h, (prefix + title).c_str());
+    //wchar_t title[512]{};
+    //const std::wstring prefix = L"🕸";
+    //if (GetWindowTextW(h, title, static_cast<int>(std::size(title))) > 0 &&
+    //    wcsncmp(title, prefix.c_str(), prefix.length()) != 0)
+    //    SetWindowTextW(h, (prefix + title).c_str());
     return true;
 }
 
