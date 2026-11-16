@@ -14,6 +14,8 @@
 #include <iterator>
 #include <algorithm>
 #include <memory>
+#include <atomic>
+#include <mutex>
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
@@ -690,7 +692,6 @@ static bool RequestHostedUwpClose(HWND h) {
 }
 
 static std::unordered_map<HWND, ULONGLONG> g_restoredWindowShows;
-static void RestoreAllPrimaryWindowTransparency();
 
 static bool SetWindowPresented(HWND h, bool visible, UINT flags = 0) {
     if (visible) {
@@ -1019,13 +1020,13 @@ static bool RestorePreviewTaskbarProperties(IPropertyStore* store, const Preview
     return restored;
 }
 
-static void SetPreviewTaskbarIcon(HWND h, SealedPreviewIconState& icons) {
+static void SetPreviewTaskbarIcon(HWND h, SealedPreviewIconState& icons, HWND source) {
     if (icons.taskbar) return;
     winrt::com_ptr<IPropertyStore> store;
     if (FAILED(SHGetPropertyStoreForWindow(h, IID_IPropertyStore, store.put_void()))) return;
 
     DWORD pid = 0;
-    GetWindowThreadProcessId(h, &pid);
+    GetWindowThreadProcessId(source, &pid);
     winrt::handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
     wchar_t exe[MAX_PATH]{};
     DWORD exeSize = static_cast<DWORD>(std::size(exe));
@@ -1077,7 +1078,7 @@ static void DestroySealedPreviewIconState(const SealedPreviewIconState& state) {
 // Apply a temporary, AccentColor-tinted Webdings web to the switcher icon.
 // The pre-preview icon handles are borrowed from the target window and are
 // restored before the generated preview icons are destroyed.
-static bool SetWindowSealedIcon(HWND h) {
+static bool SetWindowSealedIcon(HWND h, HWND source = nullptr) {
     if (!IsWindow(h)) return false;
     if (g_sealedPreviewIcons.contains(h)) return true;
 
@@ -1122,7 +1123,7 @@ static bool SetWindowSealedIcon(HWND h) {
     }
     state.smallApplied = true;
     auto it = g_sealedPreviewIcons.emplace(h, std::move(state)).first;
-    SetPreviewTaskbarIcon(h, it->second);
+    SetPreviewTaskbarIcon(h, it->second, source ? source : h);
     return true;
 }
 
@@ -1370,6 +1371,8 @@ std::wstring GetRealProcessName(HWND hwnd) {
 	return result;
 }
 
+static constexpr wchar_t ALT_TAB_PROXY_CLASS[] = L"LassoNativeAltTabProxy";
+
 static bool IsSwitcherWindow(HWND h) {
     wchar_t name[96]{};
     if (!GetClassNameW(h, name, static_cast<int>(std::size(name)))) return false;
@@ -1420,6 +1423,12 @@ static bool ReadCurrentDesktopGuidFromRegistry(
     return readRegistry(key, L"VirtualDesktopIDs", desktop);
 }
 
+static bool IsPinnedDesktopId(REFGUID id) {
+    constexpr GUID pinnedApp{0xbb64d5b7, 0x4de3, 0x4ab2, {0xa8, 0x7c, 0xdb, 0x76, 0x01, 0xae, 0xa7, 0xdc}};
+    constexpr GUID pinnedWindow{0xc2ddea68, 0x66f2, 0x4cf9, {0x82, 0x64, 0x1b, 0xfd, 0x00, 0xfb, 0xbb, 0xac}};
+    return IsEqualGUID(id, pinnedApp) || IsEqualGUID(id, pinnedWindow);
+}
+
 static bool GetCurrentDesktopGuidFromForeground(
     GUID& desktop,
     HWND anchor,
@@ -1429,17 +1438,48 @@ static bool GetCurrentDesktopGuidFromForeground(
     // Prefer a regular foreground window when Windows can confirm its desktop.
     const HWND foreground = anchor ? GetAncestor(anchor, GA_ROOT) : nullptr;
     wchar_t className[64]{};
-    constexpr GUID pinnedApp{0xbb64d5b7, 0x4de3, 0x4ab2, {0xa8, 0x7c, 0xdb, 0x76, 0x01, 0xae, 0xa7, 0xdc}};
-    constexpr GUID pinnedWindow{0xc2ddea68, 0x66f2, 0x4cf9, {0x82, 0x64, 0x1b, 0xfd, 0x00, 0xfb, 0xbb, 0xac}};
     GUID id{};
-    if (foreground && IsWindowVisible(foreground) && !IsSwitcherWindow(foreground) &&
+    if (foreground && !g_sealedWindowStates.contains(foreground) &&
+        IsWindowVisible(foreground) && !IsSwitcherWindow(foreground) &&
         GetClassNameW(foreground, className, static_cast<int>(std::size(className))) &&
-        wcscmp(className, L"Progman") != 0 && wcscmp(className, L"WorkerW") != 0 &&
+        wcscmp(className, ALT_TAB_PROXY_CLASS) != 0 && wcscmp(className, L"Progman") != 0 &&
+        wcscmp(className, L"WorkerW") != 0 &&
         wcscmp(className, L"Shell_TrayWnd") != 0 && wcscmp(className, L"Shell_SecondaryTrayWnd") != 0 &&
         readDesktop(foreground, id, true) &&
-        !IsEqualGUID(id, pinnedApp) && !IsEqualGUID(id, pinnedWindow)) {
+        !IsPinnedDesktopId(id)) {
         desktop = id;
         return true;
+    }
+
+    // When the shell owns foreground, ask other regular windows confirmed
+    // to be on the active desktop before consulting Explorer's registry.
+    if (readDesktop == GetWindowDesktopGuid) {
+        struct ActiveWindowDesktop { GUID id{}; } active;
+        EnumWindows([](HWND h, LPARAM data) -> BOOL {
+            wchar_t name[64]{};
+            if (!IsWindowVisible(h) || IsIconic(h) || g_sealedWindowStates.contains(h) ||
+                GetWindow(h, GW_OWNER) || IsSwitcherWindow(h) ||
+                (GetWindowLongPtrW(h, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) ||
+                !GetClassNameW(h, name, static_cast<int>(std::size(name))) ||
+                wcscmp(name, ALT_TAB_PROXY_CLASS) == 0 || wcscmp(name, L"Progman") == 0 ||
+                wcscmp(name, L"WorkerW") == 0 || wcscmp(name, L"Shell_TrayWnd") == 0 ||
+                wcscmp(name, L"Shell_SecondaryTrayWnd") == 0) return TRUE;
+            RECT rect{};
+            if (!GetWindowRect(h, &rect) || !MonitorFromRect(&rect, MONITOR_DEFAULTTONULL)) return TRUE;
+            DWORD cloak = 0;
+            if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloak, sizeof(cloak))) && cloak)
+                return TRUE;
+            auto& current = reinterpret_cast<ActiveWindowDesktop*>(data)->id;
+            GUID candidate{};
+            if (!GetWindowDesktopGuid(h, candidate, true) ||
+                IsPinnedDesktopId(candidate)) return TRUE;
+            current = candidate;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&active));
+        if (!IsEqualGUID(active.id, GUID{})) {
+            desktop = active.id;
+            return true;
+        }
     }
 
     // When every app window is sealed, the foreground may be the Shell.
@@ -1451,7 +1491,7 @@ static bool GetCurrentDesktopGuidFromForeground(
         if (!ReadTaggedDesktopGuid(window, tagged) || !IsIdentifiedProcess(ReadTaggedExe(window)))
             continue;
         if (readDesktop(window, id, true) && IsEqualGUID(id, tagged) &&
-            !IsEqualGUID(id, pinnedApp) && !IsEqualGUID(id, pinnedWindow)) {
+            !IsPinnedDesktopId(id)) {
             desktop = id;
             return true;
         }
@@ -1597,7 +1637,275 @@ BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 // 隐藏同类型窗口后，alt+tab临时查看下。
 // --- 全局变量与状态控制 ---
 static GUID g_altTabPreviewDesktop{};
-std::vector<HWND> g_snapUnhiddenWindows; // 存储 Alt+Tab 临时反隐藏的窗口句柄列表
+// The native switcher sees one Lasso-owned top-level window per sealed target.
+// The actual target keeps its original seal until a proxy is selected.
+static constexpr UINT WM_LASSO_PROXY_FRAME_READY = WM_APP + 21;
+static constexpr int PROXY_FRAME_WIDTH = 480;
+static constexpr int PROXY_FRAME_HEIGHT = 270;
+static std::atomic<unsigned> g_proxyCaptures{0};
+
+struct ProxyFrame {
+    std::mutex lock;
+    std::vector<DWORD> pixels;
+    int width = 0;
+    int height = 0;
+};
+
+struct AltTabProxy {
+    HWND window = nullptr;
+    HWND target = nullptr;
+    HICON sourceIcon = nullptr;
+    std::wstring title;
+    std::shared_ptr<ProxyFrame> frame = std::make_shared<ProxyFrame>();
+
+    ~AltTabProxy() {
+        if (window) {
+            RestoreWindowSealedIcon(window);
+            DestroyWindow(window);
+            DiscardWindowSealedIcon(window);
+        }
+        if (sourceIcon) DestroyIcon(sourceIcon);
+    }
+};
+
+static std::vector<std::unique_ptr<AltTabProxy>> g_altTabProxies;
+
+static BITMAPINFO ProxyBitmapInfo(int width, int height) {
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB, 0, 0, 0, 0, 0};
+    return info;
+}
+
+static void PaintAltTabProxy(HDC dc, int width, int height, const AltTabProxy& proxy) {
+    const RECT bounds{0, 0, width, height};
+    FillRect(dc, &bounds, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    bool captured = false;
+    {
+        const std::lock_guard guard(proxy.frame->lock);
+        const auto& frame = *proxy.frame;
+        if (!frame.pixels.empty()) {
+            const double scale = (std::min)(double(width) / frame.width, double(height) / frame.height);
+            const int w = (std::max)(1, static_cast<int>(frame.width * scale));
+            const int h = (std::max)(1, static_cast<int>(frame.height * scale));
+            const auto info = ProxyBitmapInfo(frame.width, frame.height);
+            SetStretchBltMode(dc, HALFTONE);
+            captured = StretchDIBits(dc, (width - w) / 2, (height - h) / 2, w, h, 0, 0,
+                frame.width, frame.height, frame.pixels.data(), &info, DIB_RGB_COLORS, SRCCOPY) > 0;
+        }
+    }
+
+    SetBkMode(dc, TRANSPARENT);
+    if (!captured) {
+        const int side = (std::max)(1, (std::min)(width, height) / 4);
+        if (proxy.sourceIcon)
+            DrawIconEx(dc, (width - side) / 2, height / 4, proxy.sourceIcon, side, side, 0, nullptr, DI_NORMAL);
+        SetTextColor(dc, RGB(255, 255, 255));
+        RECT title{width / 12, height / 2, width - width / 12, height * 5 / 6};
+        DrawTextW(dc, proxy.title.c_str(), -1, &title,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+
+    const int side = (std::max)(1, (std::min)(width, height) / 5);
+    const int margin = (std::max)(1, side / 6);
+    RECT badge{width - side - margin, margin, width - margin, margin + side};
+    FillRect(dc, &badge, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    HFONT font = CreateFontW(-side, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        SYMBOL_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Webdings");
+    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
+    if (previous && previous != HGDI_ERROR) {
+        SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, L"\"", 1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, previous);
+    }
+    if (font) DeleteObject(font);
+}
+
+static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT message,
+                                    int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    width = (std::min)(width, PROXY_FRAME_WIDTH);
+    height = (std::min)(height, PROXY_FRAME_HEIGHT);
+    // Keep the source aspect ratio within the shell's requested bounds.
+    const double scale = (std::min)(double(width) / PROXY_FRAME_WIDTH,
+        double(height) / PROXY_FRAME_HEIGHT);
+    width = (std::max)(1, static_cast<int>(PROXY_FRAME_WIDTH * scale));
+    height = (std::max)(1, static_cast<int>(PROXY_FRAME_HEIGHT * scale));
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return;
+    void* bits = nullptr;
+    const auto info = ProxyBitmapInfo(width, height);
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap && bits) {
+        const HGDIOBJ previous = SelectObject(dc, bitmap);
+        if (previous && previous != HGDI_ERROR) {
+            PaintAltTabProxy(dc, width, height, proxy);
+            GdiFlush();
+            auto* pixels = static_cast<DWORD*>(bits);
+            for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i)
+                pixels[i] |= 0xff000000;
+            SelectObject(dc, previous);
+            if (message == WM_DWMSENDICONICTHUMBNAIL)
+                DwmSetIconicThumbnail(h, bitmap, 0);
+            else
+                DwmSetIconicLivePreviewBitmap(h, bitmap, nullptr, 0);
+        }
+    }
+    if (bitmap) DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
+static LRESULT CALLBACK AltTabProxyWndProc(HWND h, UINT message, WPARAM wp, LPARAM lp) {
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lp);
+        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    }
+    const auto* proxy = reinterpret_cast<const AltTabProxy*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (proxy) {
+        switch (message) {
+        case WM_DWMSENDICONICTHUMBNAIL:
+            SupplyAltTabProxyBitmap(h, *proxy, message, HIWORD(lp), LOWORD(lp));
+            return 0;
+        case WM_DWMSENDICONICLIVEPREVIEWBITMAP:
+            SupplyAltTabProxyBitmap(h, *proxy, message, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT);
+            return 0;
+        case WM_LASSO_PROXY_FRAME_READY:
+            if (wp == reinterpret_cast<WPARAM>(proxy->frame.get())) {
+                DwmInvalidateIconicBitmaps(h);
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            const HDC dc = BeginPaint(h, &paint);
+            RECT rect{};
+            GetClientRect(h, &rect);
+            PaintAltTabProxy(dc, rect.right, rect.bottom, *proxy);
+            EndPaint(h, &paint);
+            return 0;
+        }
+        case WM_CLOSE:
+            return 0; // The preview session owns this HWND, including cleanup.
+        }
+    }
+    return DefWindowProcW(h, message, wp, lp);
+}
+
+struct ProxyCaptureRequest {
+    HWND proxy;
+    HWND target;
+    DWORD thread;
+    std::shared_ptr<ProxyFrame> frame;
+};
+
+// PrintWindow can block in an application. Capture off the switcher thread and
+// cap outstanding work so unavailable targets leave an immediately usable card.
+static void CALLBACK CaptureAltTabProxyFrame(PTP_CALLBACK_INSTANCE, void* data) noexcept {
+    std::unique_ptr<ProxyCaptureRequest> request(static_cast<ProxyCaptureRequest*>(data));
+    struct ReleaseSlot { ~ReleaseSlot() { --g_proxyCaptures; } } slot;
+    RECT rect{};
+    if (GetWindowThreadProcessId(request->target, nullptr) != request->thread ||
+        !GetWindowRect(request->target, &rect)) return;
+    const int width = rect.right - rect.left, height = rect.bottom - rect.top;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 ||
+        static_cast<size_t>(width) * height > 16'777'216) return;
+
+    const auto info = ProxyBitmapInfo(width, height);
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap && bits) {
+        const HGDIOBJ previous = SelectObject(dc, bitmap);
+        if (previous && previous != HGDI_ERROR) {
+            constexpr UINT renderFullContent = 2;
+            if (PrintWindow(request->target, dc, renderFullContent)) {
+                GdiFlush();
+                const auto* pixels = static_cast<const DWORD*>(bits);
+                const size_t count = static_cast<size_t>(width) * height;
+                if (std::any_of(pixels, pixels + count, [](DWORD p) { return (p & 0xffffff) != 0; })) {
+                    auto& frame = *request->frame;
+                    const double scale = (std::min)(1.0, (std::min)(
+                        double(PROXY_FRAME_WIDTH) / width, double(PROXY_FRAME_HEIGHT) / height));
+                    const int w = (std::max)(1, static_cast<int>(width * scale));
+                    const int h = (std::max)(1, static_cast<int>(height * scale));
+                    try {
+                        std::vector<DWORD> scaledPixels(static_cast<size_t>(w) * h);
+                        for (int y = 0; y < h; ++y)
+                            for (int x = 0; x < w; ++x)
+                                scaledPixels[static_cast<size_t>(y) * w + x] =
+                                    pixels[static_cast<size_t>(y * height / h) * width + x * width / w];
+                        const std::lock_guard guard(frame.lock);
+                        frame.pixels = std::move(scaledPixels);
+                        frame.width = w;
+                        frame.height = h;
+                    } catch (const std::bad_alloc&) {}
+                    PostMessageW(request->proxy, WM_LASSO_PROXY_FRAME_READY,
+                        reinterpret_cast<WPARAM>(&frame), 0);
+                }
+            }
+            SelectObject(dc, previous);
+        }
+    }
+    if (bitmap) DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
+static std::unique_ptr<AltTabProxy> CreateAltTabProxy(HWND target, bool capture) {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    wc.hInstance = instance;
+    wc.lpfnWndProc = AltTabProxyWndProc;
+    wc.lpszClassName = ALT_TAB_PROXY_CLASS;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return nullptr;
+
+    auto proxy = std::make_unique<AltTabProxy>();
+    proxy->target = target;
+    wchar_t title[512]{};
+    GetWindowTextW(target, title, static_cast<int>(std::size(title)));
+    proxy->title = *title ? title : ReadTaggedExe(target);
+    HICON icon = reinterpret_cast<HICON>(GetClassLongPtrW(target, GCLP_HICON));
+    proxy->sourceIcon = CopyIcon(icon ? icon : LoadIconW(nullptr, MAKEINTRESOURCEW(32512)));
+
+    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN) - PROXY_FRAME_WIDTH - 64;
+    const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const HWND h = CreateWindowExW(WS_EX_APPWINDOW, ALT_TAB_PROXY_CLASS, proxy->title.c_str(),
+        WS_OVERLAPPEDWINDOW, x, y, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, nullptr,
+        nullptr, instance, proxy.get());
+    if (!h) return nullptr;
+    proxy->window = h;
+    if (proxy->sourceIcon) {
+        SendMessageW(h, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(proxy->sourceIcon));
+        SendMessageW(h, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(proxy->sourceIcon));
+    }
+    const BOOL enabled = TRUE;
+    // WM_PAINT draws the same marked card if the shell uses a live snapshot.
+    DwmSetWindowAttribute(h, DWMWA_FORCE_ICONIC_REPRESENTATION, &enabled, sizeof(enabled));
+    DwmSetWindowAttribute(h, DWMWA_HAS_ICONIC_BITMAP, &enabled, sizeof(enabled));
+    SetWindowSealedIcon(h, target);
+    SetWindowPos(h, HWND_BOTTOM, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!IsWindowVisible(h)) return nullptr;
+
+    if (capture && g_proxyCaptures.fetch_add(1) < 4) {
+        auto* request = new (std::nothrow) ProxyCaptureRequest{h, target,
+            GetWindowThreadProcessId(target, nullptr), proxy->frame};
+        if (!request || !TrySubmitThreadpoolCallback(CaptureAltTabProxyFrame, request, nullptr)) {
+            delete request;
+            --g_proxyCaptures;
+        }
+    } else if (capture) {
+        --g_proxyCaptures;
+    }
+    return proxy;
+}
+
+static HWND FindAltTabProxyTarget(HWND window) {
+    for (const auto& proxy : g_altTabProxies)
+        if (proxy->window == window) return proxy->target;
+    return nullptr;
+}
+
 // ============================================================================
 // 1. 现代按键模拟辅助函数 (基于 SendInput)
 // ============================================================================
@@ -1639,81 +1947,80 @@ void SuppressWinKeyMenuModern() {
 // Alt+Tab 临时预览及同桌面进程组收网
 // ============================================================================
 
-bool TryUnHideWindowsForAltTab(ReadCurrentDesktop readCurrentDesktop = nullptr,
-                              HWND foreground = GetForegroundWindow()) {
-    RestoreAllPrimaryWindowTransparency();
-    // Repeated Tab advances the native switcher without rebuilding the preview.
-    if (g_InSnapWindows) return true;
+static bool BeginNativeAltTabProxies(ReadCurrentDesktop readCurrentDesktop, HWND foreground) {
+    if (g_InSnapWindows) return true; // Repeated Tab uses the same native cards.
     if (g_sealedWindowStates.empty()) return false;
     GUID currentDesktop{};
     const bool resolved = readCurrentDesktop ? readCurrentDesktop(currentDesktop)
         : GetCurrentDesktopGuidFromForeground(currentDesktop, foreground);
     if (!resolved || IsEqualGUID(currentDesktop, GUID{})) return false;
+
     g_altTabPreviewDesktop = currentDesktop;
     std::vector<HWND> candidates;
-    for (const auto& entry : g_sealedWindowStates) candidates.push_back(entry.first);
+    // EnumWindows supplies z-order. Keep relative order within the proxy block;
+    // Explorer still controls the overall order of native switcher entries.
+    EnumWindows([](HWND h, LPARAM data) -> BOOL {
+        if (g_sealedWindowStates.contains(h))
+            reinterpret_cast<std::vector<HWND>*>(data)->push_back(h);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&candidates));
 
-    // Show events generated by the preview must not immediately re-seal it.
-    g_InSnapWindows = true;
     for (HWND h : candidates) {
         if (!IsOriginalWindowEligibleForPreview(h) ||
             !TaggedDesktopMatches(h, currentDesktop) ||
             !IsIdentifiedProcess(ReadTaggedExe(h))) continue;
 
-        // A window moved by the user may still carry the previous GUID.
-        DWORD cloak = 0;
-        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
-            (cloak & DWM_CLOAKED_SHELL)) {
-            GUID actual{};
-            if (!GetWindowDesktopGuid(h, actual, true) || !IsEqualGUID(actual, currentDesktop))
-                continue;
-        }
-
-        if (ShowWindowAndShowTaskbarIcon(h, true)) g_snapUnhiddenWindows.push_back(h);
-        else HideWindowAndHideTaskbarIcon(h, true);
+        // The sealed target can still be shell-cloaked after a desktop switch.
+        // Use the saved desktop tag, and let the proxy belong to this desktop.
+        if (auto proxy = CreateAltTabProxy(h, !readCurrentDesktop))
+            g_altTabProxies.push_back(std::move(proxy));
     }
-    g_InSnapWindows = !g_snapUnhiddenWindows.empty();
-    if (!g_InSnapWindows) g_altTabPreviewDesktop = GUID{};
-    if (g_InSnapWindows) {
-        // Let the restored windows paint before the native switcher captures them.
-        for (HWND h : g_snapUnhiddenWindows)
-            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
-        DwmFlush();
-    }
+    g_InSnapWindows = !g_altTabProxies.empty();
+    if (g_InSnapWindows) DwmFlush();
+    else g_altTabPreviewDesktop = GUID{};
     return g_InSnapWindows;
+}
+
+static bool RestoreAltTabTarget(HWND h) {
+    auto it = g_sealedWindowStates.find(h);
+    if (it == g_sealedWindowStates.end() || !IsWindow(h)) return false;
+    // A real visibility transition gives the shell a fresh window entry
+    // after the cross-desktop seal removed its taskbar and switcher entries.
+    if (IsWindowVisible(h) && SetWindowPresented(h, false)) it->second.hiddenByLasso = true;
+    if (ShowWindowAndShowTaskbarIcon(h)) return true;
+    HideWindowAndHideTaskbarIcon(h, true);
+    return false;
 }
 
 static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDesktop) {
     if (!g_InSnapWindows) return;
 
-    std::wstring selectedProcess;
+    const HWND root = IsWindow(winner) ? GetAncestor(winner, GA_ROOT) : nullptr;
+    const HWND target = FindAltTabProxyTarget(root);
     GUID currentDesktop{};
-    if (IsWindow(winner) && readCurrentDesktop(currentDesktop) &&
-        IsEqualGUID(currentDesktop, g_altTabPreviewDesktop)) {
-        const HWND root = GetAncestor(winner, GA_ROOT);
-        const HWND owner = GetAncestor(winner, GA_ROOTOWNER);
-        HWND selected = root;
-        if (std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), selected) ==
-            g_snapUnhiddenWindows.end()) selected = owner;
-        if (std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), selected) !=
-            g_snapUnhiddenWindows.end()) {
-            if (TaggedDesktopMatches(selected, currentDesktop))
-                selectedProcess = ReadTaggedExe(selected);
-        } else if (root) {
-            // A visible window can be selected while its siblings are being previewed.
+    std::wstring selectedProcess;
+    // Confirm the desktop again before handing off the native selection.
+    const bool resolved = root && ((target && readCurrentDesktop == GetCurrentDesktopGuid &&
+        GetWindowDesktopGuid(root, currentDesktop, true)) || readCurrentDesktop(currentDesktop));
+    if (resolved && IsEqualGUID(currentDesktop, g_altTabPreviewDesktop)) {
+        if (target && TaggedDesktopMatches(target, currentDesktop))
+            selectedProcess = ReadTaggedExe(target);
+        else if (!target && !IsSwitcherWindow(root))
             selectedProcess = GetRealProcessName(root);
-        }
     }
 
-    const bool keepProcess = IsIdentifiedProcess(selectedProcess);
-    for (HWND h : g_snapUnhiddenWindows) {
-        if (!g_sealedWindowStates.contains(h)) continue;
-        if (keepProcess && TaggedDesktopMatches(h, currentDesktop) &&
-            _wcsicmp(ReadTaggedExe(h).c_str(), selectedProcess.c_str()) == 0 &&
-            ShowWindowAndShowTaskbarIcon(h)) continue;
-        HideWindowAndHideTaskbarIcon(h, true);
+    if (IsIdentifiedProcess(selectedProcess)) {
+        for (const auto& proxy : g_altTabProxies) {
+            const HWND h = proxy->target;
+            if (h != target && TaggedDesktopMatches(h, currentDesktop) &&
+                _wcsicmp(ReadTaggedExe(h).c_str(), selectedProcess.c_str()) == 0)
+                RestoreAltTabTarget(h);
+        }
+        // Transfer activation while the selected proxy still owns foreground.
+        if (target && RestoreAltTabTarget(target) && GetForegroundWindow() == root)
+            SetForegroundWindow(target);
     }
-    g_snapUnhiddenWindows.clear();
+    g_altTabProxies.clear();
     g_altTabPreviewDesktop = GUID{};
     g_InSnapWindows = false;
 }
@@ -1739,23 +2046,20 @@ static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
         FinishAltTabPreview(IsSwitcherWindow(foreground) ? nullptr : foreground,
             readCurrentDesktop ? readCurrentDesktop : GetCurrentDesktopGuid);
     }
-    return TryUnHideWindowsForAltTab(readCurrentDesktop, foreground);
+    return BeginNativeAltTabProxies(readCurrentDesktop, foreground);
 }
 
 // ============================================================================
 // 3. 核心钩子回调函数
 // ============================================================================
 
-// The coordinator owns window state and performs cross-process icon hit testing.
+// The coordinator owns window state and shell interactions.
 #define WM_LASSO_HIDE_CURRENT (WM_APP + 11)
 #define WM_LASSO_HIDE_OTHERS  (WM_APP + 12)
 #define WM_LASSO_ALT_TAB      (WM_APP + 13)
 #define WM_LASSO_ALT_UP       (WM_APP + 14)
 #define WM_LASSO_ESCAPE       (WM_APP + 16)
 #define WM_LASSO_TOGGLE_PRIMARY (WM_APP + 17)
-#define WM_LASSO_RESTORE_PRIMARY (WM_APP + 18)
-#define WM_LASSO_PRIMARY_LEFT_CLICK (WM_APP + 19)
-#define WM_LASSO_PRIMARY_RIGHT_CLICK (WM_APP + 20)
 
 LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
@@ -1765,8 +2069,6 @@ LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
     HWND coordinator = g_hLassoCoordinator;
     if (!coordinator) return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
-    if (down && !(key->flags & LLKHF_INJECTED))
-        PostMessageW(coordinator, WM_LASSO_RESTORE_PRIMARY, 0, 0);
 
     // Injected Tab is allowed through so the native Alt+Tab UI handles it.
     if (key->vkCode == VK_TAB && (key->flags & LLKHF_ALTDOWN) && down) {
@@ -1877,168 +2179,46 @@ static bool IsPointInShowDesktopEdge(HWND primaryTaskbar, POINT point) {
         point.x >= bounds.right - SHOW_DESKTOP_EDGE_WIDTH;
 }
 
-struct PrimaryWindowTransparencyState {
-    LONG_PTR exStyle = 0;
-    BYTE alpha = 255;
-    COLORREF colorKey = 0;
-    DWORD layerFlags = 0;
-    bool hasLayerAttributes = false;
-};
+static std::vector<HWND> g_hiddenPrimaryWindows;
+static ULONGLONG g_primaryHideCompletedAt = 0;
 
-static std::unordered_map<HWND, PrimaryWindowTransparencyState> g_transparentPrimaryWindows;
-
-struct DesktopIconClick {
-    UINT button = 0;
-    POINT point{};
-    DWORD time = 0;
-};
-
-static DesktopIconClick g_lastDesktopIconClick;
-
-static bool SetWindowExtendedStyle(HWND h, LONG_PTR style) {
-    SetLastError(ERROR_SUCCESS);
-    const LONG_PTR previous = SetWindowLongPtrW(h, GWL_EXSTYLE, style);
-    return previous != 0 || GetLastError() == ERROR_SUCCESS;
-}
-
-static bool ApplyPrimaryWindowTransparency(HWND h) {
-    if (!IsWindow(h)) return false;
-    if (g_transparentPrimaryWindows.contains(h)) return true;
-
-    PrimaryWindowTransparencyState original;
-    original.exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
-    if (original.exStyle & WS_EX_LAYERED) {
-        // Do not overwrite layered windows whose original attributes cannot
-        // be queried (for example, windows using UpdateLayeredWindow).
-        if (!GetLayeredWindowAttributes(h, &original.colorKey,
-                &original.alpha, &original.layerFlags)) return false;
-        original.hasLayerAttributes = true;
-    }
-
-    const LONG_PTR transparentStyle = original.exStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT;
-    if (!SetWindowExtendedStyle(h, transparentStyle)) return false;
-
-    if (!SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA)) {
-        if (!(original.exStyle & WS_EX_LAYERED))
-            SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
-        SetWindowExtendedStyle(h, original.exStyle);
-        SetWindowPos(h, nullptr, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-            SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
-        return false;
-    }
-
-    if (!SetWindowPos(h, nullptr, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-            SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS)) {
-        if (original.exStyle & WS_EX_LAYERED)
-            SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags);
-        else
-            SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
-        SetWindowExtendedStyle(h, original.exStyle);
-        return false;
-    }
-
-    // Preserve taskbar identity: never add/remove WS_EX_APPWINDOW or WS_EX_TOOLWINDOW.
-    g_transparentPrimaryWindows.emplace(h, original);
+static bool HidePrimaryWindow(HWND h) {
+    if (!IsWindow(h) || !IsWindowVisible(h)) return false;
+    if (!SetWindowPresented(h, false) || IsWindowVisible(h)) return false;
+    g_hiddenPrimaryWindows.push_back(h);
     return true;
 }
 
-static bool RestorePrimaryWindowTransparency(HWND h) {
-    const auto it = g_transparentPrimaryWindows.find(h);
-    if (it == g_transparentPrimaryWindows.end()) return true;
-    if (!IsWindow(h)) {
-        g_transparentPrimaryWindows.erase(it);
-        return true;
-    }
-
-    const auto original = it->second;
-    if (!(original.exStyle & WS_EX_LAYERED)) {
-        if (!SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA)) return false;
-        if (!SetWindowExtendedStyle(h, original.exStyle)) {
-            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-            return false;
-        }
-    } else {
-        if (!SetWindowExtendedStyle(h, original.exStyle)) return false;
-        if (original.hasLayerAttributes &&
-            !SetLayeredWindowAttributes(h, original.colorKey, original.alpha, original.layerFlags)) {
-            SetWindowExtendedStyle(h, original.exStyle | WS_EX_TRANSPARENT);
-            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-            return false;
-        }
-    }
-
-    SetWindowPos(h, nullptr, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-        SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
-    g_transparentPrimaryWindows.erase(it);
-    return true;
-}
-
-static void RestoreAllPrimaryWindowTransparency() {
-    g_lastDesktopIconClick = {};
-    for (auto it = g_transparentPrimaryWindows.begin();
-         it != g_transparentPrimaryWindows.end();) {
-        const HWND h = it->first;
-        ++it;
-        RestorePrimaryWindowTransparency(h);
+static void RestoreHiddenPrimaryWindows() {
+    g_primaryHideCompletedAt = 0;
+    std::vector<HWND> batch;
+    batch.swap(g_hiddenPrimaryWindows);
+    for (HWND h : batch) {
+        if (IsWindow(h) && !IsWindowVisible(h) &&
+            (!SetWindowPresented(h, true) || !IsWindowVisible(h)))
+            g_hiddenPrimaryWindows.push_back(h);
     }
 }
 
-static bool IsPrimaryDesktopIconAt(POINT point) {
-    if (MonitorFromPoint(point, MONITOR_DEFAULTTONULL) !=
-        MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY)) return false;
-
-    winrt::com_ptr<IAccessible> item;
-    VARIANT child{}, role{};
-    HWND list = nullptr;
-    const bool isItem = SUCCEEDED(AccessibleObjectFromPoint(point, item.put(), &child)) && item &&
-        SUCCEEDED(item->get_accRole(child, &role)) && role.vt == VT_I4 &&
-        role.lVal == ROLE_SYSTEM_LISTITEM &&
-        SUCCEEDED(WindowFromAccessibleObject(item.get(), &list));
-    VariantClear(&role);
-    VariantClear(&child);
-    if (!isItem || !list) return false;
-
-    wchar_t listClass[32]{}, parentClass[32]{}, rootClass[32]{};
-    return GetClassNameW(list, listClass, static_cast<int>(std::size(listClass))) &&
-        wcscmp(listClass, L"SysListView32") == 0 &&
-        GetClassNameW(GetParent(list), parentClass, static_cast<int>(std::size(parentClass))) &&
-        wcscmp(parentClass, L"SHELLDLL_DefView") == 0 &&
-        GetClassNameW(GetAncestor(list, GA_ROOT), rootClass, static_cast<int>(std::size(rootClass))) &&
-        (wcscmp(rootClass, L"Progman") == 0 || wcscmp(rootClass, L"WorkerW") == 0);
-}
-
-static RECT MouseGestureBounds(POINT point, int widthMetric, int heightMetric) {
-    const int width = GetSystemMetrics(widthMetric);
-    const int height = GetSystemMetrics(heightMetric);
-    const LONG left = point.x - width / 2;
-    const LONG top = point.y - height / 2;
-    return RECT{left, top, left + width, top + height};
-}
-
-static void HandlePrimaryDesktopClick(UINT button, POINT point, DWORD time,
-    HWND primaryTaskbar, bool (*isDesktopIconAt)(POINT) = IsPrimaryDesktopIconAt) {
-    if (g_transparentPrimaryWindows.empty()) return;
-    RECT taskbarBounds{};
-    if (IsPointInPrimaryTaskbar(primaryTaskbar, point, taskbarBounds)) {
-        RestoreAllPrimaryWindowTransparency();
-        return; // Explorer still receives the original taskbar click.
-    }
-    const RECT doubleClickBounds = MouseGestureBounds(g_lastDesktopIconClick.point,
-        SM_CXDOUBLECLK, SM_CYDOUBLECLK);
-    // A right-click is always an allowed desktop-icon operation. Only a
-    // left double-click opens the icon and therefore restores the windows.
-    const bool doubleClick = button == WM_LASSO_PRIMARY_LEFT_CLICK &&
-        g_lastDesktopIconClick.button == WM_LASSO_PRIMARY_LEFT_CLICK &&
-        time - g_lastDesktopIconClick.time <= GetDoubleClickTime() &&
-        PtInRect(&doubleClickBounds, point);
-    if (doubleClick || !isDesktopIconAt(point)) {
-        RestoreAllPrimaryWindowTransparency();
+static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
+                                         DWORD ownProcess = GetCurrentProcessId()) {
+    if (g_hiddenPrimaryWindows.empty() ||
+        (event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW))
         return;
-    }
-    g_lastDesktopIconClick = {button, point, time};
+    if (GetAncestor(h, GA_ROOT) != h || !IsValidAppWindow(h) || IsSwitcherWindow(h) ||
+        g_sealedWindowStates.contains(h)) return;
+    DWORD process = 0;
+    GetWindowThreadProcessId(h, &process);
+    if (!process || process == ownProcess ||
+        (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
+    // An automatic foreground change caused by hiding the active window
+    // is delivered asynchronously by WinEvent after the batch ends.
+    if (g_primaryHideCompletedAt && GetTickCount64() - g_primaryHideCompletedAt < 1500 &&
+        static_cast<LONG>(time - static_cast<DWORD>(g_primaryHideCompletedAt)) <= 0)
+        return;
+    if (event == EVENT_SYSTEM_FOREGROUND && GetForegroundWindow() != h) return;
+    if (event != EVENT_OBJECT_CREATE && !IsWindowVisible(h)) return;
+    RestoreHiddenPrimaryWindows();
 }
 
 // Keep the original candidate filters: current desktop, visible, not minimized,
@@ -2051,7 +2231,8 @@ struct ToggleContext {
 BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
     auto* pCtx = reinterpret_cast<ToggleContext*>(lParam);
     if (!pCtx || !pCtx->pVector || !IsValidAppWindow(hWnd)) return TRUE;
-    if (!IsWindowOnCurrentVirtualDesktop(hWnd)) return TRUE;
+    if (IsSwitcherWindow(hWnd) || FindAltTabProxyTarget(hWnd) ||
+        !IsWindowOnCurrentVirtualDesktop(hWnd)) return TRUE;
     if (IsIconic(hWnd) || !IsWindowVisible(hWnd)) return TRUE;
     if (GetPropW(hWnd, L"MTU_EXE_TAG") != nullptr) return TRUE;
     if (GetWindow(hWnd, GW_OWNER) != nullptr) return TRUE;
@@ -2067,76 +2248,42 @@ BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
 }
 
 static void TogglePrimaryWindows() {
-    if (!g_transparentPrimaryWindows.empty()) {
-        RestoreAllPrimaryWindowTransparency();
+    if (g_InSnapWindows) ExecuteCollectRestore();
+    if (!g_hiddenPrimaryWindows.empty()) {
+        RestoreHiddenPrimaryWindows();
         return;
     }
 
-    POINT origin{0, 0};
-    const HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+    const HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     std::vector<HWND> candidates;
     ToggleContext context{&candidates, primary};
     EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
-    for (HWND h : candidates)
-        ApplyPrimaryWindowTransparency(h);
-
-    // Explorer otherwise treats a click on the still-active transparent
-    // window's button as a minimize command.
-    if (g_transparentPrimaryWindows.contains(GetAncestor(GetForegroundWindow(), GA_ROOT)))
-        SetForegroundWindow(GetShellWindow());
+    // Hide back-to-front so the foreground is the last window to disappear.
+    // Store the original enumeration order for ordered, non-activating restore.
+    for (auto it = candidates.rbegin(); it != candidates.rend(); ++it)
+        HidePrimaryWindow(*it);
+    std::reverse(g_hiddenPrimaryWindows.begin(), g_hiddenPrimaryWindows.end());
+    g_primaryHideCompletedAt = GetTickCount64();
 }
 
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    // Only the hook thread reads the drag state. Ordinary movement posts nothing.
-    static WPARAM pressedButton = 0;
-    static RECT dragBounds{};
     if (nCode == HC_ACTION && wParam == WM_LBUTTONUP && g_showDesktopClickCaptured) {
         g_showDesktopClickCaptured = false;
         return 1;
     }
-
-    if (nCode == HC_ACTION && g_hLassoCoordinator) {
-        const HWND coordinator = g_hLassoCoordinator;
+    if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN && g_hLassoCoordinator) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        switch (wParam) {
-        case WM_LBUTTONDOWN: {
-            const HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-            if (IsPointInShowDesktopEdge(primaryTaskbar, mouse->pt) &&
-                PostMessageW(coordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0)) {
-                g_showDesktopClickCaptured = true;
-                pressedButton = 0;
-                return 1;
-            }
-            [[fallthrough]];
-        }
-        case WM_RBUTTONDOWN:
-            pressedButton = wParam;
-            dragBounds = MouseGestureBounds(mouse->pt, SM_CXDRAG, SM_CYDRAG);
-            PostMessageW(coordinator, wParam == WM_LBUTTONDOWN ? WM_LASSO_PRIMARY_LEFT_CLICK :
-                WM_LASSO_PRIMARY_RIGHT_CLICK, mouse->pt.x, mouse->pt.y);
-            break;
-        case WM_LBUTTONUP:
-        case WM_RBUTTONUP:
-            if ((pressedButton == WM_LBUTTONDOWN && wParam == WM_LBUTTONUP) ||
-                (pressedButton == WM_RBUTTONDOWN && wParam == WM_RBUTTONUP)) pressedButton = 0;
-            break;
-        case WM_MOUSEMOVE:
-            if (!pressedButton || PtInRect(&dragBounds, mouse->pt)) break;
-            [[fallthrough]];
-        case WM_MOUSEWHEEL:
-        case WM_MOUSEHWHEEL:
-        case WM_MBUTTONDOWN:
-        case WM_XBUTTONDOWN:
-            pressedButton = 0;
-            PostMessageW(coordinator, WM_LASSO_RESTORE_PRIMARY, 0, 0);
-            break;
+        const HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (IsPointInShowDesktopEdge(primaryTaskbar, mouse->pt) &&
+            PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0)) {
+            g_showDesktopClickCaptured = true;
+            return 1;
         }
     }
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
 
 // 辅助调试函数
-#include <mutex>
 #include <chrono>
 #include <iomanip>
 
@@ -2256,8 +2403,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
             v.erase(std::remove(v.begin(), v.end(), hwnd), v.end());
         };
         forget(g_HiddenWindowsCache);
-        forget(g_snapUnhiddenWindows);
-        g_transparentPrimaryWindows.erase(hwnd);
+        std::erase_if(g_altTabProxies, [hwnd](const auto& proxy) { return proxy->target == hwnd; });
+        if (g_InSnapWindows && g_altTabProxies.empty()) ExecuteCollectRestore();
+        forget(g_hiddenPrimaryWindows);
         return;
     }
 
@@ -2280,6 +2428,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
                 g_restoredWindowShows.erase(show);
         }
     }
+
+    if (idC == CHILDID_SELF && !restoredByLasso)
+        RestorePrimaryWindowsOnEvent(event, hwnd, dwM);
 
     // A new window can wake its local app group. A show event generated by
     // Alt+Tab must not unseal the other windows in that same group.
@@ -2409,7 +2560,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 // taskbar and hide/restore work. Hook callbacks live on the main message thread.
 static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDesktop = GetWindowDesktopGuid,
                                    bool (*isOnCurrentDesktop)(HWND) = IsWindowOnCurrentVirtualDesktop) {
-    RestoreAllPrimaryWindowTransparency();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !isOnCurrentDesktop(root)) return;
@@ -2431,7 +2581,6 @@ static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDeskto
 }
 
 static void HideOtherApplications(HWND foreground) {
-    RestoreAllPrimaryWindowTransparency();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;
@@ -2481,14 +2630,6 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     case WM_LASSO_TOGGLE_PRIMARY:
         TogglePrimaryWindows();
         return 0;
-    case WM_LASSO_RESTORE_PRIMARY:
-        RestoreAllPrimaryWindowTransparency();
-        return 0;
-    case WM_LASSO_PRIMARY_LEFT_CLICK:
-    case WM_LASSO_PRIMARY_RIGHT_CLICK:
-        HandlePrimaryDesktopClick(msg, POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)},
-            static_cast<DWORD>(GetMessageTime()), FindWindowW(L"Shell_TrayWnd", nullptr));
-        return 0;
     case WM_TIMER:
         if (wp == TIMER_ID_COLLECT) {
             OnCollectTimer(hwnd, wp);
@@ -2496,6 +2637,8 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         }
         break;
     case WM_CLOSE:
+        ExecuteCollectRestore();
+        RestoreHiddenPrimaryWindows();
         RestoreAllSealedWindows();
         DestroyWindow(hwnd);
         return 0;
@@ -2531,7 +2674,7 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     RegisterAppShortcut();
     g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    g_hObjHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
+    g_hObjHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     SetEvent(ready);
@@ -2542,6 +2685,8 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     }
     if (g_hSysHook) UnhookWinEvent(g_hSysHook);
     if (g_hObjHook) UnhookWinEvent(g_hObjHook);
+    ExecuteCollectRestore();
+    RestoreHiddenPrimaryWindows();
     RestoreAllSealedWindows();
     g_hLassoCoordinator = nullptr;
     winrt::uninit_apartment();
