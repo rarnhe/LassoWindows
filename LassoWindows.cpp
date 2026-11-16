@@ -34,9 +34,16 @@ using namespace winrt;
 using namespace Windows::UI::Notifications;
 using namespace Windows::Data::Xml::Dom;
 
+static void ReportBackgroundError(const wchar_t* operation, DWORD code) noexcept {
+    wchar_t message[256]{};
+    swprintf_s(message, L"[LassoWindows] %s (0x%08lX)\n", operation, code);
+    OutputDebugStringW(message);
+}
+
 static std::wstring cachedAppId = []() {
-	wchar_t path[MAX_PATH];
-	GetModuleFileNameW(NULL, path, MAX_PATH);
+	wchar_t path[MAX_PATH]{};
+	const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+	if (!length || length >= MAX_PATH) return std::wstring(L"LassoWindows");
 	return std::filesystem::path(path).stem().wstring();
 	}();
 
@@ -200,8 +207,10 @@ static bool GetIconResourceFromIni(std::wstring& outIconPath, int& outIconIndex)
 }
 
 static HRESULT RegisterAppShortcut() {
-	wchar_t exePath[MAX_PATH];
-	GetModuleFileNameW(NULL, exePath, MAX_PATH);
+	wchar_t exePath[MAX_PATH]{};
+	const DWORD length = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+	if (!length) return HRESULT_FROM_WIN32(GetLastError());
+	if (length >= MAX_PATH) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
 
 	// 1. 构造桌面 ini 路径
 	//std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
@@ -405,11 +414,13 @@ static void SetWindowSnapshotWithOverlay(HWND hwnd, HICON hCurrentIcon) {
 	int winW = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
 	int winH = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
 	if (winW <= 0 || winH <= 0) return;
-	int side = (std::max)(winW, winH);
+	const int windowSide = (std::max)(winW, winH);
+	const int side = (std::min)(windowSide, 128);
+	winW = (std::max)(1, MulDiv(winW, side, windowSide));
+	winH = (std::max)(1, MulDiv(winH, side, windowSide));
 	int offsetX = (side - winW) / 2;
 	int offsetY = (side - winH) / 2;
-	const int TargetIconSize = 128;
-	int penWidth = (side > TargetIconSize) ? (int)ceil((float)side / (float)TargetIconSize) : 1;
+	constexpr int penWidth = 1;
 	HDC hdcScreen = GetDC(NULL);
 	if (!hdcScreen) return;
 	HDC hdcMem = CreateCompatibleDC(hdcScreen);
@@ -522,7 +533,8 @@ static HRESULT SetWindowAppIdWithBackup(HWND hwnd, PCWSTR newAppId) {
 	}
 	if (SUCCEEDED(hr)) {
 		// --- 强制刷新 ---
-		SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+		SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
 		// 此时 SetWindowSnapshotWithOverlay 会生成带白边的缩影，并覆盖掉上面的 hBackupIcon
 		SetWindowSnapshotWithOverlay(hwnd, hBackupIcon);
 	}
@@ -535,22 +547,21 @@ static HRESULT SetWindowAppIdWithBackup(HWND hwnd, PCWSTR newAppId) {
 ///**
 // * 彻底注销显式 ID 并使窗口“归队”
 // */
-static void RestoreWindowAppId(HWND hwnd) {
+static bool RestoreWindowAppId(HWND hwnd) {
 	HANDLE hData = GetPropW(hwnd, PROP_ORIGINAL_APPID);
-	if (!hData) return;
-	// --- 1. 显式清除 Overlay (防止归队后把 Overlay 带回原组) ---
-	ITaskbarList3* pTaskbarList = GetTaskbarList(); // 使用之前定义的单例获取函数
-	if (pTaskbarList) {
-		//pTaskbarList->SetOverlayIcon(hwnd, static_cast<HICON>(NULL), NULL);
-		pTaskbarList->DeleteTab(hwnd); // A: 彻底离队
-	}
-	// --- 2. 清理快照图标资源 ---
-	HANDLE hSnapshotIcon = RemovePropW(hwnd, L"MTU_SNAPSHOT_ICON");
+	if (!hData) return true;
+	// Keep the icon and taskbar entry intact if the other application is busy.
+	HANDLE hSnapshotIcon = GetPropW(hwnd, L"MTU_SNAPSHOT_ICON");
 	if (hSnapshotIcon) {
-		SendMessageW(hwnd, WM_SETICON, ICON_BIG, NULL);
-		SendMessageW(hwnd, WM_SETICON, ICON_SMALL, NULL);
+		constexpr UINT timeout = 100;
+		constexpr UINT flags = SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT;
+		if (!SendMessageTimeoutW(hwnd, WM_SETICON, ICON_BIG, 0, flags, timeout, nullptr) ||
+		    !SendMessageTimeoutW(hwnd, WM_SETICON, ICON_SMALL, 0, flags, timeout, nullptr)) return false;
+		RemovePropW(hwnd, L"MTU_SNAPSHOT_ICON");
 		DestroyIcon((HICON)hSnapshotIcon);
 	}
+	ITaskbarList3* pTaskbarList = GetTaskbarList();
+	if (pTaskbarList) pTaskbarList->DeleteTab(hwnd);
 	// --- 3. 彻底重置 AppID 属性 ---
 	IPropertyStore* pps = NULL;
 	if (SUCCEEDED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&pps)))) {
@@ -580,7 +591,9 @@ static void RestoreWindowAppId(HWND hwnd) {
 		pTaskbarList->AddTab(hwnd);
 	}
 	// 触发重绘
-	SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+	SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+	return true;
 }
 
 
@@ -805,14 +818,15 @@ static std::unordered_map<HWND, SealedPreviewIconState> g_sealedPreviewIcons;
 static HICON QueryWindowIconForPreview(HWND h, WPARAM iconType) {
     DWORD_PTR result = 0;
     if (!SendMessageTimeoutW(h, WM_GETICON, iconType, 0,
-            SMTO_ABORTIFHUNG, 250, &result)) return nullptr;
+            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT, 100, &result)) return nullptr;
     return reinterpret_cast<HICON>(result);
 }
 
 static bool SendWindowIconForPreview(HWND h, WPARAM iconType, HICON icon) {
     DWORD_PTR result = 0;
     return SendMessageTimeoutW(h, WM_SETICON, iconType,
-        reinterpret_cast<LPARAM>(icon), SMTO_ABORTIFHUNG, 1000, &result) != 0;
+        reinterpret_cast<LPARAM>(icon), SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+        100, &result) != 0;
 }
 
 // DWM AccentColor is stored as AABBGGRR. Convert it to COLORREF.
@@ -1310,7 +1324,7 @@ static void RefreshWindowCache() {
 // 用于在 Hook 线程和 Coordinator 线程之间传递字符串
 wchar_t g_SharedProcName[MAX_PATH] = { 0 };
 // --- 声明协调器句柄 ---
-HWND g_hLassoCoordinator = NULL;
+static std::atomic<HWND> g_hLassoCoordinator{nullptr};
 
 // 辅助结构体，用于在子窗口中搜寻 PID
 struct UWP_SPY_INFO {
@@ -1650,6 +1664,7 @@ static GUID g_altTabPreviewDesktop{};
 // The native switcher sees one Lasso-owned top-level window per sealed target.
 // The actual target keeps its original seal until a proxy is selected.
 static constexpr UINT WM_LASSO_PROXY_FRAME_READY = WM_APP + 21;
+static constexpr UINT WM_LASSO_REGISTER_SHORTCUT = WM_APP + 22;
 static constexpr int PROXY_FRAME_WIDTH = 480;
 static constexpr int PROXY_FRAME_HEIGHT = 270;
 static std::atomic<unsigned> g_proxyCaptures{0};
@@ -1686,7 +1701,7 @@ static BITMAPINFO ProxyBitmapInfo(int width, int height) {
     return info;
 }
 
-// Fit the Webdings ink to the image width. Clip the centered glyph to the image.
+// Fit the Webdings ink to the image height. Clip horizontally on narrow images.
 static void DrawPreviewWeb(HDC destination, const RECT& bounds) {
     const int width = bounds.right - bounds.left;
     const int height = bounds.bottom - bounds.top;
@@ -1727,14 +1742,14 @@ static void DrawPreviewWeb(HDC destination, const RECT& bounds) {
                 }
             }
             if (ink.right > ink.left && ink.bottom > ink.top) {
-                const int webHeight = (std::max)(1, MulDiv(width,
-                    ink.bottom - ink.top, ink.right - ink.left));
-                const int top = bounds.top + (height - webHeight) / 2;
+                const int webWidth = (std::max)(1, MulDiv(height,
+                    ink.right - ink.left, ink.bottom - ink.top));
+                const int left = bounds.left + (width - webWidth) / 2;
                 if (const int saved = SaveDC(destination)) {
                     if (IntersectClipRect(destination, bounds.left, bounds.top,
                             bounds.right, bounds.bottom) != ERROR) {
                         const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-                        AlphaBlend(destination, bounds.left, top, width, webHeight,
+                        AlphaBlend(destination, left, bounds.top, webWidth, height,
                             dc, ink.left, ink.top, ink.right - ink.left, ink.bottom - ink.top, blend);
                     }
                     RestoreDC(destination, saved);
@@ -2048,8 +2063,7 @@ static bool BeginNativeAltTabProxies(ReadCurrentDesktop readCurrentDesktop, HWND
             g_altTabProxies.push_back(std::move(proxy));
     }
     g_InSnapWindows = !g_altTabProxies.empty();
-    if (g_InSnapWindows) DwmFlush();
-    else g_altTabPreviewDesktop = GUID{};
+    if (!g_InSnapWindows) g_altTabPreviewDesktop = GUID{};
     return g_InSnapWindows;
 }
 
@@ -2065,7 +2079,11 @@ static bool RestoreAltTabTarget(HWND h) {
 }
 
 static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDesktop) {
-    if (!g_InSnapWindows) return;
+    if (g_altTabProxies.empty()) {
+        g_altTabPreviewDesktop = GUID{};
+        g_InSnapWindows = false;
+        return;
+    }
 
     const HWND root = IsWindow(winner) ? GetAncestor(winner, GA_ROOT) : nullptr;
     const HWND target = FindAltTabProxyTarget(root);
@@ -2329,16 +2347,19 @@ static void CALLBACK ProbeShowDesktop(PTP_CALLBACK_INSTANCE, void* data) noexcep
         static_cast<std::shared_ptr<ShowDesktopProbe>*>(data));
     auto& probe = **ref;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        const auto previousDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         probe.found = FindXamlShowDesktopBounds(probe.taskbar, probe.point, probe.bounds);
+        if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
         CoUninitialize();
     }
     probe.finishedAt = GetTickCount64();
     SetEvent(probe.done.get());
 }
 
-static bool FindShowDesktopClickBounds(HWND taskbar, POINT point, bool click, RECT& bounds) {
+static bool FindShowDesktopClickBounds(HWND taskbar, POINT point, RECT& bounds) {
     if (!taskbar || !IsWindowVisible(taskbar)) return false;
+    RECT taskbarBounds{};
+    if (!GetWindowRect(taskbar, &taskbarBounds) || !PtInRect(&taskbarBounds, point)) return false;
     const HWND hit = WindowFromPoint(point);
     if (!hit || GetAncestor(hit, GA_ROOT) != taskbar) return false;
     if (FindNativeShowDesktopBounds(taskbar, hit, point, bounds)) return true;
@@ -2354,18 +2375,20 @@ static bool FindShowDesktopClickBounds(HWND taskbar, POINT point, bool click, RE
     };
     if (matches()) return true;
     if (!probe || ready()) {
-        if (!click && probe && probe->taskbar == taskbar &&
+        if (probe && probe->taskbar == taskbar &&
             GetTickCount64() - probe->finishedAt < 60) return false;
-        auto next = std::make_shared<ShowDesktopProbe>(ShowDesktopProbe{taskbar, point});
-        if (!next->done) return false;
-        auto ref = std::make_unique<std::shared_ptr<ShowDesktopProbe>>(next);
-        if (!TrySubmitThreadpoolCallback(ProbeShowDesktop, ref.get(), nullptr)) return false;
-        ref.release();
-        probe = std::move(next);
+        try {
+            auto next = std::make_shared<ShowDesktopProbe>(ShowDesktopProbe{taskbar, point});
+            if (!next->done) return false;
+            auto* ref = new std::shared_ptr<ShowDesktopProbe>(next);
+            if (TrySubmitThreadpoolCallback(ProbeShowDesktop, ref, nullptr)) probe = std::move(next);
+            else delete ref;
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
     }
-    // Hover normally supplies a fresh hit result. A click before the probe
-    // completes can wait briefly, then falls through to the native action.
-    return click && WaitForSingleObject(probe->done.get(), 75) == WAIT_OBJECT_0 && matches();
+    // A cold click passes through to Explorer while the worker resolves the control.
+    return false;
 }
 
 static RECT g_showDesktopPressedBounds{};
@@ -2505,7 +2528,8 @@ static void TogglePrimaryWindows() {
 }
 
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode != HC_ACTION || !g_hLassoCoordinator)
+    const HWND coordinator = g_hLassoCoordinator.load();
+    if (nCode != HC_ACTION || !coordinator)
         return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 
     const POINT point = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam)->pt;
@@ -2514,7 +2538,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         g_showDesktopPressedTaskbar = nullptr;
         if (GetAncestor(WindowFromPoint(point), GA_ROOT) == taskbar &&
             PtInRect(&g_showDesktopPressedBounds, point))
-            PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
+            PostMessageW(coordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
         return 1;
     }
 
@@ -2522,7 +2546,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
         const bool click = wParam == WM_LBUTTONDOWN;
         RECT bounds{};
-        if (FindShowDesktopClickBounds(taskbar, point, click, bounds) && click) {
+        if (FindShowDesktopClickBounds(taskbar, point, bounds) && click) {
             g_showDesktopPressedTaskbar = taskbar;
             g_showDesktopPressedBounds = bounds;
             return 1;
@@ -2637,7 +2661,7 @@ std::mutex g_fileMutex;
 
 static HWND g_taskViewWindow = nullptr;
 
-static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
+static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) try {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
     if (event == EVENT_OBJECT_DESTROY && idC == CHILDID_SELF) {
@@ -2685,7 +2709,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
     // Alt+Tab must not unseal the other windows in that same group.
     if (!restoredByLasso && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE) &&
         idC == CHILDID_SELF && !g_InSnapWindows &&
-        !IsSwitcherWindow(hwnd) &&
+        !g_sealedWindowStates.empty() && !IsSwitcherWindow(hwnd) &&
         IsWindowOnCurrentVirtualDesktop(hwnd)) {
 
         // A show/create event for an already tagged window must not trigger
@@ -2699,8 +2723,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
                 if (_wcsicmp(process.c_str(), L"explorer.exe") == 0 &&
                     className != L"CabinetWClass") process.clear();
                 if (!process.empty() && process != L"Unknown" &&
-                    _wcsicmp(process.c_str(), L"ApplicationFrameHost.exe") != 0 &&
-                    !g_sealedWindowStates.empty()) {
+                    _wcsicmp(process.c_str(), L"ApplicationFrameHost.exe") != 0) {
                     RefreshWindowCache();
                     g_HiddenWindowsCache.erase(
                         std::remove_if(g_HiddenWindowsCache.begin(),
@@ -2768,7 +2791,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 		}
 		//显式向 Shell 申请抹掉小图标：
 		if (event == EVENT_SYSTEM_MINIMIZEEND) {
-			RestoreWindowAppId(hwnd);
+			if (!RestoreWindowAppId(hwnd)) return;
 
 			ITaskbarList3* pTL = nullptr;
 			if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pTL)))) {
@@ -2782,7 +2805,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 				pTL->Release();
 			}
 
-			SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+			SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
 			return;
 		}
 	}
@@ -2803,6 +2826,8 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
     } else if (event == EVENT_SYSTEM_FOREGROUND) {
         g_taskViewWindow = nullptr;
     }
+} catch (...) {
+    ReportBackgroundError(L"WinEvent callback", static_cast<DWORD>(winrt::to_hresult()));
 }
 
 // A message-only window on a separate worker thread serializes COM, WinEvent,
@@ -2848,7 +2873,7 @@ static void HideOtherApplications(HWND foreground) {
         EnumWindows(EnumHideOthersProc, reinterpret_cast<LPARAM>(&filter));
 }
 
-static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) try {
     switch (msg) {
     case WM_LASSO_HIDE_CURRENT:
         HideCurrentApplication(reinterpret_cast<HWND>(wp));
@@ -2862,7 +2887,12 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         // HWND captured by the low-level hook can be stale after a desktop switch.
         const HWND foregroundNow = GetForegroundWindow();
         const HWND previewAnchor = IsWindow(foregroundNow) ? foregroundNow : foregroundAtKeyDown;
-        BeginAltTabPreview(hwnd, previewAnchor);
+        try {
+            BeginAltTabPreview(hwnd, previewAnchor);
+        } catch (...) {
+            ReportBackgroundError(L"Build Alt+Tab preview", static_cast<DWORD>(winrt::to_hresult()));
+            ExecuteCollectRestore();
+        }
         INPUT input[6]{};
         const bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2881,6 +2911,12 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     case WM_LASSO_TOGGLE_PRIMARY:
         TogglePrimaryWindows();
         return 0;
+    case WM_LASSO_REGISTER_SHORTCUT: {
+        const HRESULT shortcut = RegisterAppShortcut();
+        if (FAILED(shortcut))
+            ReportBackgroundError(L"Register Start menu shortcut", static_cast<DWORD>(shortcut));
+        return 0;
+    }
     case WM_TIMER:
         if (wp == TIMER_ID_COLLECT) {
             OnCollectTimer(hwnd, wp);
@@ -2888,9 +2924,6 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         }
         break;
     case WM_CLOSE:
-        ExecuteCollectRestore();
-        RestoreHiddenPrimaryWindows();
-        RestoreAllSealedWindows();
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -2898,100 +2931,160 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+} catch (...) {
+    ReportBackgroundError(L"Coordinator message", static_cast<DWORD>(winrt::to_hresult()));
+    return 0;
 }
 
-static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
-    HANDLE ready = static_cast<HANDLE>(readyPtr);
+// A negative result is a Win32 error, not WM_QUIT.
+static int RunCoordinatorMessages() {
+    MSG msg{};
+    BOOL result = 0;
+    while ((result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (result < 0) {
+        ReportBackgroundError(L"Coordinator GetMessage", GetLastError());
+        return 1;
+    }
+    return static_cast<int>(msg.wParam);
+}
+
+static DWORD RunCoordinator(HANDLE ready, bool registerShortcut) {
     try { winrt::init_apartment(winrt::apartment_type::single_threaded); }
-    catch (...) { SetEvent(ready); return 1; }
+    catch (...) {
+        ReportBackgroundError(L"Initialize coordinator COM", static_cast<DWORD>(winrt::to_hresult()));
+        return 1;
+    }
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = CoordinatorWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"LassoWindowsCoordinator";
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        SetEvent(ready);
+        ReportBackgroundError(L"Register coordinator window", GetLastError());
         winrt::uninit_apartment();
         return 1;
     }
-    g_hLassoCoordinator = CreateWindowExW(0, wc.lpszClassName, L"",
+    const HWND coordinator = CreateWindowExW(0, wc.lpszClassName, L"",
         0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    if (!g_hLassoCoordinator) {
-        SetEvent(ready);
+    if (!coordinator) {
+        ReportBackgroundError(L"Create coordinator window", GetLastError());
         winrt::uninit_apartment();
         return 1;
     }
     UpdateSystemDpiScalingStatus();
-    RegisterAppShortcut();
     g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_hSysHook) ReportBackgroundError(L"Install system window event hook", GetLastError());
     g_hObjHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_hObjHook) ReportBackgroundError(L"Install object window event hook", GetLastError());
 
+    g_hLassoCoordinator = coordinator;
+    if (registerShortcut) PostMessageW(coordinator, WM_LASSO_REGISTER_SHORTCUT, 0, 0);
     SetEvent(ready);
-    MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+
+    const int result = RunCoordinatorMessages();
+    g_hLassoCoordinator = nullptr;
     if (g_hSysHook) UnhookWinEvent(g_hSysHook);
     if (g_hObjHook) UnhookWinEvent(g_hObjHook);
-    ExecuteCollectRestore();
-    RestoreHiddenPrimaryWindows();
-    RestoreAllSealedWindows();
-    g_hLassoCoordinator = nullptr;
+    if (IsWindow(coordinator)) DestroyWindow(coordinator);
+    try {
+        ExecuteCollectRestore();
+        RestoreHiddenPrimaryWindows();
+        RestoreAllSealedWindows();
+    } catch (...) {
+        ReportBackgroundError(L"Restore windows on shutdown", static_cast<DWORD>(winrt::to_hresult()));
+    }
     winrt::uninit_apartment();
-    return 0;
+    return static_cast<DWORD>(result);
+}
+
+static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
+    // The worker owns its copy even if startup times out on the main thread.
+    winrt::handle ready(static_cast<HANDLE>(readyPtr));
+    return RunCoordinator(ready.get(), true);
 }
 
 int WINAPI WinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Global\\MyWindowManagerUniqueMutex_12345");
-    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (mutex) CloseHandle(mutex);
-        return 0;
+    winrt::handle mutex(CreateMutexW(nullptr, TRUE, L"Global\\MyWindowManagerUniqueMutex_12345"));
+    const DWORD mutexStatus = GetLastError();
+    if (!mutex) {
+        ReportBackgroundError(L"Create single-instance mutex", mutexStatus);
+        return 1;
     }
-    // Initialize DPI before any UI-dependent work.
+    if (mutexStatus == ERROR_ALREADY_EXISTS) return 0;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE worker = ready ? CreateThread(nullptr, 0, CoordinatorThreadProc, ready, 0, nullptr) : nullptr;
-    if (!worker || WaitForSingleObject(ready, 15000) != WAIT_OBJECT_0 || !g_hLassoCoordinator) {
-        if (worker) {
-            WaitForSingleObject(worker, INFINITE);
-            CloseHandle(worker);
-        }
-        if (ready) CloseHandle(ready);
-        ReleaseMutex(mutex);
-        CloseHandle(mutex);
+    winrt::handle ready(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    HANDLE workerReady = nullptr;
+    const HANDLE currentProcess = GetCurrentProcess();
+    if (!ready || !DuplicateHandle(currentProcess, ready.get(), currentProcess,
+            &workerReady, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        ReportBackgroundError(L"Create coordinator startup event", GetLastError());
         return 1;
     }
-    CloseHandle(ready);
+
+    winrt::handle worker(CreateThread(nullptr, 0, CoordinatorThreadProc, workerReady, 0, nullptr));
+    if (!worker) {
+        ReportBackgroundError(L"Create coordinator thread", GetLastError());
+        CloseHandle(workerReady);
+        return 1;
+    }
+    const HANDLE startup[] = {ready.get(), worker.get()};
+    const DWORD started = WaitForMultipleObjects(2, startup, FALSE, 15000);
+    if (started != WAIT_OBJECT_0) {
+        DWORD error = started == WAIT_TIMEOUT ? ERROR_TIMEOUT : ERROR_GEN_FAILURE;
+        if (started == WAIT_FAILED) error = GetLastError();
+        ReportBackgroundError(L"Start coordinator", error);
+        return 1;
+    }
 
     g_hKeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyProc, hInst, 0);
+    if (!g_hKeyHook) ReportBackgroundError(L"Install keyboard hook", GetLastError());
     g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hInst, 0);
-    if (!g_hKeyHook || !g_hMouseHook) {
-        if (g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
-        if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
-        PostMessageW(g_hLassoCoordinator, WM_CLOSE, 0, 0);
-        WaitForSingleObject(worker, INFINITE);
-        CloseHandle(worker);
-        ReleaseMutex(mutex);
-        CloseHandle(mutex);
+    if (!g_hMouseHook) ReportBackgroundError(L"Install mouse hook", GetLastError());
+
+    int result = 1;
+    if (g_hKeyHook && g_hMouseHook) {
+        const HANDLE workerHandle = worker.get();
+        bool quitting = false;
+        while (!quitting) {
+            const DWORD wake = MsgWaitForMultipleObjectsEx(1, &workerHandle, INFINITE,
+                QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (wake == WAIT_OBJECT_0) {
+                DWORD exitCode = 0;
+                GetExitCodeThread(workerHandle, &exitCode);
+                ReportBackgroundError(L"Coordinator stopped", exitCode);
+                break;
+            }
+            if (wake != WAIT_OBJECT_0 + 1) {
+                ReportBackgroundError(L"Hook message wait", GetLastError());
+                break;
+            }
+            MSG msg{};
+            // Drain a bounded batch so a busy input queue cannot mask worker exit.
+            for (int i = 0; i < 64 && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE); ++i) {
+                if (msg.message == WM_QUIT) {
+                    quitting = true;
+                    result = static_cast<int>(msg.wParam);
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    if (g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
+    if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
+    if (const HWND coordinator = g_hLassoCoordinator.load())
+        PostMessageW(coordinator, WM_CLOSE, 0, 0);
+    if (WaitForSingleObject(worker.get(), 5000) != WAIT_OBJECT_0) {
+        ReportBackgroundError(L"Stop coordinator", ERROR_TIMEOUT);
         return 1;
     }
-
-    MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    UnhookWindowsHookEx(g_hKeyHook);
-    UnhookWindowsHookEx(g_hMouseHook);
-    if (g_hLassoCoordinator) PostMessageW(g_hLassoCoordinator, WM_CLOSE, 0, 0);
-    WaitForSingleObject(worker, INFINITE);
-    CloseHandle(worker);
-    ReleaseMutex(mutex);
-    CloseHandle(mutex);
-    return 0;
+    return result;
 }
