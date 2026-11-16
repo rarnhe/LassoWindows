@@ -9,6 +9,7 @@
 #include <propkey.h>
 #include <propvarutil.h>
 #include <oleacc.h>
+#include <UIAutomation.h>
 #include <filesystem>
 #include <unordered_map>
 #include <iterator>
@@ -19,6 +20,7 @@
 
 // WinRT 通知相关
 #include <winrt/Windows.UI.Notifications.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -28,6 +30,7 @@
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "oleacc.lib")
+#pragma comment(lib, "msimg32.lib")
 using namespace winrt;
 using namespace Windows::UI::Notifications;
 using namespace Windows::Data::Xml::Dom;
@@ -1655,6 +1658,7 @@ struct AltTabProxy {
     HWND window = nullptr;
     HWND target = nullptr;
     HICON sourceIcon = nullptr;
+    COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
     std::wstring title;
     std::shared_ptr<ProxyFrame> frame = std::make_shared<ProxyFrame>();
 
@@ -1674,6 +1678,65 @@ static BITMAPINFO ProxyBitmapInfo(int width, int height) {
     BITMAPINFO info{};
     info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB, 0, 0, 0, 0, 0};
     return info;
+}
+
+// Measure the actual Webdings ink so the symbol (not the font box) reaches
+// both thumbnail edges. AlphaBlend touches only pixels covered by the web.
+static void DrawCenteredPreviewWeb(HDC destination, int width, int height, COLORREF accent) {
+    if (width <= 0 || height <= 0) return;
+    constexpr int maskSide = 256;
+    HDC dc = CreateCompatibleDC(destination);
+    if (!dc) return;
+    const auto info = ProxyBitmapInfo(maskSide, maskSide);
+    void* bits = nullptr;
+    HBITMAP mask = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HFONT font = CreateFontW(-192, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        SYMBOL_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Webdings");
+    if (mask && bits && font) {
+        const HGDIOBJ oldBitmap = SelectObject(dc, mask);
+        const HGDIOBJ oldFont = SelectObject(dc, font);
+        if (oldBitmap && oldBitmap != HGDI_ERROR && oldFont && oldFont != HGDI_ERROR) {
+            PatBlt(dc, 0, 0, maskSide, maskSide, BLACKNESS);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(255, 255, 255));
+            RECT maskBounds{0, 0, maskSide, maskSide};
+            DrawTextW(dc, L"\"", 1, &maskBounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            GdiFlush();
+
+            RECT ink{maskSide, maskSide, 0, 0};
+            auto* pixels = static_cast<DWORD*>(bits);
+            for (LONG y = 0; y < maskSide; ++y) {
+                for (LONG x = 0; x < maskSide; ++x) {
+                    auto& pixel = pixels[y * maskSide + x];
+                    const DWORD alpha = pixel & 0xff;
+                    if (alpha) {
+                        ink.left = (std::min)(ink.left, x);
+                        ink.top = (std::min)(ink.top, y);
+                        ink.right = (std::max)(ink.right, x + 1);
+                        ink.bottom = (std::max)(ink.bottom, y + 1);
+                    }
+                    pixel = (alpha << 24) |
+                        ((GetRValue(accent) * alpha / 255) << 16) |
+                        ((GetGValue(accent) * alpha / 255) << 8) |
+                        (GetBValue(accent) * alpha / 255);
+                }
+            }
+            if (ink.right > ink.left && ink.bottom > ink.top) {
+                const int inkWidth = ink.right - ink.left;
+                const int inkHeight = ink.bottom - ink.top;
+                const int webWidth = (std::min)(width, (std::max)(1, MulDiv(inkWidth, height, inkHeight)));
+                const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+                AlphaBlend(destination, (width - webWidth) / 2, 0, webWidth, height,
+                    dc, ink.left, ink.top, inkWidth, inkHeight, blend);
+            }
+        }
+        if (oldFont && oldFont != HGDI_ERROR) SelectObject(dc, oldFont);
+        if (oldBitmap && oldBitmap != HGDI_ERROR) SelectObject(dc, oldBitmap);
+    }
+    if (font) DeleteObject(font);
+    if (mask) DeleteObject(mask);
+    DeleteDC(dc);
 }
 
 static void PaintAltTabProxy(HDC dc, int width, int height, const AltTabProxy& proxy) {
@@ -1705,20 +1768,7 @@ static void PaintAltTabProxy(HDC dc, int width, int height, const AltTabProxy& p
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
-    const int side = (std::max)(1, (std::min)(width, height) / 5);
-    const int margin = (std::max)(1, side / 6);
-    RECT badge{width - side - margin, margin, width - margin, margin + side};
-    FillRect(dc, &badge, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-    HFONT font = CreateFontW(-side, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        SYMBOL_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_SWISS, L"Webdings");
-    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
-    if (previous && previous != HGDI_ERROR) {
-        SetTextColor(dc, RGB(255, 255, 255));
-        DrawTextW(dc, L"\"", 1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, previous);
-    }
-    if (font) DeleteObject(font);
+    DrawCenteredPreviewWeb(dc, width, height, proxy.accent);
 }
 
 static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT message,
@@ -1862,6 +1912,13 @@ static std::unique_ptr<AltTabProxy> CreateAltTabProxy(HWND target, bool capture)
 
     auto proxy = std::make_unique<AltTabProxy>();
     proxy->target = target;
+    try {
+        using namespace winrt::Windows::UI::ViewManagement;
+        const auto accent = UISettings().GetColorValue(UIColorType::Accent);
+        proxy->accent = RGB(accent.R, accent.G, accent.B);
+    } catch (const winrt::hresult_error&) {
+        proxy->accent = GetTaskbarAccentColor();
+    }
     wchar_t title[512]{};
     GetWindowTextW(target, title, static_cast<int>(std::size(title)));
     proxy->title = *title ? title : ReadTaggedExe(target);
@@ -2165,39 +2222,203 @@ BOOL GetPhysicalRect(HWND hWnd, RECT* pRect) {
 	return GetWindowRect(hWnd, pRect);
 }
 
-static constexpr LONG SHOW_DESKTOP_EDGE_WIDTH = 10;
-static bool g_showDesktopClickCaptured = false;
+static constexpr wchar_t SHOW_DESKTOP_HWND_CLASS[] = L"TrayShowDesktopButtonWClass";
 
-static bool IsPointInPrimaryTaskbar(HWND taskbar, POINT point, RECT& bounds) {
-    return taskbar && IsWindowVisible(taskbar) && GetWindowRect(taskbar, &bounds) &&
-        PtInRect(&bounds, point);
+static bool WindowClassIs(HWND window, const wchar_t* expected) {
+    wchar_t name[96]{};
+    return GetClassNameW(window, name, static_cast<int>(std::size(name))) &&
+        wcscmp(name, expected) == 0;
 }
 
-static bool IsPointInShowDesktopEdge(HWND primaryTaskbar, POINT point) {
+static bool FindNativeShowDesktopBounds(HWND taskbar, HWND hit, POINT point, RECT& bounds) {
+    for (HWND window = hit; window && window != taskbar; window = GetParent(window)) {
+        if (WindowClassIs(window, SHOW_DESKTOP_HWND_CLASS))
+            return IsChild(taskbar, window) && IsWindowVisible(window) && IsWindowEnabled(window) &&
+                GetWindowRect(window, &bounds) && PtInRect(&bounds, point);
+    }
+    return false;
+}
+
+static bool IsShowDesktopAutomationElement(const wchar_t* id, const wchar_t* name,
+                                           CONTROLTYPEID type) {
+    if (id && (wcscmp(id, L"ShowDesktopStack") == 0 ||
+               wcscmp(id, L"ShowDesktopButton") == 0 ||
+               wcscmp(id, L"ShowDesktopIcon") == 0)) return true;
+    if (!name || type != UIA_ButtonControlTypeId) return false;
+    return _wcsicmp(name, L"Show desktop") == 0 ||
+        wcscmp(name, L"显示桌面") == 0 || wcscmp(name, L"顯示桌面") == 0;
+}
+
+static bool FindXamlShowDesktopBounds(HWND taskbar, POINT point, RECT& bounds) {
+    winrt::com_ptr<IUIAutomation2> automation;
+    if (FAILED(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(automation.put())))) return false;
+    automation->put_ConnectionTimeout(100);
+    automation->put_TransactionTimeout(100);
+
+    winrt::com_ptr<IUIAutomationCacheRequest> cache;
+    if (FAILED(automation->CreateCacheRequest(cache.put()))) return false;
+    for (PROPERTYID property : {UIA_AutomationIdPropertyId, UIA_NamePropertyId,
+            UIA_ControlTypePropertyId, UIA_IsEnabledPropertyId, UIA_BoundingRectanglePropertyId,
+            UIA_ProcessIdPropertyId})
+        if (FAILED(cache->AddProperty(property))) return false;
+
+    winrt::com_ptr<IUIAutomationElement> element;
+    winrt::com_ptr<IUIAutomationTreeWalker> walker;
+    if (FAILED(automation->ElementFromPointBuildCache(point, cache.get(), element.put())) ||
+        FAILED(automation->get_RawViewWalker(walker.put()))) return false;
+    DWORD explorer = 0;
+    GetWindowThreadProcessId(taskbar, &explorer);
+    for (int depth = 0; element && depth < 8; ++depth) {
+        int process = 0;
+        if (FAILED(element->get_CachedProcessId(&process)) ||
+            static_cast<DWORD>(process) != explorer) break;
+        BSTR id = nullptr, name = nullptr;
+        CONTROLTYPEID type = 0;
+        BOOL enabled = FALSE;
+        element->get_CachedAutomationId(&id);
+        element->get_CachedName(&name);
+        element->get_CachedControlType(&type);
+        element->get_CachedIsEnabled(&enabled);
+        const bool matched = enabled && IsShowDesktopAutomationElement(id, name, type);
+        SysFreeString(id);
+        SysFreeString(name);
+        if (matched && SUCCEEDED(element->get_CachedBoundingRectangle(&bounds)) &&
+            PtInRect(&bounds, point)) return true;
+        winrt::com_ptr<IUIAutomationElement> parent;
+        if (FAILED(walker->GetParentElementBuildCache(element.get(), cache.get(), parent.put()))) break;
+        element = std::move(parent);
+    }
+    return false;
+}
+
+struct ShowDesktopProbe {
+    HWND taskbar;
+    POINT point;
+    winrt::handle done{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     RECT bounds{};
-    return IsPointInPrimaryTaskbar(primaryTaskbar, point, bounds) &&
-        point.x >= bounds.right - SHOW_DESKTOP_EDGE_WIDTH;
+    bool found = false;
+    ULONGLONG finishedAt = 0;
+};
+
+// The hook thread owns the probe reference. UI Automation runs in an MTA
+// worker, and readers examine the result only after the event is signaled.
+static std::shared_ptr<ShowDesktopProbe> g_showDesktopProbe;
+
+static void CALLBACK ProbeShowDesktop(PTP_CALLBACK_INSTANCE, void* data) noexcept {
+    std::unique_ptr<std::shared_ptr<ShowDesktopProbe>> ref(
+        static_cast<std::shared_ptr<ShowDesktopProbe>*>(data));
+    auto& probe = **ref;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        probe.found = FindXamlShowDesktopBounds(probe.taskbar, probe.point, probe.bounds);
+        CoUninitialize();
+    }
+    probe.finishedAt = GetTickCount64();
+    SetEvent(probe.done.get());
 }
 
-static std::vector<HWND> g_hiddenPrimaryWindows;
+static bool FindShowDesktopClickBounds(HWND taskbar, POINT point, bool click, RECT& bounds) {
+    if (!taskbar || !IsWindowVisible(taskbar)) return false;
+    const HWND hit = WindowFromPoint(point);
+    if (!hit || GetAncestor(hit, GA_ROOT) != taskbar) return false;
+    if (FindNativeShowDesktopBounds(taskbar, hit, point, bounds)) return true;
+
+    auto& probe = g_showDesktopProbe;
+    const auto ready = [&] { return probe && WaitForSingleObject(probe->done.get(), 0) == WAIT_OBJECT_0; };
+    const auto matches = [&] {
+        if (!ready() || probe->taskbar != taskbar || !probe->found ||
+            GetTickCount64() - probe->finishedAt > 250 || !PtInRect(&probe->bounds, point))
+            return false;
+        bounds = probe->bounds;
+        return true;
+    };
+    if (matches()) return true;
+    if (!probe || ready()) {
+        if (!click && probe && probe->taskbar == taskbar &&
+            GetTickCount64() - probe->finishedAt < 60) return false;
+        auto next = std::make_shared<ShowDesktopProbe>(ShowDesktopProbe{taskbar, point});
+        if (!next->done) return false;
+        auto ref = std::make_unique<std::shared_ptr<ShowDesktopProbe>>(next);
+        if (!TrySubmitThreadpoolCallback(ProbeShowDesktop, ref.get(), nullptr)) return false;
+        ref.release();
+        probe = std::move(next);
+    }
+    // Hover normally supplies a fresh hit result. A click before the probe
+    // completes can wait briefly, then falls through to the native action.
+    return click && WaitForSingleObject(probe->done.get(), 75) == WAIT_OBJECT_0 && matches();
+}
+
+static RECT g_showDesktopPressedBounds{};
+static HWND g_showDesktopPressedTaskbar = nullptr;
+
+struct PrimaryWindowTransparency {
+    HWND window;
+    LONG_PTR extendedStyle;
+    COLORREF colorKey = 0;
+    BYTE alpha = 255;
+    DWORD layerFlags = 0;
+};
+
+static std::vector<PrimaryWindowTransparency> g_hiddenPrimaryWindows;
 static ULONGLONG g_primaryHideCompletedAt = 0;
 
+static bool SetPrimaryExtendedStyle(HWND h, LONG_PTR style) {
+    SetLastError(ERROR_SUCCESS);
+    return SetWindowLongPtrW(h, GWL_EXSTYLE, style) != 0 || GetLastError() == ERROR_SUCCESS;
+}
+
+static void RefreshPrimaryWindowFrame(HWND h) {
+    SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+}
+
 static bool HidePrimaryWindow(HWND h) {
-    if (!IsWindow(h) || !IsWindowVisible(h)) return false;
-    if (!SetWindowPresented(h, false) || IsWindowVisible(h)) return false;
-    g_hiddenPrimaryWindows.push_back(h);
+    if (!IsWindow(h) || !IsWindowVisible(h) ||
+        std::any_of(g_hiddenPrimaryWindows.begin(), g_hiddenPrimaryWindows.end(),
+            [h](const auto& state) { return state.window == h; })) return false;
+    PrimaryWindowTransparency state{h, GetWindowLongPtrW(h, GWL_EXSTYLE)};
+    if ((state.extendedStyle & WS_EX_LAYERED) &&
+        !GetLayeredWindowAttributes(h, &state.colorKey, &state.alpha, &state.layerFlags)) return false;
+
+    // Preserve WS_VISIBLE and the original shell-facing extended styles.
+    if (!SetPrimaryExtendedStyle(h, state.extendedStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT))
+        return false;
+    if (!SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA)) {
+        SetPrimaryExtendedStyle(h, state.extendedStyle);
+        RefreshPrimaryWindowFrame(h);
+        return false;
+    }
+    g_hiddenPrimaryWindows.push_back(state);
+    RefreshPrimaryWindowFrame(h);
+    return true;
+}
+
+static bool RestorePrimaryWindow(const PrimaryWindowTransparency& state) {
+    const HWND h = state.window;
+    if (!IsWindow(h)) return true;
+    if (state.extendedStyle & WS_EX_LAYERED) {
+        if (!SetLayeredWindowAttributes(h, state.colorKey, state.alpha, state.layerFlags)) return false;
+        if (!SetPrimaryExtendedStyle(h, state.extendedStyle)) {
+            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+            return false;
+        }
+    } else {
+        if (!SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA)) return false;
+        if (!SetPrimaryExtendedStyle(h, state.extendedStyle)) {
+            SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+            return false;
+        }
+    }
+    RefreshPrimaryWindowFrame(h);
     return true;
 }
 
 static void RestoreHiddenPrimaryWindows() {
     g_primaryHideCompletedAt = 0;
-    std::vector<HWND> batch;
+    std::vector<PrimaryWindowTransparency> batch;
     batch.swap(g_hiddenPrimaryWindows);
-    for (HWND h : batch) {
-        if (IsWindow(h) && !IsWindowVisible(h) &&
-            (!SetWindowPresented(h, true) || !IsWindowVisible(h)))
-            g_hiddenPrimaryWindows.push_back(h);
-    }
+    for (const auto& state : batch)
+        if (!RestorePrimaryWindow(state)) g_hiddenPrimaryWindows.push_back(state);
 }
 
 static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
@@ -2258,25 +2479,35 @@ static void TogglePrimaryWindows() {
     std::vector<HWND> candidates;
     ToggleContext context{&candidates, primary};
     EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
-    // Hide back-to-front so the foreground is the last window to disappear.
-    // Store the original enumeration order for ordered, non-activating restore.
-    for (auto it = candidates.rbegin(); it != candidates.rend(); ++it)
-        HidePrimaryWindow(*it);
-    std::reverse(g_hiddenPrimaryWindows.begin(), g_hiddenPrimaryWindows.end());
+    for (HWND h : candidates) HidePrimaryWindow(h);
+    const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    if (std::any_of(g_hiddenPrimaryWindows.begin(), g_hiddenPrimaryWindows.end(),
+            [foreground](const auto& state) { return state.window == foreground; }))
+        SetForegroundWindow(GetShellWindow());
     g_primaryHideCompletedAt = GetTickCount64();
 }
 
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && wParam == WM_LBUTTONUP && g_showDesktopClickCaptured) {
-        g_showDesktopClickCaptured = false;
+    if (nCode != HC_ACTION || !g_hLassoCoordinator)
+        return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+
+    const POINT point = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam)->pt;
+    if (wParam == WM_LBUTTONUP && g_showDesktopPressedTaskbar) {
+        const HWND taskbar = g_showDesktopPressedTaskbar;
+        g_showDesktopPressedTaskbar = nullptr;
+        if (GetAncestor(WindowFromPoint(point), GA_ROOT) == taskbar &&
+            PtInRect(&g_showDesktopPressedBounds, point))
+            PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
         return 1;
     }
-    if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN && g_hLassoCoordinator) {
-        const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        const HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-        if (IsPointInShowDesktopEdge(primaryTaskbar, mouse->pt) &&
-            PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0)) {
-            g_showDesktopClickCaptured = true;
+
+    if (wParam == WM_MOUSEMOVE || wParam == WM_LBUTTONDOWN) {
+        const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        const bool click = wParam == WM_LBUTTONDOWN;
+        RECT bounds{};
+        if (FindShowDesktopClickBounds(taskbar, point, click, bounds) && click) {
+            g_showDesktopPressedTaskbar = taskbar;
+            g_showDesktopPressedBounds = bounds;
             return 1;
         }
     }
@@ -2405,7 +2636,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
         forget(g_HiddenWindowsCache);
         std::erase_if(g_altTabProxies, [hwnd](const auto& proxy) { return proxy->target == hwnd; });
         if (g_InSnapWindows && g_altTabProxies.empty()) ExecuteCollectRestore();
-        forget(g_hiddenPrimaryWindows);
+        std::erase_if(g_hiddenPrimaryWindows,
+            [hwnd](const auto& state) { return state.window == hwnd; });
         return;
     }
 
@@ -2509,8 +2741,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 			const HWND mouseRoot = GetAncestor(WindowFromPoint(pt), GA_ROOT);
 			wchar_t trayCls[256]{};
 			GetClassNameW(mouseRoot, trayCls, static_cast<int>(std::size(trayCls)));
-			if ((wcscmp(trayCls, L"Shell_TrayWnd") == 0 && !IsPointInShowDesktopEdge(mouseRoot, pt)) ||
-			    wcscmp(trayCls, L"Shell_SecondaryTrayWnd") == 0) return;
+			if (wcscmp(trayCls, L"Shell_TrayWnd") == 0 ||
+                wcscmp(trayCls, L"Shell_SecondaryTrayWnd") == 0) return;
 
 			// C. 执行 AppID 分离逻辑
 			std::wstring uniqueId = L"MTU.AppSplit." + std::to_wstring((UINT_PTR)hwnd);
@@ -2560,6 +2792,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
 // taskbar and hide/restore work. Hook callbacks live on the main message thread.
 static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDesktop = GetWindowDesktopGuid,
                                    bool (*isOnCurrentDesktop)(HWND) = IsWindowOnCurrentVirtualDesktop) {
+    RestoreHiddenPrimaryWindows();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !isOnCurrentDesktop(root)) return;
@@ -2581,6 +2814,7 @@ static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDeskto
 }
 
 static void HideOtherApplications(HWND foreground) {
+    RestoreHiddenPrimaryWindows();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;
