@@ -136,8 +136,15 @@ void run(const std::string& name) {
         const LONG_PTR layeredStyle = GetWindowLongPtrW(layered, GWL_EXSTYLE);
         CHECK(HidePrimaryWindow(plain));
         CHECK(HidePrimaryWindow(layered));
-        CHECK((g_hiddenPrimaryWindows == std::vector<HWND>{plain.h, layered.h}));
-        CHECK(!IsWindowVisible(plain) && !IsWindowVisible(layered));
+        CHECK(g_hiddenPrimaryWindows.size() == 2 &&
+            g_hiddenPrimaryWindows[0].window == plain.h && g_hiddenPrimaryWindows[1].window == layered.h);
+        for (HWND h : {plain.h, layered.h}) {
+            CHECK(IsWindowVisible(h));
+            CHECK((GetWindowLongPtrW(h, GWL_EXSTYLE) & (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW)) == WS_EX_APPWINDOW);
+            CHECK(GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TRANSPARENT);
+            BYTE hiddenAlpha = 255;
+            CHECK(GetLayeredWindowAttributes(h, nullptr, &hiddenAlpha, nullptr) && hiddenAlpha == 0);
+        }
         CHECK(!HidePrimaryWindow(plain));
         CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
         CHECK(g_hiddenPrimaryWindows.empty());
@@ -176,25 +183,37 @@ void run(const std::string& name) {
         CHECK(HidePrimaryWindow(a));
         CHECK(HidePrimaryWindow(b));
         WinEventProc(nullptr, EVENT_OBJECT_DESTROY, a, OBJID_WINDOW, CHILDID_SELF, 0, 0);
-        CHECK(g_hiddenPrimaryWindows == std::vector<HWND>{b.h});
+        CHECK(g_hiddenPrimaryWindows.size() == 1 && g_hiddenPrimaryWindows.front().window == b.h);
         RestoreHiddenPrimaryWindows();
-        CHECK(IsWindowVisible(b) && !IsWindowVisible(a));
+        CHECK(IsWindowVisible(b) && !(GetWindowLongPtrW(b, GWL_EXSTYLE) & WS_EX_LAYERED));
         return;
     }
     if (name == "show_desktop_button_hit_test") {
         RegisterFixtureClass(L"PrimaryTaskbarFixture");
+        RegisterFixtureClass(SHOW_DESKTOP_HWND_CLASS);
         Window tray(0, nullptr, L"PrimaryTaskbarFixture", 100, 100, 1000, 40, WS_POPUP);
-        ShowWindow(tray, SW_SHOWNOACTIVATE);
-        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1085, 120})); // Old band.
-        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1089, 120}));
-        CHECK(IsPointInShowDesktopEdge(tray, POINT{1090, 120}));
-        CHECK(IsPointInShowDesktopEdge(tray, POINT{1099, 139}));
-        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1100, 120}));
-        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1099, 99}));
-        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1099, 140}));
-        CHECK(!IsPointInShowDesktopEdge(nullptr, POINT{1099, 120}));
-        ShowWindow(tray, SW_HIDE);
-        CHECK(!IsPointInShowDesktopEdge(tray, POINT{1099, 120}));
+        Window clock(0, tray, L"STATIC", 970, 0, 22, 40);
+        Window button(0, tray, SHOW_DESKTOP_HWND_CLASS, 992, 0, 8, 40);
+        for (HWND h : {tray.h, clock.h, button.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
+        RECT bounds{};
+        CHECK(!FindNativeShowDesktopBounds(tray, clock, POINT{1091, 120}, bounds));
+        CHECK(!FindNativeShowDesktopBounds(tray, tray, POINT{1095, 120}, bounds));
+        CHECK(FindNativeShowDesktopBounds(tray, button, POINT{1092, 120}, bounds));
+        CHECK(FindNativeShowDesktopBounds(tray, button, POINT{1099, 139}, bounds));
+        CHECK(!FindNativeShowDesktopBounds(tray, button, POINT{1100, 120}, bounds));
+        CHECK(!FindNativeShowDesktopBounds(tray, button, POINT{1099, 140}, bounds));
+        EnableWindow(button, FALSE);
+        CHECK(!FindNativeShowDesktopBounds(tray, button, POINT{1099, 120}, bounds));
+        EnableWindow(button, TRUE);
+        ShowWindow(button, SW_HIDE);
+        CHECK(!FindNativeShowDesktopBounds(tray, button, POINT{1099, 120}, bounds));
+
+        CHECK(IsShowDesktopAutomationElement(L"ShowDesktopStack", L"", UIA_PaneControlTypeId, L""));
+        CHECK(IsShowDesktopAutomationElement(L"", L"显示桌面", UIA_ButtonControlTypeId, L""));
+        CHECK(IsShowDesktopAutomationElement(L"", L"顯示桌面", UIA_ButtonControlTypeId, L""));
+        CHECK(IsShowDesktopAutomationElement(L"", L"Show desktop", UIA_CustomControlTypeId, L"SystemTray.IconView"));
+        CHECK(!IsShowDesktopAutomationElement(L"", L"Show desktop", UIA_TextControlTypeId, L""));
+        CHECK(!IsShowDesktopAutomationElement(L"ClockButton", L"Clock", UIA_ButtonControlTypeId, L"IconView"));
         return;
     }
     if (name == "uwp_frame_close") {
@@ -683,21 +702,34 @@ void run(const std::string& name) {
         CHECK(bitmap && bits);
         HGDIOBJ old = SelectObject(dc, bitmap);
         CHECK(old && old != HGDI_ERROR);
-        const auto& card = *g_altTabProxies.front();
+        auto& card = *g_altTabProxies.front();
+        card.accent = RGB(0xd5, 0x60, 0x22);
         card.frame->width = 2;
         card.frame->height = 2;
         card.frame->pixels.assign(4, 0xff224466);
         PaintAltTabProxy(dc, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, card);
         GdiFlush();
         const auto* pixels = static_cast<const DWORD*>(bits);
-        const int side = PROXY_FRAME_HEIGHT / 5;
-        const int margin = side / 6;
-        CHECK((pixels[(PROXY_FRAME_HEIGHT / 2) * PROXY_FRAME_WIDTH + PROXY_FRAME_WIDTH / 2] & 0xffffff) == 0x224466);
-        bool whiteGlyph = false;
-        for (int y = margin; y < margin + side; ++y)
-            for (int x = PROXY_FRAME_WIDTH - margin - side; x < PROXY_FRAME_WIDTH - margin; ++x)
-                whiteGlyph |= (pixels[y * PROXY_FRAME_WIDTH + x] & 0xffffff) == 0xffffff;
-        CHECK(whiteGlyph);
+        RECT web{PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, 0, 0};
+        size_t accentPixels = 0;
+        size_t backgroundPixels = 0;
+        for (LONG y = 0; y < PROXY_FRAME_HEIGHT; ++y) {
+            for (LONG x = 0; x < PROXY_FRAME_WIDTH; ++x) {
+                const auto pixel = pixels[y * PROXY_FRAME_WIDTH + x] & 0xffffff;
+                if (pixel == 0xd56022) ++accentPixels;
+                if (pixel == 0x224466) ++backgroundPixels;
+                if (pixel != 0x000000 && pixel != 0x224466) {
+                    web.left = (std::min)(web.left, x);
+                    web.top = (std::min)(web.top, y);
+                    web.right = (std::max)(web.right, x + 1);
+                    web.bottom = (std::max)(web.bottom, y + 1);
+                }
+            }
+        }
+        CHECK(accentPixels > 200 && backgroundPixels > 1000);
+        CHECK(web.top <= 2 && web.bottom >= PROXY_FRAME_HEIGHT - 2);
+        CHECK(abs(web.left + web.right - PROXY_FRAME_WIDTH) <= 3);
+        CHECK((pixels[10 * PROXY_FRAME_WIDTH + 400] & 0xffffff) == 0);
         SelectObject(dc, old);
         DeleteObject(bitmap);
         DeleteDC(dc);
