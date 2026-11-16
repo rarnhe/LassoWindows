@@ -1,12 +1,22 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-15 18:37:15
-- 测试源码基准提交：e23f30747863edfdb81efd8380a7140da2819fd4
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43747721109
+- 时间（UTC）：2026-11-16 13:59:45
+- 测试源码基准提交：58db16037dc11a0e7234bad75d7dac9df8c2c8cf
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43881079593
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
-- 统计：通过 36 / 失败 0 / 跳过 0 / 共 36
+- 统计：通过 43 / 失败 0 / 跳过 0 / 共 43
+
+## GitHub Actions 阶段状态
+
+| 阶段 | 结果 |
+| --- | --- |
+| Configure | success |
+| Build | success |
+| CTest | success |
+
+## 测试用例结果
 
 | 测试 | 结果 |
 | --- | --- |
@@ -39,18 +49,24 @@
 | collect | 通过 |
 | icon_cache | 通过 |
 | toggle_filter | 通过 |
+| hide_others_all_desktops | 通过 |
+| primary_transparency_roundtrip | 通过 |
+| primary_transparency_input | 通过 |
+| show_desktop_button_hit_test | 通过 |
 | uwp_frame_close | 通过 |
-| uwp_frame_recovery | 通过 |
-| uwp_shell_switcher_state | 通过 |
+| exe_tag_atom | 通过 |
+| alt_tab_after_desktop_switch | 通过 |
 | alt_tab_chord | 通过 |
 | alt_tab_consecutive_previews | 通过 |
 | cross_desktop_win_c | 通过 |
 | uwp_win_c_close | 通过 |
+| sealed_preview_icon_roundtrip | 通过 |
+| preview_icon_selection_restore | 通过 |
+| preview_icon_reseal_restore | 通过 |
 
 ## 失败详情
-无用例失败详情；若整体失败，请检查 Actions 阶段和构建日志。
 
 ## 覆盖范围
-真实编译 LassoWindows.cpp，验证 INI 图标解析、进程识别、窗口过滤/坐标/可见性、隐藏恢复样式、压制条件、收网状态、跨虚拟桌面同进程封印及逐窗 GUID 标签、Alt+Tab 当前桌面 GUID 筛选、同进程解封、连续预览、临时应用窗口样式和最终原样恢复、收网计时器隔离、Win+C 向模拟 UWP 外框派发 WM_CLOSE、图标缓存和主屏收集过滤。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
+真实编译 LassoWindows.cpp，验证 INI 图标解析、EXE 文件名与虚拟桌面 GUID 双标签、跨虚拟桌面同名 EXE 封印、Shift+Win+C 跨全部虚拟桌面隐藏其他应用及 UWP WM_CLOSE、会话级虚拟桌面 GUID 优先解析、切换桌面后 Alt+Tab 仅预览当前桌面窗口、主屏原生 Show Desktop 按钮精确命中、主屏窗口透明化及还原、桌面图标点击例外/双击/右键规则、临时透明样式不添加 WS_EX_TOOLWINDOW、键盘与其他鼠标操作恢复、关闭/清理边界、图标缓存和主屏筛选条件。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
 
 全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。
