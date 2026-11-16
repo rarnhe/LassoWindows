@@ -901,7 +901,7 @@ static HICON CreateSealedPreviewIcon(HICON sourceIcon, int iconSize, COLORREF ac
     const DWORD markedColor = 0xff000000 |
         (static_cast<DWORD>(GetRValue(accentColor)) << 16) |
         (static_cast<DWORD>(GetGValue(accentColor)) << 8) |
-        static_cast<DWORD>(GetBValue(accentColor);
+        static_cast<DWORD>(GetBValue(accentColor));
     bool hasWebGlyph = false;
     for (size_t i = 0; i < pixelCount; ++i) {
         if (pixels[i] != pixelBackup[i]) {
