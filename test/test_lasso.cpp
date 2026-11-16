@@ -79,6 +79,12 @@ void iniTest(const std::string& name) {
     CHECK(GetIconResourceFromIni(actual, index) == result);
     CHECK(actual == expected); CHECK(index == expectedIndex);
 }
+static HWND ProxyFor(HWND target) {
+    for (const auto& proxy : g_altTabProxies)
+        if (proxy->target == target) return proxy->window;
+    return nullptr;
+}
+
 void run(const std::string& name) {
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
     if (name == "hide_others_all_desktops") {
@@ -121,132 +127,58 @@ void run(const std::string& name) {
         g_testWindowDesktopIds.clear();
         return;
     }
-    if (name == "primary_transparency_roundtrip") {
+    if (name == "primary_hide_roundtrip") {
         Window plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
         ShowWindow(plain, SW_SHOWNOACTIVATE);
         ShowWindow(layered, SW_SHOWNOACTIVATE);
-
-        const LONG_PTR plainWindowStyle = GetWindowLongPtrW(plain, GWL_STYLE);
-        const LONG_PTR layeredWindowStyle = GetWindowLongPtrW(layered, GWL_STYLE);
+        CHECK(SetLayeredWindowAttributes(layered, RGB(13, 42, 71), 173, LWA_ALPHA));
         const LONG_PTR plainStyle = GetWindowLongPtrW(plain, GWL_EXSTYLE);
-        CHECK(plainStyle & WS_EX_APPWINDOW);
-        CHECK(!(plainStyle & WS_EX_TOOLWINDOW));
-        CHECK(ApplyPrimaryWindowTransparency(plain));
-        CHECK(ApplyPrimaryWindowTransparency(plain));
-        LONG_PTR style = GetWindowLongPtrW(plain, GWL_EXSTYLE);
-        // The temporary invisibility path adds only layered + click-through.
-        // In particular it never adds WS_EX_TOOLWINDOW (Task View exclusion).
-        CHECK(style == (plainStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT));
-        BYTE alpha = 255; DWORD flags = 0;
-        CHECK(GetLayeredWindowAttributes(plain, nullptr, &alpha, &flags));
-        CHECK(alpha == 0 && (flags & LWA_ALPHA));
-        CHECK(IsWindowVisible(plain) && !IsIconic(plain));
-
         const LONG_PTR layeredStyle = GetWindowLongPtrW(layered, GWL_EXSTYLE);
-        const COLORREF originalKey = RGB(13, 42, 71);
-        CHECK(SetLayeredWindowAttributes(layered, originalKey, 173, LWA_ALPHA | LWA_COLORKEY));
-        CHECK(ApplyPrimaryWindowTransparency(layered));
-        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == (layeredStyle | WS_EX_TRANSPARENT));
-        alpha = 255; flags = 0;
-        CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
-        CHECK(alpha == 0 && flags == LWA_ALPHA);
-
-        CHECK(GetWindowLongPtrW(plain, GWL_STYLE) == plainWindowStyle);
-        CHECK(GetWindowLongPtrW(layered, GWL_STYLE) == layeredWindowStyle);
-
-        CHECK(RestorePrimaryWindowTransparency(plain));
+        CHECK(HidePrimaryWindow(plain));
+        CHECK(HidePrimaryWindow(layered));
+        CHECK((g_hiddenPrimaryWindows == std::vector<HWND>{plain.h, layered.h}));
+        CHECK(!IsWindowVisible(plain) && !IsWindowVisible(layered));
+        CHECK(!HidePrimaryWindow(plain));
+        CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
+        CHECK(g_hiddenPrimaryWindows.empty());
+        CHECK(IsWindowVisible(plain) && IsWindowVisible(layered));
         CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
-        CHECK(RestorePrimaryWindowTransparency(layered));
         CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
-        COLORREF restoredKey{}; alpha = 0; flags = 0;
-        CHECK(GetLayeredWindowAttributes(layered, &restoredKey, &alpha, &flags));
-        CHECK(restoredKey == originalKey && alpha == 173);
-        CHECK(flags == (LWA_ALPHA | LWA_COLORKEY));
-        CHECK(g_transparentPrimaryWindows.empty());
+        BYTE alpha = 0;
+        DWORD flags = 0;
+        CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
+        CHECK(alpha == 173 && flags == LWA_ALPHA);
         return;
     }
-    if (name == "primary_transparency_input") {
-        Window w;
-        ShowWindow(w, SW_SHOWNOACTIVATE);
-        const LONG_PTR originalStyle = GetWindowLongPtrW(w, GWL_EXSTYLE);
-        const auto isIcon = [](POINT point) { return point.x == 100 && point.y == 100; };
-        const POINT icon{100, 100}, blank{200, 200};
-
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 1000, nullptr, isIcon);
-        CHECK(g_transparentPrimaryWindows.contains(w.h));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1100, nullptr, isIcon);
-        CHECK(g_transparentPrimaryWindows.contains(w.h));
-        // Repeated right-clicks on the same desktop icon remain exceptions.
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1150, nullptr, isIcon);
-        CHECK(g_transparentPrimaryWindows.contains(w.h));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, blank, 1200, nullptr, isIcon);
-        CHECK(g_transparentPrimaryWindows.empty());
-        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
-
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2000, nullptr, isIcon);
-        CHECK(g_transparentPrimaryWindows.contains(w.h));
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2001, nullptr, isIcon);
-        CHECK(g_transparentPrimaryWindows.empty());
-
-        RegisterFixtureClass(L"PrimaryTaskbarFixture");
-        Window taskbar(0, nullptr, L"PrimaryTaskbarFixture", 50, 80, 1000, 40, WS_POPUP);
-        Window sibling;
-        ShowWindow(taskbar, SW_SHOWNOACTIVATE);
-        const LONG_PTR siblingStyle = GetWindowLongPtrW(sibling, GWL_EXSTYLE);
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        CHECK(ApplyPrimaryWindowTransparency(sibling));
-        // Taskbar hit takes priority over any desktop-icon accessibility result.
-        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 3000, taskbar, isIcon);
-        CHECK(g_transparentPrimaryWindows.empty());
-        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
-        CHECK(GetWindowLongPtrW(sibling, GWL_EXSTYLE) == siblingStyle);
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        CHECK(ApplyPrimaryWindowTransparency(sibling));
-        CoordinatorWndProc(w, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
-        CHECK(g_transparentPrimaryWindows.empty());
-        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
-        CHECK(GetWindowLongPtrW(sibling, GWL_EXSTYLE) == siblingStyle);
-
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        CHECK(!IsPrimaryDesktopIconAt(POINT{-100000, -100000}));
-        CoordinatorWndProc(w, WM_LASSO_RESTORE_PRIMARY, 0, 0);
-        CHECK(g_transparentPrimaryWindows.empty());
-        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
-
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        g_hLassoCoordinator = w;
-        MSLLHOOKSTRUCT mouse{};
-        mouse.pt = icon;
-        LowLevelMouseProc(HC_ACTION, WM_RBUTTONDOWN, reinterpret_cast<LPARAM>(&mouse));
-        MSG input{};
-        CHECK(PeekMessageW(&input, w, WM_LASSO_PRIMARY_RIGHT_CLICK, WM_LASSO_PRIMARY_RIGHT_CLICK, PM_REMOVE));
-        LowLevelMouseProc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse));
-        CHECK(!PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
-        mouse.pt = blank;
-        LowLevelMouseProc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse));
-        CHECK(PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
-        CoordinatorWndProc(input.hwnd, input.message, input.wParam, input.lParam);
-        CHECK(g_transparentPrimaryWindows.empty());
-        // A physical keyboard action is a non-exempt interaction.
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        g_hLassoCoordinator = w;
-        KBDLLHOOKSTRUCT key{};
-        key.vkCode = VK_SPACE;
-        LowLevelKeyProc(HC_ACTION, WM_KEYDOWN, reinterpret_cast<LPARAM>(&key));
-        CHECK(PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
-        CoordinatorWndProc(input.hwnd, input.message, input.wParam, input.lParam);
-        CHECK(g_transparentPrimaryWindows.empty());
-        g_hLassoCoordinator = nullptr;
-
-        // The shutdown/shared sealed-window cleanup must not restore this state.
-        CHECK(ApplyPrimaryWindowTransparency(w));
-        RestoreAllSealedWindows();
-        CHECK(g_transparentPrimaryWindows.contains(w.h));
-        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) ==
-            (originalStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT));
-        CHECK(RestorePrimaryWindowTransparency(w));
+    if (name == "primary_hide_events") {
+        Window a, b, incoming;
+        for (HWND h : {a.h, b.h, incoming.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
+        const DWORD noOwnProcess = 0;
+        for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND}) {
+            CHECK(HidePrimaryWindow(a));
+            CHECK(HidePrimaryWindow(b));
+            g_primaryHideCompletedAt = GetTickCount64();
+            DWORD time = static_cast<DWORD>(g_primaryHideCompletedAt);
+            if (event == EVENT_SYSTEM_FOREGROUND) {
+                SetForegroundWindow(incoming);
+                CHECK(GetForegroundWindow() == incoming.h);
+            }
+            RestorePrimaryWindowsOnEvent(event, incoming, time, noOwnProcess);
+            CHECK(g_hiddenPrimaryWindows.size() == 2); // Ignore events already queued at hide time.
+            RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, noOwnProcess);
+            CHECK(g_hiddenPrimaryWindows.size() == 2);
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1); // Own process.
+            CHECK(g_hiddenPrimaryWindows.size() == 2);
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
+            CHECK(g_hiddenPrimaryWindows.empty());
+            CHECK(IsWindowVisible(a) && IsWindowVisible(b));
+        }
+        CHECK(HidePrimaryWindow(a));
+        CHECK(HidePrimaryWindow(b));
+        WinEventProc(nullptr, EVENT_OBJECT_DESTROY, a, OBJID_WINDOW, CHILDID_SELF, 0, 0);
+        CHECK(g_hiddenPrimaryWindows == std::vector<HWND>{b.h});
+        RestoreHiddenPrimaryWindows();
+        CHECK(IsWindowVisible(b) && !IsWindowVisible(a));
         return;
     }
     if (name == "show_desktop_button_hit_test") {
@@ -338,15 +270,15 @@ void run(const std::string& name) {
 
         g_hLassoCoordinator = coordinator;
         CHECK(BeginAltTabPreview(coordinator, nullptr, currentDesktop));
-        CHECK(g_snapUnhiddenWindows.size() == 2);
-        CHECK(std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), desktopB.h) != g_snapUnhiddenWindows.end());
-        CHECK(std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), desktopBSibling.h) != g_snapUnhiddenWindows.end());
-        CHECK(std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), desktopA.h) == g_snapUnhiddenWindows.end());
+        CHECK(g_altTabProxies.size() == 2);
+        CHECK(ProxyFor(desktopB));
+        CHECK(ProxyFor(desktopBSibling));
+        CHECK(!ProxyFor(desktopA));
         CHECK(GetWindowLongPtrW(desktopA, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
-        CHECK(!(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
-        FinishAltTabPreview(desktopB, currentDesktop);
-        CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
+        FinishAltTabPreview(ProxyFor(desktopB), currentDesktop);
+        CHECK(!g_InSnapWindows && g_altTabProxies.empty());
         CHECK(GetPropW(desktopA, L"MTU_EXE_TAG") && GetPropW(desktopA, L"MTU_VD_TAG"));
         CHECK(g_sealedWindowStates.contains(desktopA.h));
         for (HWND h : {desktopB.h, desktopBSibling.h}) {
@@ -386,31 +318,31 @@ void run(const std::string& name) {
         };
 
         CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
-        CHECK(g_snapUnhiddenWindows == std::vector<HWND>{preview.h});
+        CHECK((g_altTabProxies.size() == 1 && ProxyFor(preview)));
         CHECK(IsWindowVisible(preview));
-        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) == (originalStyle | WS_EX_APPWINDOW));
+        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         FinishAltTabPreview(otherApp, currentDesktop);
         CHECK(!g_InSnapWindows);
         checkSealed();
 
         CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
-        CHECK(!(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         ScheduleAltTabCollect(coordinator);
         CHECK(g_altTabNextCollectAt);
         // The next chord arrives before the first release's queued timer.
         CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
         CHECK(!g_altTabNextCollectAt);
         OnCollectTimer(coordinator, TIMER_ID_COLLECT);
-        CHECK(g_InSnapWindows && g_snapUnhiddenWindows == std::vector<HWND>{preview.h});
+        CHECK(g_InSnapWindows && (g_altTabProxies.size() == 1 && ProxyFor(preview)));
         CHECK(IsWindowVisible(preview));
-        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) == (originalStyle | WS_EX_APPWINDOW));
+        CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
         ExecuteCollectRestore();
         CHECK(!g_InSnapWindows);
         checkSealed();
 
         CHECK(BeginAltTabPreview(coordinator, otherApp, currentDesktop));
-        FinishAltTabPreview(preview, currentDesktop);
+        FinishAltTabPreview(ProxyFor(preview), currentDesktop);
         CHECK(!g_InSnapWindows && IsWindowVisible(preview));
         CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) == originalStyle);
         CHECK(!GetPropW(preview, L"MTU_EXE_TAG") && !GetPropW(preview, L"MTU_VD_TAG"));
@@ -474,23 +406,23 @@ void run(const std::string& name) {
             activeDesktop = deskB;
             return GetCurrentDesktopGuidFromForeground(id, nullptr, readDesktop) && IsEqualGUID(id, deskB);
         };
-        CHECK(!TryUnHideWindowsForAltTab(+[](GUID&) { return false; }));
-        CHECK(TryUnHideWindowsForAltTab(firstDesktop));
+        CHECK(!BeginNativeAltTabProxies(+[](GUID&) { return false; }, nullptr));
+        CHECK(BeginNativeAltTabProxies(firstDesktop, nullptr));
         CHECK(desktopReads == 1);
-        CHECK(TryUnHideWindowsForAltTab(firstDesktop)); // Repeated tabs reuse the preview.
+        CHECK(BeginNativeAltTabProxies(firstDesktop, nullptr)); // Repeated tabs reuse the preview.
         CHECK(desktopReads == 1);
-        CHECK(g_snapUnhiddenWindows.size() == 3);
-        CHECK(!(GetWindowLongPtrW(selected, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
-        CHECK(!(GetWindowLongPtrW(otherProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(g_altTabProxies.size() == 3);
+        CHECK(GetWindowLongPtrW(selected, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(GetWindowLongPtrW(otherProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(invalidProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(oldDesktopName, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(otherDesktop, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
         WinEventProc(nullptr, EVENT_SYSTEM_FOREGROUND, selected, OBJID_WINDOW, CHILDID_SELF, 0, 0);
         CHECK(g_InSnapWindows);
-        FinishAltTabPreview(selected, firstDesktop);
+        FinishAltTabPreview(ProxyFor(selected), firstDesktop);
         CHECK(desktopReads == 2);
-        CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
+        CHECK(!g_InSnapWindows && g_altTabProxies.empty());
         CHECK(IsWindowVisible(selected) && IsWindowVisible(current));
         CHECK(ReadTaggedExe(selected).empty() && !GetPropW(selected, L"MTU_VD_TAG"));
         CHECK(ReadTaggedExe(current).empty() && !GetPropW(current, L"MTU_VD_TAG"));
@@ -499,26 +431,25 @@ void run(const std::string& name) {
         checkSealed(otherDesktop, deskB);
         checkSealed(otherDesktopSibling, deskB);
 
-        CHECK(TryUnHideWindowsForAltTab(secondDesktop));
-        CHECK(g_snapUnhiddenWindows.size() == 2);
+        CHECK(BeginNativeAltTabProxies(secondDesktop, nullptr));
+        CHECK(g_altTabProxies.size() == 2);
         for (HWND h : {otherDesktop.h, otherDesktopSibling.h}) {
-            CHECK(std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), h) !=
-                g_snapUnhiddenWindows.end());
-            CHECK(IsWindowVisible(h) && !(GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+            CHECK(ProxyFor(h));
+            CHECK(IsWindowVisible(h) && (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
         }
-        FinishAltTabPreview(otherDesktop, firstDesktop); // Desktop changed while Alt was held.
+        FinishAltTabPreview(ProxyFor(otherDesktop), firstDesktop); // Desktop changed while Alt was held.
         checkSealed(otherDesktop, deskB);
         checkSealed(otherDesktopSibling, deskB);
 
-        CHECK(TryUnHideWindowsForAltTab(secondDesktop));
+        CHECK(BeginNativeAltTabProxies(secondDesktop, nullptr));
         ExecuteCollectRestore(); // The coordinator invokes this on Escape.
-        CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
+        CHECK(!g_InSnapWindows && g_altTabProxies.empty());
         checkSealed(otherDesktop, deskB);
         checkSealed(otherDesktopSibling, deskB);
 
-        CHECK(TryUnHideWindowsForAltTab(secondDesktop));
-        FinishAltTabPreview(otherDesktop, secondDesktop);
-        CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
+        CHECK(BeginNativeAltTabProxies(secondDesktop, nullptr));
+        FinishAltTabPreview(ProxyFor(otherDesktop), secondDesktop);
+        CHECK(!g_InSnapWindows && g_altTabProxies.empty());
         for (HWND h : {otherDesktop.h, otherDesktopSibling.h}) {
             CHECK(IsWindowVisible(h) && (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_APPWINDOW));
             CHECK(!GetPropW(h, L"MTU_EXE_TAG") && !GetPropW(h, L"MTU_VD_TAG"));
@@ -733,25 +664,48 @@ void run(const std::string& name) {
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     } else if (name == "collect") {
         ShowWindow(w, SW_SHOWNOACTIVATE);
-        ATOM process = GlobalAddAtomW(L"preview-fixture.exe");
-        CHECK(process);
-        CHECK(SetPropW(w, L"MTU_EXE_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(process))));
-        HideWindowAndHideTaskbarIcon(w);
-        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
-        CHECK(IsWindowVisible(w));
-        CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(SealWindow(w, L"preview-fixture.exe", GUID{1}));
+        const auto currentDesktop = +[](GUID& id) { id = GUID{1}; return true; };
+        CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
+        const HWND proxy = ProxyFor(w);
+        CHECK(proxy && proxy != w.h && IsWindowVisible(proxy));
+        CHECK(FindAltTabProxyTarget(proxy) == w.h);
+        CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
+        CHECK(g_altTabProxies.size() == 1 && ProxyFor(w) == proxy);
 
-        g_InSnapWindows = true;
-        g_snapUnhiddenWindows = {w, nullptr};
-        CHECK(TryUnHideWindowsForAltTab());
-        CHECK(g_snapUnhiddenWindows.size() == 2);
+        HDC dc = CreateCompatibleDC(nullptr);
+        CHECK(dc);
+        void* bits = nullptr;
+        const auto info = ProxyBitmapInfo(PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT);
+        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        CHECK(bitmap && bits);
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        CHECK(old && old != HGDI_ERROR);
+        const auto& card = *g_altTabProxies.front();
+        card.frame->width = 2;
+        card.frame->height = 2;
+        card.frame->pixels.assign(4, 0xff224466);
+        PaintAltTabProxy(dc, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, card);
+        GdiFlush();
+        const auto* pixels = static_cast<const DWORD*>(bits);
+        const int side = PROXY_FRAME_HEIGHT / 5;
+        const int margin = side / 6;
+        CHECK((pixels[(PROXY_FRAME_HEIGHT / 2) * PROXY_FRAME_WIDTH + PROXY_FRAME_WIDTH / 2] & 0xffffff) == 0x224466);
+        bool whiteGlyph = false;
+        for (int y = margin; y < margin + side; ++y)
+            for (int x = PROXY_FRAME_WIDTH - margin - side; x < PROXY_FRAME_WIDTH - margin; ++x)
+                whiteGlyph |= (pixels[y * PROXY_FRAME_WIDTH + x] & 0xffffff) == 0xffffff;
+        CHECK(whiteGlyph);
+        SelectObject(dc, old);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
+
         ExecuteCollectRestore();
-        CHECK(g_snapUnhiddenWindows.empty());
-        CHECK(!g_InSnapWindows);
+        CHECK(!IsWindow(proxy) && g_altTabProxies.empty() && !g_InSnapWindows);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(ReadTaggedExe(w) == L"preview-fixture.exe");
-        ExecuteCollectRestore();
-        CHECK(g_snapUnhiddenWindows.empty());
         CHECK(ShowWindowAndShowTaskbarIcon(w));
         CHECK(ReadTaggedExe(w).empty());
     } else if (name == "sealed_preview_icon_roundtrip") {
