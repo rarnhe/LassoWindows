@@ -8,6 +8,7 @@
 #include <shlobj.h>
 #include <propkey.h>
 #include <propvarutil.h>
+#include <oleacc.h>
 #include <filesystem>
 #include <unordered_map>
 #include <iterator>
@@ -23,6 +24,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "oleacc.lib")
 using namespace winrt;
 using namespace Windows::UI::Notifications;
 using namespace Windows::Data::Xml::Dom;
@@ -828,7 +830,6 @@ bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
 }
 
 static void RestoreAllSealedWindows() {
-    RestoreAllPrimaryWindowTransparency();
     for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
         const HWND h = (it++)->first;
         ShowWindowAndShowTaskbarIcon(h);
@@ -1341,14 +1342,16 @@ static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
 // 3. 核心钩子回调函数
 // ============================================================================
 
-// Low-level hooks must never enumerate windows or wait on Shell/DWM.
-// The coordinator thread owns window state; the hook only posts commands.
+// The coordinator owns window state and performs cross-process icon hit testing.
 #define WM_LASSO_HIDE_CURRENT (WM_APP + 11)
 #define WM_LASSO_HIDE_OTHERS  (WM_APP + 12)
 #define WM_LASSO_ALT_TAB      (WM_APP + 13)
 #define WM_LASSO_ALT_UP       (WM_APP + 14)
 #define WM_LASSO_ESCAPE       (WM_APP + 16)
 #define WM_LASSO_TOGGLE_PRIMARY (WM_APP + 17)
+#define WM_LASSO_RESTORE_PRIMARY (WM_APP + 18)
+#define WM_LASSO_PRIMARY_LEFT_CLICK (WM_APP + 19)
+#define WM_LASSO_PRIMARY_RIGHT_CLICK (WM_APP + 20)
 
 LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
@@ -1358,6 +1361,8 @@ LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
     HWND coordinator = g_hLassoCoordinator;
     if (!coordinator) return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+    if (down && !(key->flags & LLKHF_INJECTED))
+        PostMessageW(coordinator, WM_LASSO_RESTORE_PRIMARY, 0, 0);
 
     // Injected Tab is allowed through so the native Alt+Tab UI handles it.
     if (key->vkCode == VK_TAB && (key->flags & LLKHF_ALTDOWN) && down) {
@@ -1492,6 +1497,14 @@ struct PrimaryWindowTransparencyState {
 
 static std::unordered_map<HWND, PrimaryWindowTransparencyState> g_transparentPrimaryWindows;
 
+struct DesktopIconClick {
+    UINT button = 0;
+    POINT point{};
+    DWORD time = 0;
+};
+
+static DesktopIconClick g_lastDesktopIconClick;
+
 static bool SetWindowExtendedStyle(HWND h, LONG_PTR style) {
     SetLastError(ERROR_SUCCESS);
     const LONG_PTR previous = SetWindowLongPtrW(h, GWL_EXSTYLE, style);
@@ -1574,12 +1587,59 @@ static bool RestorePrimaryWindowTransparency(HWND h) {
 }
 
 static void RestoreAllPrimaryWindowTransparency() {
+    g_lastDesktopIconClick = {};
     for (auto it = g_transparentPrimaryWindows.begin();
          it != g_transparentPrimaryWindows.end();) {
         const HWND h = it->first;
         ++it;
         RestorePrimaryWindowTransparency(h);
     }
+}
+
+static bool IsPrimaryDesktopIconAt(POINT point) {
+    if (MonitorFromPoint(point, MONITOR_DEFAULTTONULL) !=
+        MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY)) return false;
+
+    winrt::com_ptr<IAccessible> item;
+    VARIANT child{}, role{};
+    HWND list = nullptr;
+    const bool isItem = SUCCEEDED(AccessibleObjectFromPoint(point, item.put(), &child)) && item &&
+        SUCCEEDED(item->get_accRole(child, &role)) && role.vt == VT_I4 &&
+        role.lVal == ROLE_SYSTEM_LISTITEM &&
+        SUCCEEDED(WindowFromAccessibleObject(item.get(), &list));
+    VariantClear(&role);
+    VariantClear(&child);
+    if (!isItem || !list) return false;
+
+    wchar_t listClass[32]{}, parentClass[32]{}, rootClass[32]{};
+    return GetClassNameW(list, listClass, static_cast<int>(std::size(listClass))) &&
+        wcscmp(listClass, L"SysListView32") == 0 &&
+        GetClassNameW(GetParent(list), parentClass, static_cast<int>(std::size(parentClass))) &&
+        wcscmp(parentClass, L"SHELLDLL_DefView") == 0 &&
+        GetClassNameW(GetAncestor(list, GA_ROOT), rootClass, static_cast<int>(std::size(rootClass))) &&
+        (wcscmp(rootClass, L"Progman") == 0 || wcscmp(rootClass, L"WorkerW") == 0);
+}
+
+static RECT MouseGestureBounds(POINT point, int widthMetric, int heightMetric) {
+    const int width = GetSystemMetrics(widthMetric);
+    const int height = GetSystemMetrics(heightMetric);
+    const LONG left = point.x - width / 2;
+    const LONG top = point.y - height / 2;
+    return RECT{left, top, left + width, top + height};
+}
+
+static void HandlePrimaryDesktopClick(UINT button, POINT point, DWORD time,
+    bool (*isDesktopIconAt)(POINT) = IsPrimaryDesktopIconAt) {
+    if (g_transparentPrimaryWindows.empty()) return;
+    const RECT doubleClickBounds = MouseGestureBounds(g_lastDesktopIconClick.point,
+        SM_CXDOUBLECLK, SM_CYDOUBLECLK);
+    const bool doubleClick = g_lastDesktopIconClick.button == button &&
+        time - g_lastDesktopIconClick.time <= GetDoubleClickTime() && PtInRect(&doubleClickBounds, point);
+    if (doubleClick || !isDesktopIconAt(point)) {
+        RestoreAllPrimaryWindowTransparency();
+        return;
+    }
+    g_lastDesktopIconClick = {button, point, time};
 }
 
 // Keep the original candidate filters: current desktop, visible, not minimized,
@@ -1623,18 +1683,49 @@ static void TogglePrimaryWindows() {
 }
 
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    // Only the hook thread reads the drag state. Ordinary movement posts nothing.
+    static WPARAM pressedButton = 0;
+    static RECT dragBounds{};
     if (nCode == HC_ACTION && wParam == WM_LBUTTONUP && g_showDesktopClickCaptured) {
         g_showDesktopClickCaptured = false;
         return 1;
     }
 
-    if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN && g_hLassoCoordinator) {
+    if (nCode == HC_ACTION && g_hLassoCoordinator) {
+        const HWND coordinator = g_hLassoCoordinator;
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        const HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-        if (primaryTaskbar && IsPointInsideShowDesktopButton(primaryTaskbar, mouse->pt) &&
-            PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0)) {
-            g_showDesktopClickCaptured = true;
-            return 1;
+        switch (wParam) {
+        case WM_LBUTTONDOWN: {
+            const HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+            if (IsPointInsideShowDesktopButton(primaryTaskbar, mouse->pt) &&
+                PostMessageW(coordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0)) {
+                g_showDesktopClickCaptured = true;
+                pressedButton = 0;
+                return 1;
+            }
+            [[fallthrough]];
+        }
+        case WM_RBUTTONDOWN:
+            pressedButton = wParam;
+            dragBounds = MouseGestureBounds(mouse->pt, SM_CXDRAG, SM_CYDRAG);
+            PostMessageW(coordinator, wParam == WM_LBUTTONDOWN ? WM_LASSO_PRIMARY_LEFT_CLICK :
+                WM_LASSO_PRIMARY_RIGHT_CLICK, mouse->pt.x, mouse->pt.y);
+            break;
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+            if ((pressedButton == WM_LBUTTONDOWN && wParam == WM_LBUTTONUP) ||
+                (pressedButton == WM_RBUTTONDOWN && wParam == WM_RBUTTONUP)) pressedButton = 0;
+            break;
+        case WM_MOUSEMOVE:
+            if (!pressedButton || PtInRect(&dragBounds, mouse->pt)) break;
+            [[fallthrough]];
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+        case WM_MBUTTONDOWN:
+        case WM_XBUTTONDOWN:
+            pressedButton = 0;
+            PostMessageW(coordinator, WM_LASSO_RESTORE_PRIMARY, 0, 0);
+            break;
         }
     }
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
@@ -2002,6 +2093,14 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         return 0;
     case WM_LASSO_TOGGLE_PRIMARY:
         TogglePrimaryWindows();
+        return 0;
+    case WM_LASSO_RESTORE_PRIMARY:
+        RestoreAllPrimaryWindowTransparency();
+        return 0;
+    case WM_LASSO_PRIMARY_LEFT_CLICK:
+    case WM_LASSO_PRIMARY_RIGHT_CLICK:
+        HandlePrimaryDesktopClick(msg, POINT{static_cast<LONG>(wp), static_cast<LONG>(lp)},
+            static_cast<DWORD>(GetMessageTime()));
         return 0;
     case WM_TIMER:
         if (wp == TIMER_ID_COLLECT) {

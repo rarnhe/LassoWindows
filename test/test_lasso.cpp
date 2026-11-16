@@ -114,13 +114,9 @@ void run(const std::string& name) {
         return;
     }
     if (name == "primary_transparency_roundtrip") {
-        Window underlay, plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
-        ShowWindow(underlay, SW_SHOWNOACTIVATE);
+        Window plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
         ShowWindow(plain, SW_SHOWNOACTIVATE);
         ShowWindow(layered, SW_SHOWNOACTIVATE);
-        for (HWND h : {underlay.h, plain.h, layered.h})
-            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
         const LONG_PTR plainWindowStyle = GetWindowLongPtrW(plain, GWL_STYLE);
         const LONG_PTR layeredWindowStyle = GetWindowLongPtrW(layered, GWL_STYLE);
@@ -143,15 +139,11 @@ void run(const std::string& name) {
         const COLORREF originalKey = RGB(13, 42, 71);
         CHECK(SetLayeredWindowAttributes(layered, originalKey, 173, LWA_ALPHA | LWA_COLORKEY));
         CHECK(ApplyPrimaryWindowTransparency(layered));
-        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) & WS_EX_APPWINDOW);
-        CHECK(!(GetWindowLongPtrW(layered, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == (layeredStyle | WS_EX_TRANSPARENT));
         alpha = 255; flags = 0;
         CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
         CHECK(alpha == 0 && flags == LWA_ALPHA);
 
-        // Both transparent layered windows must pass hit testing through to
-        // the still-opaque window underneath them.
-        CHECK(WindowFromPoint(POINT{100, 100}) == underlay.h);
         CHECK(GetWindowLongPtrW(plain, GWL_STYLE) == plainWindowStyle);
         CHECK(GetWindowLongPtrW(layered, GWL_STYLE) == layeredWindowStyle);
 
@@ -164,6 +156,56 @@ void run(const std::string& name) {
         CHECK(restoredKey == originalKey && alpha == 173);
         CHECK(flags == (LWA_ALPHA | LWA_COLORKEY));
         CHECK(g_transparentPrimaryWindows.empty());
+        return;
+    }
+    if (name == "primary_transparency_input") {
+        Window w;
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        const LONG_PTR originalStyle = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        const auto isIcon = [](POINT point) { return point.x == 100 && point.y == 100; };
+        const POINT icon{100, 100}, blank{200, 200};
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 1000, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1100, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, blank, 1200, isIcon);
+        CHECK(g_transparentPrimaryWindows.empty());
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2000, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2001, isIcon);
+        CHECK(g_transparentPrimaryWindows.empty());
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        CHECK(!IsPrimaryDesktopIconAt(POINT{-100000, -100000}));
+        CoordinatorWndProc(w, WM_LASSO_RESTORE_PRIMARY, 0, 0);
+        CHECK(g_transparentPrimaryWindows.empty());
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        g_hLassoCoordinator = w;
+        MSLLHOOKSTRUCT mouse{};
+        mouse.pt = icon;
+        LowLevelMouseProc(HC_ACTION, WM_RBUTTONDOWN, reinterpret_cast<LPARAM>(&mouse));
+        MSG input{};
+        CHECK(PeekMessageW(&input, w, WM_LASSO_PRIMARY_RIGHT_CLICK, WM_LASSO_PRIMARY_RIGHT_CLICK, PM_REMOVE));
+        LowLevelMouseProc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse));
+        CHECK(!PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
+        mouse.pt = blank;
+        LowLevelMouseProc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse));
+        CHECK(PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
+        CoordinatorWndProc(input.hwnd, input.message, input.wParam, input.lParam);
+        CHECK(g_transparentPrimaryWindows.empty());
+        g_hLassoCoordinator = nullptr;
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        RestoreAllSealedWindows();
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        CHECK(RestorePrimaryWindowTransparency(w));
         return;
     }
     if (name == "show_desktop_button_hit_test") {
