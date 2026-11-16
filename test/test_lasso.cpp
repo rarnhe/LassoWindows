@@ -126,10 +126,9 @@ void run(const std::string& name) {
         CHECK(ApplyPrimaryWindowTransparency(plain));
         CHECK(ApplyPrimaryWindowTransparency(plain));
         LONG_PTR style = GetWindowLongPtrW(plain, GWL_EXSTYLE);
-        CHECK((style & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) ==
-            (WS_EX_LAYERED | WS_EX_TRANSPARENT));
-        CHECK((style & WS_EX_APPWINDOW) == (plainStyle & WS_EX_APPWINDOW));
-        CHECK(!(style & WS_EX_TOOLWINDOW));
+        // The temporary invisibility path adds only layered + click-through.
+        // In particular it never adds WS_EX_TOOLWINDOW (Task View exclusion).
+        CHECK(style == (plainStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT));
         BYTE alpha = 255; DWORD flags = 0;
         CHECK(GetLayeredWindowAttributes(plain, nullptr, &alpha, &flags));
         CHECK(alpha == 0 && (flags & LWA_ALPHA));
@@ -170,6 +169,9 @@ void run(const std::string& name) {
         CHECK(g_transparentPrimaryWindows.contains(w.h));
         HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1100, isIcon);
         CHECK(g_transparentPrimaryWindows.contains(w.h));
+        // Repeated right-clicks on the same desktop icon remain exceptions.
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1150, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
         HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, blank, 1200, isIcon);
         CHECK(g_transparentPrimaryWindows.empty());
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
@@ -200,11 +202,23 @@ void run(const std::string& name) {
         CHECK(PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
         CoordinatorWndProc(input.hwnd, input.message, input.wParam, input.lParam);
         CHECK(g_transparentPrimaryWindows.empty());
+        // A physical keyboard action is a non-exempt interaction.
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        g_hLassoCoordinator = w;
+        KBDLLHOOKSTRUCT key{};
+        key.vkCode = VK_SPACE;
+        LowLevelKeyProc(HC_ACTION, WM_KEYDOWN, reinterpret_cast<LPARAM>(&key));
+        CHECK(PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
+        CoordinatorWndProc(input.hwnd, input.message, input.wParam, input.lParam);
+        CHECK(g_transparentPrimaryWindows.empty());
         g_hLassoCoordinator = nullptr;
 
+        // The shutdown/shared sealed-window cleanup must not restore this state.
         CHECK(ApplyPrimaryWindowTransparency(w));
         RestoreAllSealedWindows();
         CHECK(g_transparentPrimaryWindows.contains(w.h));
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) ==
+            (originalStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT));
         CHECK(RestorePrimaryWindowTransparency(w));
         return;
     }

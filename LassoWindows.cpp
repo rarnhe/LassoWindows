@@ -830,6 +830,8 @@ bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
 }
 
 static void RestoreAllSealedWindows() {
+    // This shared cleanup path also runs during shutdown. Do not couple it to
+    // temporary primary transparency; only explicit user input restores that state.
     for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
         const HWND h = (it++)->first;
         ShowWindowAndShowTaskbarIcon(h);
@@ -1633,8 +1635,12 @@ static void HandlePrimaryDesktopClick(UINT button, POINT point, DWORD time,
     if (g_transparentPrimaryWindows.empty()) return;
     const RECT doubleClickBounds = MouseGestureBounds(g_lastDesktopIconClick.point,
         SM_CXDOUBLECLK, SM_CYDOUBLECLK);
-    const bool doubleClick = g_lastDesktopIconClick.button == button &&
-        time - g_lastDesktopIconClick.time <= GetDoubleClickTime() && PtInRect(&doubleClickBounds, point);
+    // A right-click is always an allowed desktop-icon operation. Only a
+    // left double-click opens the icon and therefore restores the windows.
+    const bool doubleClick = button == WM_LASSO_PRIMARY_LEFT_CLICK &&
+        g_lastDesktopIconClick.button == WM_LASSO_PRIMARY_LEFT_CLICK &&
+        time - g_lastDesktopIconClick.time <= GetDoubleClickTime() &&
+        PtInRect(&doubleClickBounds, point);
     if (doubleClick || !isDesktopIconAt(point)) {
         RestoreAllPrimaryWindowTransparency();
         return;
