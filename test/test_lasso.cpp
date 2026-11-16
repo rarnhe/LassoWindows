@@ -703,34 +703,54 @@ void run(const std::string& name) {
         HGDIOBJ old = SelectObject(dc, bitmap);
         CHECK(old && old != HGDI_ERROR);
         const auto& card = *g_altTabProxies.front();
-        card.frame->width = 2;
-        card.frame->height = 2;
-        card.frame->pixels.assign(4, 0xff224466);
+        card.frame->width = 8;
+        card.frame->height = 1;
+        card.frame->pixels.assign(8, 0xff224466);
         PaintAltTabProxy(dc, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, card);
         GdiFlush();
         const auto* pixels = static_cast<const DWORD*>(bits);
+        constexpr int imageHeight = PROXY_FRAME_WIDTH / 8;
+        constexpr int imageTop = (PROXY_FRAME_HEIGHT - imageHeight) / 2;
+        constexpr int imageBottom = imageTop + imageHeight;
+        const auto rendered = std::vector<DWORD>(pixels, pixels +
+            static_cast<size_t>(PROXY_FRAME_WIDTH) * PROXY_FRAME_HEIGHT);
+
+        // The same glyph height yields the same centered pixels in a narrower box.
+        PatBlt(dc, 0, 0, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, WHITENESS);
+        constexpr int inset = 120;
+        DrawPreviewWeb(dc, RECT{inset, imageTop, PROXY_FRAME_WIDTH - inset, imageBottom});
+        GdiFlush();
         RECT web{PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, 0, 0};
         size_t blackPixels = 0;
         size_t backgroundPixels = 0;
-        const LONG left = (PROXY_FRAME_WIDTH - PROXY_FRAME_HEIGHT) / 2;
-        const LONG right = left + PROXY_FRAME_HEIGHT;
         for (LONG y = 0; y < PROXY_FRAME_HEIGHT; ++y) {
-            for (LONG x = left; x < right; ++x) {
-                const auto pixel = pixels[y * PROXY_FRAME_WIDTH + x] & 0xffffff;
+            for (LONG x = 0; x < PROXY_FRAME_WIDTH; ++x) {
+                const auto index = y * PROXY_FRAME_WIDTH + x;
+                const auto pixel = rendered[index] & 0xffffff;
+                const auto narrowPixel = pixels[index] & 0xffffff;
+                if (y < imageTop || y >= imageBottom) {
+                    CHECK(pixel == 0x000000);
+                    CHECK(narrowPixel == 0xffffff);
+                    continue;
+                }
                 if (pixel == 0x000000) ++blackPixels;
                 if (pixel == 0x224466) ++backgroundPixels;
-                if (pixel != 0x224466) {
+                else {
                     web.left = (std::min)(web.left, x);
                     web.top = (std::min)(web.top, y);
                     web.right = (std::max)(web.right, x + 1);
                     web.bottom = (std::max)(web.bottom, y + 1);
                 }
+                if (x >= inset && x < PROXY_FRAME_WIDTH - inset) {
+                    if (narrowPixel == 0x000000) CHECK(pixel == 0x000000);
+                    if (narrowPixel == 0xffffff) CHECK(pixel == 0x224466);
+                }
             }
         }
-        CHECK(blackPixels > 200 && backgroundPixels > 1000);
-        CHECK(web.top <= 2 && web.bottom >= PROXY_FRAME_HEIGHT - 2);
-        CHECK(web.left <= left + 2 && web.right >= right - 2);
-        CHECK((pixels[10 * PROXY_FRAME_WIDTH + 400] & 0xffffff) == 0);
+        CHECK(blackPixels > 100 && backgroundPixels > 1000);
+        CHECK(web.top <= imageTop + 1 && web.bottom >= imageBottom - 1);
+        CHECK(web.left > inset && web.right < PROXY_FRAME_WIDTH - inset);
+        CHECK(abs(web.left + web.right - PROXY_FRAME_WIDTH) <= 3);
         SelectObject(dc, old);
         DeleteObject(bitmap);
         DeleteDC(dc);
