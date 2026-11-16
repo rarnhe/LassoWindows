@@ -114,11 +114,16 @@ void run(const std::string& name) {
         return;
     }
     if (name == "primary_transparency_roundtrip") {
-        Window plain;
-        Window layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
+        Window underlay, plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
+        ShowWindow(underlay, SW_SHOWNOACTIVATE);
         ShowWindow(plain, SW_SHOWNOACTIVATE);
         ShowWindow(layered, SW_SHOWNOACTIVATE);
+        for (HWND h : {underlay.h, plain.h, layered.h})
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
+        const LONG_PTR plainWindowStyle = GetWindowLongPtrW(plain, GWL_STYLE);
+        const LONG_PTR layeredWindowStyle = GetWindowLongPtrW(layered, GWL_STYLE);
         const LONG_PTR plainStyle = GetWindowLongPtrW(plain, GWL_EXSTYLE);
         CHECK(plainStyle & WS_EX_APPWINDOW);
         CHECK(!(plainStyle & WS_EX_TOOLWINDOW));
@@ -143,6 +148,12 @@ void run(const std::string& name) {
         alpha = 255; flags = 0;
         CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
         CHECK(alpha == 0 && flags == LWA_ALPHA);
+
+        // Both transparent layered windows must pass hit testing through to
+        // the still-opaque window underneath them.
+        CHECK(WindowFromPoint(POINT{100, 100}) == underlay.h);
+        CHECK(GetWindowLongPtrW(plain, GWL_STYLE) == plainWindowStyle);
+        CHECK(GetWindowLongPtrW(layered, GWL_STYLE) == layeredWindowStyle);
 
         CHECK(RestorePrimaryWindowTransparency(plain));
         CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
