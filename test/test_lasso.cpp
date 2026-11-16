@@ -6,10 +6,11 @@
 
 struct Window {
     HWND h;
-    explicit Window(DWORD ex = WS_EX_APPWINDOW, HWND parent = nullptr, const wchar_t* windowClass = L"STATIC") {
+    explicit Window(DWORD ex = WS_EX_APPWINDOW, HWND parent = nullptr, const wchar_t* windowClass = L"STATIC",
+        int x = 50, int y = 50, int width = 240, int height = 160, DWORD styleOverride = 0) {
         h = CreateWindowExW(ex, windowClass, L"Lasso fixture",
-            parent ? WS_CHILD : WS_OVERLAPPEDWINDOW, 50, 50, 240, 160,
-            parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+            styleOverride ? styleOverride : (parent ? WS_CHILD : WS_OVERLAPPEDWINDOW),
+            x, y, width, height, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
         CHECK(h);
     }
     ~Window() { DestroyWindow(h); }
@@ -30,6 +31,28 @@ struct Ini {
     }
     ~Ini() { std::error_code ec; std::filesystem::remove(path, ec); }
 };
+
+static std::unordered_map<HWND, GUID> g_testWindowDesktopIds;
+static UINT g_testDesktopReadCount = 0;
+
+static bool ReadTestWindowDesktop(HWND h, GUID& desktop, bool requireCurrent) {
+    if (requireCurrent) return false;
+    const auto it = g_testWindowDesktopIds.find(h);
+    if (it == g_testWindowDesktopIds.end()) return false;
+    ++g_testDesktopReadCount;
+    desktop = it->second;
+    return true;
+}
+
+static void RegisterFixtureClass(const wchar_t* name) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = name;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        throw std::runtime_error("RegisterClassW failed");
+}
+
 void iniTest(const std::string& name) {
     Ini ini;
     std::wstring expected;
@@ -50,65 +73,182 @@ void iniTest(const std::string& name) {
 }
 void run(const std::string& name) {
     if (name.rfind("ini_", 0) == 0) { iniTest(name); return; }
-    if (name == "uwp_shell_switcher_state") {
-        struct SwitcherView {
-            int shown = 1;
-            int writes = 0;
-            bool ignoreWrite = false;
-            bool failReadAfterWrite = false;
-            bool readFails = false;
+    if (name == "hide_others_all_desktops") {
+        RegisterFixtureClass(L"ApplicationFrameWindow");
+        Window desktopA, desktopB, uwpA(WS_EX_APPWINDOW, nullptr, L"ApplicationFrameWindow"),
+            uwpB(WS_EX_APPWINDOW, nullptr, L"ApplicationFrameWindow"), sameApp;
+        for (HWND h : {desktopA.h, desktopB.h, uwpA.h, uwpB.h, sameApp.h})
+            ShowWindow(h, SW_SHOWNOACTIVATE);
 
-            HRESULT GetShowInSwitchers(int* result) const {
-                if (readFails) return E_FAIL;
-                *result = shown;
-                return S_OK;
-            }
-            HRESULT SetShowInSwitchers(int requested) {
-                ++writes;
-                if (!ignoreWrite) shown = requested;
-                readFails = failReadAfterWrite;
-                return S_OK;
-            }
-        };
-        Window frame;
-        SwitcherView view;
-        const auto property = uwp_taskbar::PROP_RESTORE_SWITCHER;
-        using uwp_taskbar::SetSwitcherVisibility;
-        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, false, view)));
-        CHECK(view.shown == 0 && view.writes == 1 && GetPropW(frame, property));
-        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, false, view)));
-        CHECK(view.writes == 1);
+        static constexpr GUID deskA{0x17fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xf9}};
+        static constexpr GUID deskB{0x17fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xfa}};
+        g_testWindowDesktopIds[desktopA.h] = deskA;
+        g_testWindowDesktopIds[desktopB.h] = deskB;
+        g_testDesktopReadCount = 0;
 
-        view.ignoreWrite = true;
-        CHECK(FAILED(SetSwitcherVisibility(frame, true, view)));
-        CHECK(view.shown == 0 && GetPropW(frame, property));
+        CloseFilter filter;
+        filter.currentAppProcName = L"active-app.exe";
+        filter.readDesktop = ReadTestWindowDesktop;
+        CHECK(EnumHideOthersProc(desktopA, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(EnumHideOthersProc(desktopB, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(g_testDesktopReadCount == 2);
+        GUID actualA{}, actualB{};
+        CHECK(ReadTaggedDesktopGuid(desktopA, actualA) && IsEqualGUID(actualA, deskA));
+        CHECK(ReadTaggedDesktopGuid(desktopB, actualB) && IsEqualGUID(actualB, deskB));
+        CHECK(ReadTaggedExe(desktopA) == GetRealProcessName(desktopA));
+        CHECK(ReadTaggedExe(desktopB) == GetRealProcessName(desktopB));
 
-        view.ignoreWrite = false;
-        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, true, view)));
-        CHECK(view.shown == 1 && !GetPropW(frame, property));
+        CHECK(EnumHideOthersProc(uwpA, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(EnumHideOthersProc(uwpB, reinterpret_cast<LPARAM>(&filter)));
+        MSG messageA{}, messageB{};
+        CHECK(PeekMessageW(&messageA, uwpA, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+        CHECK(PeekMessageW(&messageB, uwpB, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+        CHECK(messageA.hwnd == uwpA.h && messageB.hwnd == uwpB.h);
 
-        view.ignoreWrite = true;
-        CHECK(FAILED(SetSwitcherVisibility(frame, false, view)));
-        CHECK(view.shown == 1 && !GetPropW(frame, property));
+        filter.currentAppProcName = GetRealProcessName(sameApp);
+        CHECK(EnumHideOthersProc(sameApp, reinterpret_cast<LPARAM>(&filter)));
+        CHECK(!g_sealedWindowStates.contains(sameApp.h));
 
-        view.shown = 0; // The Shell view was already excluded independently.
-        const int writes = view.writes;
-        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, false, view)));
-        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, true, view)));
-        CHECK(view.shown == 0 && view.writes == writes && !GetPropW(frame, property));
-
-        view.shown = 1;
-        view.ignoreWrite = false;
-        view.failReadAfterWrite = true;
-        CHECK(FAILED(SetSwitcherVisibility(frame, false, view)));
-        CHECK(view.shown == 0 && GetPropW(frame, property));
-        view.failReadAfterWrite = false;
-        view.readFails = false;
-        CHECK(SUCCEEDED(SetSwitcherVisibility(frame, true, view)));
-        CHECK(view.shown == 1 && !GetPropW(frame, property));
+        RestoreAllSealedWindows();
+        g_testWindowDesktopIds.clear();
         return;
     }
-    if (name == "uwp_frame_close" || name == "uwp_frame_recovery") {
+    if (name == "primary_transparency_roundtrip") {
+        Window plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
+        ShowWindow(plain, SW_SHOWNOACTIVATE);
+        ShowWindow(layered, SW_SHOWNOACTIVATE);
+
+        const LONG_PTR plainWindowStyle = GetWindowLongPtrW(plain, GWL_STYLE);
+        const LONG_PTR layeredWindowStyle = GetWindowLongPtrW(layered, GWL_STYLE);
+        const LONG_PTR plainStyle = GetWindowLongPtrW(plain, GWL_EXSTYLE);
+        CHECK(plainStyle & WS_EX_APPWINDOW);
+        CHECK(!(plainStyle & WS_EX_TOOLWINDOW));
+        CHECK(ApplyPrimaryWindowTransparency(plain));
+        CHECK(ApplyPrimaryWindowTransparency(plain));
+        LONG_PTR style = GetWindowLongPtrW(plain, GWL_EXSTYLE);
+        // The temporary invisibility path adds only layered + click-through.
+        // In particular it never adds WS_EX_TOOLWINDOW (Task View exclusion).
+        CHECK(style == (plainStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT));
+        BYTE alpha = 255; DWORD flags = 0;
+        CHECK(GetLayeredWindowAttributes(plain, nullptr, &alpha, &flags));
+        CHECK(alpha == 0 && (flags & LWA_ALPHA));
+        CHECK(IsWindowVisible(plain) && !IsIconic(plain));
+
+        const LONG_PTR layeredStyle = GetWindowLongPtrW(layered, GWL_EXSTYLE);
+        const COLORREF originalKey = RGB(13, 42, 71);
+        CHECK(SetLayeredWindowAttributes(layered, originalKey, 173, LWA_ALPHA | LWA_COLORKEY));
+        CHECK(ApplyPrimaryWindowTransparency(layered));
+        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == (layeredStyle | WS_EX_TRANSPARENT));
+        alpha = 255; flags = 0;
+        CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
+        CHECK(alpha == 0 && flags == LWA_ALPHA);
+
+        CHECK(GetWindowLongPtrW(plain, GWL_STYLE) == plainWindowStyle);
+        CHECK(GetWindowLongPtrW(layered, GWL_STYLE) == layeredWindowStyle);
+
+        CHECK(RestorePrimaryWindowTransparency(plain));
+        CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
+        CHECK(RestorePrimaryWindowTransparency(layered));
+        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
+        COLORREF restoredKey{}; alpha = 0; flags = 0;
+        CHECK(GetLayeredWindowAttributes(layered, &restoredKey, &alpha, &flags));
+        CHECK(restoredKey == originalKey && alpha == 173);
+        CHECK(flags == (LWA_ALPHA | LWA_COLORKEY));
+        CHECK(g_transparentPrimaryWindows.empty());
+        return;
+    }
+    if (name == "primary_transparency_input") {
+        Window w;
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        const LONG_PTR originalStyle = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        const auto isIcon = [](POINT point) { return point.x == 100 && point.y == 100; };
+        const POINT icon{100, 100}, blank{200, 200};
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 1000, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1100, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        // Repeated right-clicks on the same desktop icon remain exceptions.
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_RIGHT_CLICK, icon, 1150, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, blank, 1200, isIcon);
+        CHECK(g_transparentPrimaryWindows.empty());
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2000, isIcon);
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        HandlePrimaryDesktopClick(WM_LASSO_PRIMARY_LEFT_CLICK, icon, 2001, isIcon);
+        CHECK(g_transparentPrimaryWindows.empty());
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        CHECK(!IsPrimaryDesktopIconAt(POINT{-100000, -100000}));
+        CoordinatorWndProc(w, WM_LASSO_RESTORE_PRIMARY, 0, 0);
+        CHECK(g_transparentPrimaryWindows.empty());
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == originalStyle);
+
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        g_hLassoCoordinator = w;
+        MSLLHOOKSTRUCT mouse{};
+        mouse.pt = icon;
+        LowLevelMouseProc(HC_ACTION, WM_RBUTTONDOWN, reinterpret_cast<LPARAM>(&mouse));
+        MSG input{};
+        CHECK(PeekMessageW(&input, w, WM_LASSO_PRIMARY_RIGHT_CLICK, WM_LASSO_PRIMARY_RIGHT_CLICK, PM_REMOVE));
+        LowLevelMouseProc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse));
+        CHECK(!PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
+        mouse.pt = blank;
+        LowLevelMouseProc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse));
+        CHECK(PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
+        CoordinatorWndProc(input.hwnd, input.message, input.wParam, input.lParam);
+        CHECK(g_transparentPrimaryWindows.empty());
+        // A physical keyboard action is a non-exempt interaction.
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        g_hLassoCoordinator = w;
+        KBDLLHOOKSTRUCT key{};
+        key.vkCode = VK_SPACE;
+        LowLevelKeyProc(HC_ACTION, WM_KEYDOWN, reinterpret_cast<LPARAM>(&key));
+        CHECK(PeekMessageW(&input, w, WM_LASSO_RESTORE_PRIMARY, WM_LASSO_RESTORE_PRIMARY, PM_REMOVE));
+        CoordinatorWndProc(input.hwnd, input.message, input.wParam, input.lParam);
+        CHECK(g_transparentPrimaryWindows.empty());
+        g_hLassoCoordinator = nullptr;
+
+        // The shutdown/shared sealed-window cleanup must not restore this state.
+        CHECK(ApplyPrimaryWindowTransparency(w));
+        RestoreAllSealedWindows();
+        CHECK(g_transparentPrimaryWindows.contains(w.h));
+        CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) ==
+            (originalStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT));
+        CHECK(RestorePrimaryWindowTransparency(w));
+        return;
+    }
+    if (name == "show_desktop_button_hit_test") {
+        RegisterFixtureClass(L"Shell_TrayWnd");
+        RegisterFixtureClass(L"TrayNotifyWnd");
+        RegisterFixtureClass(L"TrayClockWClass");
+        RegisterFixtureClass(L"TrayShowDesktopButtonWClass");
+        Window tray(0, nullptr, L"Shell_TrayWnd", 100, 100, 1000, 40, WS_POPUP);
+        Window notify(0, tray, L"TrayNotifyWnd", 850, 0, 150, 40);
+        Window clock(0, notify, L"TrayClockWClass", 0, 0, 135, 40);
+        Window button(0, notify, L"TrayShowDesktopButtonWClass", 140, 0, 10, 40);
+        for (HWND h : {tray.h, notify.h, clock.h, button.h})
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+
+        CHECK(FindShowDesktopButton(tray) == button.h);
+        RECT buttonRect{}, clockRect{}, trayRect{};
+        CHECK(GetWindowRect(button, &buttonRect));
+        CHECK(GetWindowRect(clock, &clockRect));
+        CHECK(GetWindowRect(tray, &trayRect));
+        CHECK(buttonRect.left == 1090 && buttonRect.right == 1100);
+        const POINT clockPoint{trayRect.right - 25, 120};
+        CHECK(PtInRect(&clockRect, clockPoint));
+        CHECK(clockPoint.x >= trayRect.right - 30);
+        CHECK(!IsPointInsideShowDesktopButton(tray, clockPoint));
+        CHECK(IsPointInsideShowDesktopButton(tray, POINT{1095, 120}));
+        CHECK(!IsPointInsideShowDesktopButton(tray, POINT{1100, 120}));
+        return;
+    }
+    if (name == "uwp_frame_close") {
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
         wc.hInstance = GetModuleHandleW(nullptr);
@@ -116,34 +256,89 @@ void run(const std::string& name) {
         CHECK(RegisterClassW(&wc));
         Window frame(WS_EX_APPWINDOW, nullptr, wc.lpszClassName);
         ShowWindow(frame, SW_SHOWNOACTIVATE);
+        Window ordinary;
+        CHECK(!RequestHostedUwpClose(ordinary));
+        CHECK(!g_sealedWindowStates.contains(frame.h));
+        CHECK(RequestHostedUwpClose(frame));
+        CHECK(IsWindow(frame)); // PostMessage queues the request.
+        MSG message{};
+        CHECK(PeekMessageW(&message, frame, WM_CLOSE, WM_CLOSE, PM_REMOVE));
+        CHECK(message.hwnd == frame.h && message.wParam == 0 && message.lParam == 0);
+        DispatchMessageW(&message);
+        CHECK(!IsWindow(frame));
+        CHECK(!g_sealedWindowStates.contains(frame.h));
+        return;
+    }
+    if (name == "exe_tag_atom") {
+        Window tagged;
+        static constexpr GUID desktop{0x4fd230e8, 0x260c, 0x4fa9, {0x92, 0x34, 0x15, 0x11, 0x55, 0xa7, 0xb7, 0x39}};
+        wchar_t desktopText[40]{};
+        CHECK(StringFromGUID2(desktop, desktopText, static_cast<int>(std::size(desktopText))));
+        CHECK(SetSealTag(tagged, L"MTU_EXE_TAG", L"notepad.exe"));
+        CHECK(SetSealTag(tagged, L"MTU_VD_TAG", desktopText));
+        CHECK(ReadTaggedExe(tagged) == L"notepad.exe");
+        GUID actual{};
+        CHECK(ReadTaggedDesktopGuid(tagged, actual) && IsEqualGUID(actual, desktop));
+        CHECK(GetPropW(tagged, L"MTU_EXE_TAG") && GetPropW(tagged, L"MTU_VD_TAG"));
+        ClearSealMarkers(tagged);
+        CHECK(!GetPropW(tagged, L"MTU_EXE_TAG") && !GetPropW(tagged, L"MTU_VD_TAG"));
+        CHECK(ReadTaggedExe(tagged).empty());
+        return;
+    }
+    if (name == "alt_tab_after_desktop_switch") {
+        Window desktopA, desktopB, desktopBSibling, coordinator;
+        static constexpr GUID deskA{0x83fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xf9}};
+        static constexpr GUID deskB{0x83fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xfa}};
+        for (HWND h : {desktopA.h, desktopB.h, desktopBSibling.h})
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+        CHECK(SealWindow(desktopA, L"shared-fixture.exe", deskA));
+        CHECK(SealWindow(desktopB, L"shared-fixture.exe", deskB));
+        CHECK(SealWindow(desktopBSibling, L"shared-fixture.exe", deskB));
+        CHECK(TaggedDesktopMatches(desktopA, deskA));
+        CHECK(TaggedDesktopMatches(desktopB, deskB));
+        CHECK(TaggedDesktopMatches(desktopBSibling, deskB));
 
-        if (name == "uwp_frame_close") {
-            Window ordinary;
-            CHECK(!RequestHostedUwpClose(ordinary));
-            CHECK(!g_sealedWindowStates.contains(frame.h));
-            CHECK(RequestHostedUwpClose(frame));
-            CHECK(IsWindow(frame)); // PostMessage queues the request.
-            MSG message{};
-            CHECK(PeekMessageW(&message, frame, WM_CLOSE, WM_CLOSE, PM_REMOVE));
-            CHECK(message.hwnd == frame.h && message.wParam == 0 && message.lParam == 0);
-            DispatchMessageW(&message);
-            CHECK(!IsWindow(frame));
-            CHECK(!g_sealedWindowStates.contains(frame.h));
-            return;
+        // Simulate the case where all same-EXE windows are sealed and the
+        // foreground is the Shell: VDM cannot identify a current sealed HWND.
+        static const auto readDesktop = +[](HWND, GUID&, bool) { return false; };
+        static const auto readRegistry = +[](const wchar_t* key, const wchar_t* value, GUID& id) {
+            if (wcscmp(value, L"CurrentVirtualDesktop") != 0) return false;
+            if (wcsstr(key, L"SessionInfo\\77\\VirtualDesktops")) {
+                id = deskB;
+                return true;
+            }
+            if (_wcsicmp(key, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops") == 0) {
+                id = deskA; // Stale unscoped value from the desktop we left.
+                return true;
+            }
+            return false;
+        };
+        auto currentDesktop = +[](GUID& id) {
+            return GetCurrentDesktopGuidFromForeground(id, nullptr, readDesktop, readRegistry, 77);
+        };
+        GUID resolved{};
+        CHECK(currentDesktop(resolved) && IsEqualGUID(resolved, deskB));
+
+        g_hLassoCoordinator = coordinator;
+        CHECK(BeginAltTabPreview(coordinator, nullptr, currentDesktop));
+        CHECK(g_snapUnhiddenWindows.size() == 2);
+        CHECK(std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), desktopB.h) != g_snapUnhiddenWindows.end());
+        CHECK(std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), desktopBSibling.h) != g_snapUnhiddenWindows.end());
+        CHECK(std::find(g_snapUnhiddenWindows.begin(), g_snapUnhiddenWindows.end(), desktopA.h) == g_snapUnhiddenWindows.end());
+        CHECK(GetWindowLongPtrW(desktopA, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+        CHECK(!(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
+
+        FinishAltTabPreview(desktopB, currentDesktop);
+        CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
+        CHECK(GetPropW(desktopA, L"MTU_EXE_TAG") && GetPropW(desktopA, L"MTU_VD_TAG"));
+        CHECK(g_sealedWindowStates.contains(desktopA.h));
+        for (HWND h : {desktopB.h, desktopBSibling.h}) {
+            CHECK(!GetPropW(h, L"MTU_EXE_TAG") && !GetPropW(h, L"MTU_VD_TAG"));
+            CHECK(!g_sealedWindowStates.contains(h));
+            CHECK(IsWindowVisible(h));
         }
-
-        // A frame left cloaked by a previous Lasso version remains recoverable.
-        CHECK(SetDwmCloak(frame, TRUE));
-        CHECK(SetPropW(frame, PROP_UWP_DWM_CLOAK, reinterpret_cast<HANDLE>(UINT_PTR{1})));
-        const ATOM proc = GlobalAddAtomW(L"uwp-fixture.exe");
-        CHECK(proc);
-        CHECK(SetPropW(frame, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(proc))));
-        RecoverApplicationFrameState();
-        DWORD cloak = 0;
-        CHECK(SUCCEEDED(DwmGetWindowAttribute(frame, DWMWA_CLOAKED, &cloak, sizeof(cloak))));
-        CHECK(!(cloak & DWM_CLOAKED_APP));
-        CHECK(!GetPropW(frame, PROP_UWP_DWM_CLOAK));
-        CHECK(!GetPropW(frame, L"MTU_PROC_TAG"));
+        g_hLassoCoordinator = nullptr;
+        RestoreAllSealedWindows();
         return;
     }
     if (name == "alt_tab_consecutive_previews") {
@@ -154,15 +349,15 @@ void run(const std::string& name) {
         ShowWindow(otherApp, SW_SHOWNOACTIVATE);
         const GUID desktop{1};
         CHECK(SealWindow(preview, L"sealed-fixture.exe", desktop));
-        const HANDLE procTag = GetPropW(preview, L"MTU_PROC_TAG");
+        const HANDLE procTag = GetPropW(preview, L"MTU_EXE_TAG");
         const HANDLE desktopTag = GetPropW(preview, L"MTU_VD_TAG");
         CHECK(procTag && desktopTag);
         auto currentDesktop = +[](GUID& id) { id = GUID{1}; return true; };
         g_hLassoCoordinator = coordinator;
         auto checkSealed = [&] {
-            CHECK(GetPropW(preview, L"MTU_PROC_TAG") == procTag);
+            CHECK(GetPropW(preview, L"MTU_EXE_TAG") == procTag);
             CHECK(GetPropW(preview, L"MTU_VD_TAG") == desktopTag);
-            CHECK(ReadTaggedProcess(preview) == L"sealed-fixture.exe");
+            CHECK(ReadTaggedExe(preview) == L"sealed-fixture.exe");
             CHECK(TaggedDesktopMatches(preview, desktop));
             CHECK(g_sealedWindowStates.contains(preview.h));
             CHECK(IsWindowVisible(preview));
@@ -201,7 +396,7 @@ void run(const std::string& name) {
         FinishAltTabPreview(preview, currentDesktop);
         CHECK(!g_InSnapWindows && IsWindowVisible(preview));
         CHECK(GetWindowLongPtrW(preview, GWL_EXSTYLE) == originalStyle);
-        CHECK(!GetPropW(preview, L"MTU_PROC_TAG") && !GetPropW(preview, L"MTU_VD_TAG"));
+        CHECK(!GetPropW(preview, L"MTU_EXE_TAG") && !GetPropW(preview, L"MTU_VD_TAG"));
         CHECK(!g_sealedWindowStates.contains(preview.h));
         g_hLassoCoordinator = nullptr;
         return;
@@ -230,7 +425,7 @@ void run(const std::string& name) {
             return readDesktop(h, desktop, true);
         });
         auto checkSealed = [&](HWND h, REFGUID desktop) {
-            CHECK(ReadTaggedProcess(h) == process && TaggedDesktopMatches(h, desktop));
+            CHECK(ReadTaggedExe(h) == process && TaggedDesktopMatches(h, desktop));
             CHECK(GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
             BYTE alpha = 255;
             DWORD flags = 0;
@@ -242,7 +437,7 @@ void run(const std::string& name) {
         checkSealed(otherDesktop, deskB);
         checkSealed(otherDesktopSibling, deskB);
         for (HWND h : {inactive.h, unknownDesktop.h})
-            CHECK(!GetPropW(h, L"MTU_PROC_TAG") && !GetPropW(h, L"MTU_VD_TAG"));
+            CHECK(!GetPropW(h, L"MTU_EXE_TAG") && !GetPropW(h, L"MTU_VD_TAG"));
 
         Window otherProcess, invalidProcess, oldDesktopName;
         for (HWND h : {otherProcess.h, invalidProcess.h, oldDesktopName.h})
@@ -250,7 +445,7 @@ void run(const std::string& name) {
         CHECK(SealWindow(otherProcess, L"other-fixture.exe", deskA));
         CHECK(SealWindow(invalidProcess, L"invalid-fixture.exe", deskA));
         CHECK(SealWindow(oldDesktopName, L"legacy-fixture.exe", deskA));
-        CHECK(SetSealTag(invalidProcess, L"MTU_PROC_TAG", L"Unknown"));
+        CHECK(SetSealTag(invalidProcess, L"MTU_EXE_TAG", L"Unknown"));
         CHECK(SetSealTag(oldDesktopName, L"MTU_VD_TAG", L"Fixture desktop name"));
         static int desktopReads = 0;
         auto firstDesktop = +[](GUID& id) {
@@ -280,8 +475,8 @@ void run(const std::string& name) {
         CHECK(desktopReads == 2);
         CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
         CHECK(IsWindowVisible(selected) && IsWindowVisible(current));
-        CHECK(ReadTaggedProcess(selected).empty() && !GetPropW(selected, L"MTU_VD_TAG"));
-        CHECK(ReadTaggedProcess(current).empty() && !GetPropW(current, L"MTU_VD_TAG"));
+        CHECK(ReadTaggedExe(selected).empty() && !GetPropW(selected, L"MTU_VD_TAG"));
+        CHECK(ReadTaggedExe(current).empty() && !GetPropW(current, L"MTU_VD_TAG"));
         CHECK(GetWindowLongPtrW(otherProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(TaggedDesktopMatches(otherProcess, deskA));
         checkSealed(otherDesktop, deskB);
@@ -309,7 +504,7 @@ void run(const std::string& name) {
         CHECK(!g_InSnapWindows && g_snapUnhiddenWindows.empty());
         for (HWND h : {otherDesktop.h, otherDesktopSibling.h}) {
             CHECK(IsWindowVisible(h) && (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_APPWINDOW));
-            CHECK(!GetPropW(h, L"MTU_PROC_TAG") && !GetPropW(h, L"MTU_VD_TAG"));
+            CHECK(!GetPropW(h, L"MTU_EXE_TAG") && !GetPropW(h, L"MTU_VD_TAG"));
             CHECK(!g_sealedWindowStates.contains(h));
         }
         CHECK(TaggedDesktopMatches(otherProcess, deskA));
@@ -331,7 +526,7 @@ void run(const std::string& name) {
         CHECK(!filter.process.empty() && filter.process != L"Unknown");
         CHECK(EnumHideWindowsProc(frame, reinterpret_cast<LPARAM>(&filter)));
         CHECK(IsWindowVisible(frame) && !g_sealedWindowStates.contains(frame.h));
-        CHECK(!GetPropW(frame, L"MTU_PROC_TAG") && !GetPropW(frame, L"MTU_VD_TAG"));
+        CHECK(!GetPropW(frame, L"MTU_EXE_TAG") && !GetPropW(frame, L"MTU_VD_TAG"));
         MSG message{};
         CHECK(PeekMessageW(&message, frame, WM_CLOSE, WM_CLOSE, PM_REMOVE));
         DispatchMessageW(&message);
@@ -506,7 +701,7 @@ void run(const std::string& name) {
         ShowWindowAndShowTaskbarIcon(w);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) == original);
     } else if (name == "suppress") {
-        CHECK(SetPropW(w, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(1)));
+        CHECK(SetPropW(w, L"MTU_EXE_TAG", reinterpret_cast<HANDLE>(1)));
         g_InSnapWindows = true;
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
@@ -516,14 +711,14 @@ void run(const std::string& name) {
         // Process tag alone must NOT override virtual desktop isolation.
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
-        RemovePropW(w, L"MTU_PROC_TAG");
+        RemovePropW(w, L"MTU_EXE_TAG");
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     } else if (name == "collect") {
         ShowWindow(w, SW_SHOWNOACTIVATE);
         ATOM process = GlobalAddAtomW(L"preview-fixture.exe");
         CHECK(process);
-        CHECK(SetPropW(w, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(process))));
+        CHECK(SetPropW(w, L"MTU_EXE_TAG", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(process))));
         HideWindowAndHideTaskbarIcon(w);
         CHECK(ShowWindowAndShowTaskbarIcon(w, true));
         CHECK(IsWindowVisible(w));
@@ -537,11 +732,77 @@ void run(const std::string& name) {
         CHECK(g_snapUnhiddenWindows.empty());
         CHECK(!g_InSnapWindows);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
-        CHECK(ReadTaggedProcess(w) == L"preview-fixture.exe");
+        CHECK(ReadTaggedExe(w) == L"preview-fixture.exe");
         ExecuteCollectRestore();
         CHECK(g_snapUnhiddenWindows.empty());
         CHECK(ShowWindowAndShowTaskbarIcon(w));
-        CHECK(ReadTaggedProcess(w).empty());
+        CHECK(ReadTaggedExe(w).empty());
+    } else if (name == "sealed_preview_icon_roundtrip") {
+        RegisterFixtureClass(L"SealedPreviewIconFixture");
+        Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        HICON originalBig = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        HICON originalSmall = LoadIconW(nullptr, MAKEINTRESOURCEW(32516));
+        CHECK(originalBig && originalSmall);
+        SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(originalBig));
+        SendMessageW(w, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(originalSmall));
+
+        CHECK(SetWindowSealedIcon(w));
+        HICON previewBig = reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0));
+        HICON previewSmall = reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0));
+        CHECK(previewBig && previewBig != originalBig);
+        CHECK(previewSmall && previewSmall != originalSmall);
+        CHECK(g_sealedPreviewIcons.contains(w.h));
+        CHECK(SetWindowSealedIcon(w)); // Repeated preview must not stack another web.
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == previewBig);
+
+        RestoreWindowSealedIcon(w);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
+    } else if (name == "preview_icon_selection_restore") {
+        RegisterFixtureClass(L"SealedPreviewIconFixture");
+        Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        HICON originalBig = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        HICON originalSmall = LoadIconW(nullptr, MAKEINTRESOURCEW(32516));
+        CHECK(originalBig && originalSmall);
+        SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(originalBig));
+        SendMessageW(w, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(originalSmall));
+
+        CHECK(HideWindowAndHideTaskbarIcon(w));
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        HICON previewBig = reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0));
+        CHECK(previewBig && previewBig != originalBig);
+        CHECK(ShowWindowAndShowTaskbarIcon(w)); // Alt release selects this window.
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
+        CHECK(!g_sealedWindowStates.contains(w.h));
+    } else if (name == "preview_icon_reseal_restore") {
+        RegisterFixtureClass(L"SealedPreviewIconFixture");
+        Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        HICON originalBig = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        HICON originalSmall = LoadIconW(nullptr, MAKEINTRESOURCEW(32516));
+        CHECK(originalBig && originalSmall);
+        SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(originalBig));
+        SendMessageW(w, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(originalSmall));
+
+        CHECK(HideWindowAndHideTaskbarIcon(w));
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) != originalBig);
+        CHECK(HideWindowAndHideTaskbarIcon(w, true)); // Preview cancelled; re-seal it.
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
+
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) != originalBig);
+        CHECK(ShowWindowAndShowTaskbarIcon(w));
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
     } else if (name == "icon_cache") {
         auto icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); CHECK(icon);
         SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
@@ -558,10 +819,10 @@ void run(const std::string& name) {
         CHECK(EnumWindowToggleProc(w, reinterpret_cast<LPARAM>(&context)));
         CHECK(found.empty());
         ShowWindow(w, SW_SHOWNOACTIVATE);
-        CHECK(SetPropW(w, L"MTU_PROC_TAG", reinterpret_cast<HANDLE>(1)));
+        CHECK(SetPropW(w, L"MTU_EXE_TAG", reinterpret_cast<HANDLE>(1)));
         CHECK(EnumWindowToggleProc(w, reinterpret_cast<LPARAM>(&context)));
         CHECK(found.empty());
-        RemovePropW(w, L"MTU_PROC_TAG");
+        RemovePropW(w, L"MTU_EXE_TAG");
         CHECK(EnumWindowToggleProc(w, reinterpret_cast<LPARAM>(&context)));
         // Headless CI can lack the Virtual Desktop COM service. The filter
         // fails closed in that case instead of collecting a foreign window.

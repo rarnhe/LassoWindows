@@ -21,34 +21,82 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         id: configure
         run: |
-          cmake -S . -B out/test -A x64 -DBUILD_TESTING=ON
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory -Force out/test-logs | Out-Null
+          cmake -S . -B out/test -A x64 -DBUILD_TESTING=ON 2>&1 | Tee-Object out/test-logs/configure.log
+          "Exit code: $LASTEXITCODE" | Add-Content out/test-logs/configure.log
           exit $LASTEXITCODE
       - name: Build application and tests
         id: build
         run: |
-          cmake --build out/test --config Release --parallel
+          $PSNativeCommandUseErrorActionPreference = $false
+          cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log
+          "Exit code: $LASTEXITCODE" | Add-Content out/test-logs/build.log
           exit $LASTEXITCODE
       - name: Run CTest
         id: ctest
         run: |
-          ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
+          $PSNativeCommandUseErrorActionPreference = $false
+          ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
+          "Exit code: $LASTEXITCODE" | Add-Content out/test-logs/ctest.log
           exit $LASTEXITCODE
       - name: Write Markdown report and Actions summary
         if: always()
         run: |
-          ./test/write_report.ps1 -Configure '${{ steps.configure.outcome }}' -Build '${{ steps.build.outcome }}' -Test '${{ steps.ctest.outcome }}'
+          try {
+            if (Test-Path -LiteralPath test_report.md) {
+              Remove-Item -LiteralPath test_report.md -Force
+            }
+            ./test/write_report.ps1 -Configure '${{ steps.configure.outcome }}' -Build '${{ steps.build.outcome }}' -Test '${{ steps.ctest.outcome }}' -LogDirectory out/test-logs
+          } catch {
+            $details = [System.Net.WebUtility]::HtmlEncode(($_ | Out-String))
+            $fallback = [System.Collections.Generic.List[string]]::new()
+            @(
+              "# C++ Windows 测试报告",
+              "",
+              "- 状态：失败（报告生成脚本异常，已写入降级报告）",
+              "- Configure=${{ steps.configure.outcome }} / Build=${{ steps.build.outcome }} / CTest=${{ steps.ctest.outcome }}",
+              "",
+              "## 报告生成错误",
+              "<pre>$details</pre>"
+            ) | ForEach-Object { $fallback.Add($_) }
+            foreach ($phase in @("configure", "build", "ctest")) {
+              $log = "out/test-logs/$phase.log"
+              if (Test-Path -LiteralPath $log) {
+                try {
+                  $output = (Get-Content -LiteralPath $log -Tail 80) -join [Environment]::NewLine
+                  $fallback.Add("")
+                  $fallback.Add("### $phase 最后 80 行")
+                  $fallback.Add("<pre>$([System.Net.WebUtility]::HtmlEncode($output))</pre>")
+                } catch {
+                  $fallback.Add("读取 $phase 日志失败：$($_.Exception.Message)")
+                }
+              }
+            }
+            $fallback | Set-Content -LiteralPath test_report.md -Encoding utf8
+            Write-Warning "The detailed report writer failed; a fallback test_report.md was written."
+          }
+          if (!(Test-Path -LiteralPath test_report.md) -or (Get-Item -LiteralPath test_report.md).Length -eq 0) {
+            @(
+              "# C++ Windows 测试报告",
+              "",
+              "- 状态：失败（未生成详细报告，已写入兜底报告）",
+              "- Configure=${{ steps.configure.outcome }} / Build=${{ steps.build.outcome }} / CTest=${{ steps.ctest.outcome }}"
+            ) | Set-Content -LiteralPath test_report.md -Encoding utf8
+          }
       - name: Preserve report and diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: cpp-windows-test-report
-          if-no-files-found: error
+          if-no-files-found: warn
           path: |
             test_report.md
+            out/test-logs/
             out/test/test-results.xml
             out/test/Testing/Temporary/
             out/test/CMakeFiles/CMakeConfigureLog.yaml
