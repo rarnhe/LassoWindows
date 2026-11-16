@@ -7,7 +7,7 @@ LassoWindows 是基于 Win32、COM 与 C++/WinRT 的后台窗口管理工具。�
 | 操作 | 当前行为 |
 | --- | --- |
 | Win + C | 封印各虚拟桌面上进程名相同的可见顶级窗口，并记录各窗口自己的桌面 GUID。Explorer 仅处理文件夹窗口。对匹配的 `ApplicationFrameWindow` 外框发送 `WM_CLOSE`。 |
-| Shift + Win + C | 尝试隐藏当前桌面中其他应用的窗口，保留当前应用；其他应用的 UWP 外框也接收 `WM_CLOSE`。当前 UWP 应用身份无法区分时，跳过其他 UWP 外框。 |
+| Shift + Win + C | 在所有虚拟桌面隐藏其他应用窗口，保留当前前台应用；普通窗口按各自桌面 GUID 封印，其他 UWP 外框发送 `WM_CLOSE`。 |
 | Alt + Tab | 先读取当前桌面的 GUID，再临时恢复带有效 `MTU_EXE_TAG` 且 `MTU_VD_TAG` 匹配该 GUID 的封印窗口。松开 Alt 后解封选中窗口及同桌面、同进程的预览窗口，其余窗口重新封印。Esc 取消本次预览。 |
 | 点击主屏任务栏原生“显示桌面”按钮 | 将筛选后的主屏当前桌面普通窗口透明化并启用鼠标穿透；再次点击恢复原始透明度与扩展样式，保留原任务栏图标。 |
 | 再次打开同应用窗口或通过关联文件唤醒 | 事件处理尝试恢复同进程、同桌面的已隐藏窗口并清理标签。 |
@@ -36,7 +36,7 @@ IconResource=C:\Windows\System32\shell32.dll,3
 
 ## 自动测试与双轨报告
 
-测试位于独立的 `test/` 目录，通过 CTest 驱动 36 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
+测试位于独立的 `test/` 目录，通过 CTest 驱动 39 个用例，直接编译并调用 `LassoWindows.cpp` 的实际实现，不执行 `WinMain`，也不安装全局钩子。测试创建并销毁自己的 Win32 窗口；INI 临时文件只放在测试可执行文件旁，用例串行运行并自动清理。
 
 ```powershell
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml
