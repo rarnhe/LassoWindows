@@ -1,9 +1,9 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-16 15:53:51
-- 测试源码基准提交：65022614e2a93bc0216ba7de143c7b58fa88eba9
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43901280273
+- 时间（UTC）：2026-11-16 16:51:29
+- 测试源码基准提交：8a4b60dd119a316227a6b193659e545d712033ba
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/43911960772
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
 - 统计：通过 44 / 失败 0 / 跳过 0 / 共 44
@@ -50,8 +50,8 @@
 | icon_cache | 通过 |
 | toggle_filter | 通过 |
 | hide_others_all_desktops | 通过 |
-| primary_transparency_roundtrip | 通过 |
-| primary_transparency_input | 通过 |
+| primary_hide_roundtrip | 通过 |
+| primary_hide_events | 通过 |
 | show_desktop_button_hit_test | 通过 |
 | uwp_frame_close | 通过 |
 | exe_tag_atom | 通过 |
