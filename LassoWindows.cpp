@@ -1432,7 +1432,7 @@ BOOL IsValidAppWindow(HWND hWnd) {
 // 在全局变量或单例中维护
 static bool g_bSystemHasDpiScaling = false;
 
-// 在程序初始化 (如 DllMain / main) 以及 WndProc 响应 WM_DISPLAYCHANGE / WM_DPICHANGED 时调用一次
+// 在协调线程启动时检测显示器缩放状态。
 void UpdateSystemDpiScalingStatus() {
 	g_bSystemHasDpiScaling = false;
 	EnumDisplayMonitors(NULL, NULL, [](HMONITOR hMon, HDC, LPRECT, LPARAM pData) -> BOOL {
@@ -1862,12 +1862,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
         return;
     }
 
-	// 捕获插拔显示器、分辨率切换、桌面重建事件
-	if (event == EVENT_SYSTEM_DESKTOPSWITCH) {
-		UpdateSystemDpiScalingStatus(); // 刷新屏幕缩放标志位
-		return;
-	}
-
 	// --- 1. 获取基础信息 ---
 	wchar_t cls[256] = { 0 };
 	wchar_t title[256] = { 0 };
@@ -2152,9 +2146,6 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_hObjHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    HWINEVENTHOOK desktopHook = SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH,
-        EVENT_SYSTEM_DESKTOPSWITCH, nullptr, WinEventProc, 0, 0,
-        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     SetEvent(ready);
     MSG msg{};
@@ -2164,7 +2155,6 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     }
     if (g_hSysHook) UnhookWinEvent(g_hSysHook);
     if (g_hObjHook) UnhookWinEvent(g_hObjHook);
-    if (desktopHook) UnhookWinEvent(desktopHook);
     RestoreAllSealedWindows();
     g_hLassoCoordinator = nullptr;
     winrt::uninit_apartment();
