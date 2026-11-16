@@ -737,6 +737,72 @@ void run(const std::string& name) {
         CHECK(g_snapUnhiddenWindows.empty());
         CHECK(ShowWindowAndShowTaskbarIcon(w));
         CHECK(ReadTaggedExe(w).empty());
+    } else if (name == "sealed_preview_icon_roundtrip") {
+        RegisterFixtureClass(L"SealedPreviewIconFixture");
+        Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        HICON originalBig = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        HICON originalSmall = LoadIconW(nullptr, MAKEINTRESOURCEW(32516));
+        CHECK(originalBig && originalSmall);
+        SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(originalBig));
+        SendMessageW(w, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(originalSmall));
+
+        CHECK(SetWindowSealedIcon(w));
+        HICON previewBig = reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0));
+        HICON previewSmall = reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0));
+        CHECK(previewBig && previewBig != originalBig);
+        CHECK(previewSmall && previewSmall != originalSmall);
+        CHECK(g_sealedPreviewIcons.contains(w.h));
+        CHECK(SetWindowSealedIcon(w)); // Repeated preview must not stack another web.
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == previewBig);
+
+        RestoreWindowSealedIcon(w);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
+    } else if (name == "preview_icon_selection_restore") {
+        RegisterFixtureClass(L"SealedPreviewIconFixture");
+        Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        HICON originalBig = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        HICON originalSmall = LoadIconW(nullptr, MAKEINTRESOURCEW(32516));
+        CHECK(originalBig && originalSmall);
+        SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(originalBig));
+        SendMessageW(w, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(originalSmall));
+
+        CHECK(HideWindowAndHideTaskbarIcon(w));
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        HICON previewBig = reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0));
+        CHECK(previewBig && previewBig != originalBig);
+        CHECK(ShowWindowAndShowTaskbarIcon(w)); // Alt release selects this window.
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
+        CHECK(!g_sealedWindowStates.contains(w.h));
+    } else if (name == "preview_icon_reseal_restore") {
+        RegisterFixtureClass(L"SealedPreviewIconFixture");
+        Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        HICON originalBig = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        HICON originalSmall = LoadIconW(nullptr, MAKEINTRESOURCEW(32516));
+        CHECK(originalBig && originalSmall);
+        SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(originalBig));
+        SendMessageW(w, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(originalSmall));
+
+        CHECK(HideWindowAndHideTaskbarIcon(w));
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) != originalBig);
+        CHECK(HideWindowAndHideTaskbarIcon(w, true)); // Preview cancelled; re-seal it.
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
+
+        CHECK(ShowWindowAndShowTaskbarIcon(w, true));
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) != originalBig);
+        CHECK(ShowWindowAndShowTaskbarIcon(w));
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_BIG, 0)) == originalBig);
+        CHECK(reinterpret_cast<HICON>(SendMessageW(w, WM_GETICON, ICON_SMALL, 0)) == originalSmall);
+        CHECK(!g_sealedPreviewIcons.contains(w.h));
     } else if (name == "icon_cache") {
         auto icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); CHECK(icon);
         SendMessageW(w, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));

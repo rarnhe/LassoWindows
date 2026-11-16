@@ -765,6 +765,259 @@ static void UpdateTaskbarButton(HWND h, bool visible) {
     else taskbar->DeleteTab(h);
 }
 
+
+struct SealedPreviewIconState {
+    HICON originalBig = nullptr;
+    HICON originalSmall = nullptr;
+    HICON previewBig = nullptr;
+    HICON previewSmall = nullptr;
+    bool bigApplied = false;
+    bool smallApplied = false;
+};
+
+static std::unordered_map<HWND, SealedPreviewIconState> g_sealedPreviewIcons;
+
+static HICON QueryWindowIconForPreview(HWND h, WPARAM iconType) {
+    DWORD_PTR result = 0;
+    if (!SendMessageTimeoutW(h, WM_GETICON, iconType, 0,
+            SMTO_ABORTIFHUNG, 250, &result)) return nullptr;
+    return reinterpret_cast<HICON>(result);
+}
+
+static bool SendWindowIconForPreview(HWND h, WPARAM iconType, HICON icon) {
+    DWORD_PTR result = 0;
+    return SendMessageTimeoutW(h, WM_SETICON, iconType,
+        reinterpret_cast<LPARAM>(icon), SMTO_ABORTIFHUNG, 1000, &result) != 0;
+}
+
+// DWM AccentColor is stored as AABBGGRR. Convert it to COLORREF.
+static COLORREF GetTaskbarAccentColor() {
+    DWORD colorData = 0;
+    DWORD type = 0;
+    DWORD size = sizeof(colorData);
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM",
+            0, KEY_READ, &key) == ERROR_SUCCESS) {
+        const LONG status = RegQueryValueExW(key, L"AccentColor", nullptr,
+            &type, reinterpret_cast<LPBYTE>(&colorData), &size);
+        RegCloseKey(key);
+        if (status == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(colorData)) {
+            const BYTE red = static_cast<BYTE>(colorData & 0xff);
+            const BYTE green = static_cast<BYTE>((colorData >> 8) & 0xff);
+            const BYTE blue = static_cast<BYTE>((colorData >> 16) & 0xff);
+            return RGB(red, green, blue);
+        }
+    }
+    return RGB(255, 255, 255);
+}
+
+static HICON CreateSealedPreviewIcon(HICON sourceIcon, int iconSize, COLORREF accentColor) {
+    if (!sourceIcon || iconSize <= 0 || iconSize > 256) return nullptr;
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) return nullptr;
+    HDC memory = CreateCompatibleDC(screen);
+    if (!memory) {
+        ReleaseDC(nullptr, screen);
+        return nullptr;
+    }
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = iconSize;
+    bmi.bmiHeader.biHeight = -iconSize;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP colorBitmap = CreateDIBSection(
+        memory, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!colorBitmap || !bits) {
+        if (colorBitmap) DeleteObject(colorBitmap);
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return nullptr;
+    }
+
+    HGDIOBJ oldBitmap = SelectObject(memory, colorBitmap);
+    if (!oldBitmap || oldBitmap == HGDI_ERROR) {
+        DeleteObject(colorBitmap);
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return nullptr;
+    }
+
+    auto cleanup = [&]() {
+        SelectObject(memory, oldBitmap);
+        DeleteObject(colorBitmap);
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+    };
+
+    const size_t pixelCount = static_cast<size_t>(iconSize) *
+        static_cast<size_t>(iconSize);
+    auto* pixels = static_cast<DWORD*>(bits);
+    memset(pixels, 0, pixelCount * sizeof(DWORD));
+    if (!DrawIconEx(memory, 0, 0, sourceIcon, iconSize, iconSize,
+            0, nullptr, DI_NORMAL)) {
+        cleanup();
+        return nullptr;
+    }
+
+    std::vector<DWORD> pixelBackup;
+    try {
+        pixelBackup.resize(pixelCount);
+    } catch (...) {
+        cleanup();
+        return nullptr;
+    }
+    memcpy(pixelBackup.data(), pixels, pixelCount * sizeof(DWORD));
+
+    HFONT font = CreateFontW(-iconSize, 0, 0, 0, FW_NORMAL,
+        FALSE, FALSE, FALSE, SYMBOL_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Webdings");
+    if (!font) {
+        cleanup();
+        return nullptr;
+    }
+    HGDIOBJ oldFont = SelectObject(memory, font);
+    if (!oldFont || oldFont == HGDI_ERROR) {
+        DeleteObject(font);
+        cleanup();
+        return nullptr;
+    }
+
+    SetBkMode(memory, TRANSPARENT);
+    SetTextColor(memory, RGB(255, 255, 255));
+    const wchar_t webChar = L'"';
+    RECT rect{0, 0, iconSize, iconSize};
+    DrawTextW(memory, &webChar, 1, &rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(memory, oldFont);
+    DeleteObject(font);
+
+    const DWORD markedColor = 0xff000000 |
+        (static_cast<DWORD>(GetRValue(accentColor)) << 16) |
+        (static_cast<DWORD>(GetGValue(accentColor)) << 8) |
+        static_cast<DWORD>(GetBValue(accentColor);
+    bool hasWebGlyph = false;
+    for (size_t i = 0; i < pixelCount; ++i) {
+        if (pixels[i] != pixelBackup[i]) {
+            pixels[i] = markedColor;
+            hasWebGlyph = true;
+        } else if (pixels[i] != 0) {
+            pixels[i] |= 0xff000000;
+        }
+    }
+    if (!hasWebGlyph) {
+        cleanup();
+        return nullptr;
+    }
+
+    HBITMAP maskBitmap = CreateBitmap(iconSize, iconSize, 1, 1, nullptr);
+    if (!maskBitmap) {
+        cleanup();
+        return nullptr;
+    }
+    ICONINFO iconInfo{};
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmColor = colorBitmap;
+    iconInfo.hbmMask = maskBitmap;
+    HICON result = CreateIconIndirect(&iconInfo);
+    DeleteObject(maskBitmap);
+    cleanup();
+    return result;
+}
+
+static void DestroySealedPreviewIconState(const SealedPreviewIconState& state) {
+    if (state.previewBig) DestroyIcon(state.previewBig);
+    if (state.previewSmall && state.previewSmall != state.previewBig)
+        DestroyIcon(state.previewSmall);
+}
+
+// Apply a temporary, AccentColor-tinted Webdings web to the taskbar icon.
+// The pre-preview icon handles are borrowed from the target window and are
+// restored before the generated preview icons are destroyed.
+static bool SetWindowSealedIcon(HWND h) {
+    if (!IsWindow(h)) return false;
+    if (g_sealedPreviewIcons.contains(h)) return true;
+
+    SealedPreviewIconState state;
+    state.originalBig = QueryWindowIconForPreview(h, ICON_BIG);
+    state.originalSmall = QueryWindowIconForPreview(h, ICON_SMALL);
+    if (!state.originalBig)
+        state.originalBig = reinterpret_cast<HICON>(GetClassLongPtrW(h, GCLP_HICON));
+    if (!state.originalSmall)
+        state.originalSmall = reinterpret_cast<HICON>(GetClassLongPtrW(h, GCLP_HICONSM));
+
+    HICON bigSource = state.originalBig ? state.originalBig : state.originalSmall;
+    HICON smallSource = state.originalSmall ? state.originalSmall : state.originalBig;
+    if (!bigSource) return false;
+
+    const COLORREF accent = GetTaskbarAccentColor();
+    state.previewBig = CreateSealedPreviewIcon(
+        bigSource, GetSystemMetrics(SM_CXICON), accent);
+    if (!state.previewBig) return false;
+    state.previewSmall = CreateSealedPreviewIcon(
+        smallSource ? smallSource : bigSource, GetSystemMetrics(SM_CXSMICON), accent);
+    // Some systems/fonts cannot render the glyph legibly at the small metric.
+    // Reuse the already-marked large icon rather than showing an unmarked icon.
+    if (!state.previewSmall) state.previewSmall = state.previewBig;
+
+    if (!SendWindowIconForPreview(h, ICON_BIG, state.previewBig)) {
+        DestroySealedPreviewIconState(state);
+        return false;
+    }
+    state.bigApplied = true;
+
+    if (!SendWindowIconForPreview(h, ICON_SMALL, state.previewSmall)) {
+        if (SendWindowIconForPreview(h, ICON_BIG, state.originalBig)) {
+            DestroySealedPreviewIconState(state);
+            return false;
+        }
+        if (state.previewSmall != state.previewBig) {
+            DestroyIcon(state.previewSmall);
+            state.previewSmall = nullptr;
+        }
+        g_sealedPreviewIcons.emplace(h, state);
+        return false;
+    }
+    state.smallApplied = true;
+    g_sealedPreviewIcons.emplace(h, state);
+    return true;
+}
+
+static void RestoreWindowSealedIcon(HWND h) {
+    const auto it = g_sealedPreviewIcons.find(h);
+    if (it == g_sealedPreviewIcons.end()) return;
+    if (!IsWindow(h)) {
+        DestroySealedPreviewIconState(it->second);
+        g_sealedPreviewIcons.erase(it);
+        return;
+    }
+
+    const auto& state = it->second;
+    bool restored = true;
+    if (state.bigApplied)
+        restored = SendWindowIconForPreview(h, ICON_BIG, state.originalBig) && restored;
+    if (state.smallApplied)
+        restored = SendWindowIconForPreview(h, ICON_SMALL, state.originalSmall) && restored;
+    // Keep generated handles alive if a hung target could still be using them.
+    if (!restored) return;
+
+    DestroySealedPreviewIconState(state);
+    g_sealedPreviewIcons.erase(it);
+}
+
+static void DiscardWindowSealedIcon(HWND h) {
+    const auto it = g_sealedPreviewIcons.find(h);
+    if (it == g_sealedPreviewIcons.end()) return;
+    DestroySealedPreviewIconState(it->second);
+    g_sealedPreviewIcons.erase(it);
+}
+
 // Keep the snapshot and tags during the temporary native switcher preview.
 bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     auto it = g_sealedWindowStates.find(h);
@@ -792,6 +1045,8 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
     } else if (!SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED)) {
         return false;
     }
+    if (preview) SetWindowSealedIcon(h);
+    else RestoreWindowSealedIcon(h);
     if (original.wasVisible && IsWindowVisible(h) && !(targetStyle & WS_EX_TOOLWINDOW))
         UpdateTaskbarButton(h, true);
     InvalidateRect(h, nullptr, TRUE);
@@ -803,6 +1058,7 @@ bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
 }
 
 bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
+    RestoreWindowSealedIcon(h);
     if (!SnapshotWindowState(h)) return false;
     auto& original = g_sealedWindowStates.at(h);
     LONG_PTR exStyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
@@ -1851,6 +2107,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LO
         if (g_taskViewWindow == hwnd) g_taskViewWindow = nullptr;
         // A HWND can be recycled after destruction; never restore stale state
         // onto a different window that later receives the same handle value.
+        DiscardWindowSealedIcon(hwnd);
         g_sealedWindowStates.erase(hwnd);
         g_restoredWindowShows.erase(hwnd);
         auto forget = [hwnd](std::vector<HWND>& v) {
