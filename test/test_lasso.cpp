@@ -702,8 +702,7 @@ void run(const std::string& name) {
         CHECK(bitmap && bits);
         HGDIOBJ old = SelectObject(dc, bitmap);
         CHECK(old && old != HGDI_ERROR);
-        auto& card = *g_altTabProxies.front();
-        card.accent = RGB(0xd5, 0x60, 0x22);
+        const auto& card = *g_altTabProxies.front();
         card.frame->width = 2;
         card.frame->height = 2;
         card.frame->pixels.assign(4, 0xff224466);
@@ -711,14 +710,16 @@ void run(const std::string& name) {
         GdiFlush();
         const auto* pixels = static_cast<const DWORD*>(bits);
         RECT web{PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, 0, 0};
-        size_t accentPixels = 0;
+        size_t blackPixels = 0;
         size_t backgroundPixels = 0;
+        const LONG left = (PROXY_FRAME_WIDTH - PROXY_FRAME_HEIGHT) / 2;
+        const LONG right = left + PROXY_FRAME_HEIGHT;
         for (LONG y = 0; y < PROXY_FRAME_HEIGHT; ++y) {
-            for (LONG x = 0; x < PROXY_FRAME_WIDTH; ++x) {
+            for (LONG x = left; x < right; ++x) {
                 const auto pixel = pixels[y * PROXY_FRAME_WIDTH + x] & 0xffffff;
-                if (pixel == 0xd56022) ++accentPixels;
+                if (pixel == 0x000000) ++blackPixels;
                 if (pixel == 0x224466) ++backgroundPixels;
-                if (pixel != 0x000000 && pixel != 0x224466) {
+                if (pixel != 0x224466) {
                     web.left = (std::min)(web.left, x);
                     web.top = (std::min)(web.top, y);
                     web.right = (std::max)(web.right, x + 1);
@@ -726,9 +727,9 @@ void run(const std::string& name) {
                 }
             }
         }
-        CHECK(accentPixels > 200 && backgroundPixels > 1000);
+        CHECK(blackPixels > 200 && backgroundPixels > 1000);
         CHECK(web.top <= 2 && web.bottom >= PROXY_FRAME_HEIGHT - 2);
-        CHECK(abs(web.left + web.right - PROXY_FRAME_WIDTH) <= 3);
+        CHECK(web.left <= left + 2 && web.right >= right - 2);
         CHECK((pixels[10 * PROXY_FRAME_WIDTH + 400] & 0xffffff) == 0);
         SelectObject(dc, old);
         DeleteObject(bitmap);
@@ -776,7 +777,8 @@ void run(const std::string& name) {
         CHECK(SUCCEEDED(store->SetValue(PKEY_AppUserModel_ID, value)));
         PropVariantClear(&value);
         CHECK(!SendMessageW(w, WM_GETICON, ICON_BIG, 0));
-        CHECK(SetWindowSealedIcon(w));
+        Window target;
+        CHECK(SetWindowSealedIcon(w, target));
         const auto& state = g_sealedPreviewIcons.at(w.h);
         CHECK(state.taskbar);
         const auto iconFile = state.taskbar->iconFile;
@@ -787,8 +789,39 @@ void run(const std::string& name) {
         HICON writtenIcon = reinterpret_cast<HICON>(LoadImageW(nullptr, iconFile.c_str(),
             IMAGE_ICON, 0, 0, LR_LOADFROMFILE));
         CHECK(writtenIcon);
+        const int size = GetSystemMetrics(SM_CXICON);
+        auto iconPixels = [size](HICON icon) {
+            HDC dc = CreateCompatibleDC(nullptr);
+            CHECK(dc);
+            void* bits = nullptr;
+            const auto info = ProxyBitmapInfo(size, size);
+            HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+            CHECK(bitmap && bits);
+            HGDIOBJ old = SelectObject(dc, bitmap);
+            CHECK(old && old != HGDI_ERROR);
+            PatBlt(dc, 0, 0, size, size, WHITENESS);
+            CHECK(DrawIconEx(dc, 0, 0, icon, size, size, 0, nullptr, DI_NORMAL));
+            GdiFlush();
+            const auto* pixels = static_cast<const DWORD*>(bits);
+            std::vector<DWORD> rgb(pixels, pixels + static_cast<size_t>(size) * size);
+            for (auto& pixel : rgb) pixel &= 0xffffff;
+            SelectObject(dc, old);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            return rgb;
+        };
+        const HICON source = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        const HICON blackIcon = CreateSealedPreviewIcon(source, size, RGB(0, 0, 0));
+        const HICON accentIcon = CreateSealedPreviewIcon(source, size, GetTaskbarAccentColor());
+        CHECK(blackIcon && accentIcon);
+        const auto titlePixels = iconPixels(state.previewBig);
+        CHECK(titlePixels == iconPixels(blackIcon));
+        CHECK(iconPixels(writtenIcon) == iconPixels(accentIcon));
+        if (GetTaskbarAccentColor() != RGB(0, 0, 0)) CHECK(titlePixels != iconPixels(writtenIcon));
+        DestroyIcon(blackIcon);
+        DestroyIcon(accentIcon);
         DestroyIcon(writtenIcon);
-        CHECK(SetWindowSealedIcon(w));
+        CHECK(SetWindowSealedIcon(w, target));
         CHECK(ReadStringProperty(store.get(), PKEY_AppUserModel_ID) == previewId);
         RestoreWindowSealedIcon(w);
         CHECK(!SendMessageW(w, WM_GETICON, ICON_BIG, 0));
