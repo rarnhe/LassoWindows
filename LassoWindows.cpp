@@ -1649,9 +1649,9 @@ static BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 static GUID g_altTabPreviewDesktop{};
 // Each grouped proxy is a one-line EXE title card; the spider overlay belongs
 // only to its window icons, never to the DWM thumbnail bitmap.
-static constexpr int PROXY_THUMBNAIL_HEIGHT = 60;
+static constexpr int PROXY_THUMBNAIL_HEIGHT = 137;
 static constexpr int PROXY_TITLE_FONT_SIZE = 19;
-static constexpr int PROXY_TITLE_PADDING_X = 12;
+static constexpr int PROXY_TITLE_PADDING_X = 0;
 
 struct AltTabProxy {
     HWND window = nullptr;
