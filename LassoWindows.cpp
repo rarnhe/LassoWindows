@@ -676,9 +676,6 @@ HHOOK g_hMouseHook = NULL;
 HWINEVENTHOOK g_hSysHook = NULL;
 HWINEVENTHOOK g_hObjHook = NULL;
 
-// 建议：句柄缓存 - 避免频繁 EnumWindows 带来的性能开销
-std::vector<HWND> g_HiddenWindowsCache;
-
 // Preserve original presentation across seals and Alt+Tab previews.
 static constexpr UINT WINDOW_FRAME_FLAGS =
     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
@@ -693,19 +690,31 @@ static bool RequestHostedUwpClose(HWND h) {
     return IsApplicationFrameWindow(h) && PostMessageW(h, WM_CLOSE, 0, 0) != FALSE;
 }
 
-static std::unordered_map<HWND, ULONGLONG> g_restoredWindowShows;
+static std::unordered_map<HWND, ULONGLONG> g_restoredWindowPresentations;
+
+static void RecordLassoWindowRestoration(HWND window) {
+    const auto now = GetTickCount64();
+    std::erase_if(g_restoredWindowPresentations, [now](const auto& entry) {
+        return now - entry.second > 3000;
+    });
+    g_restoredWindowPresentations[window] = now;
+}
+
+static bool IsLassoRestorationEvent(HWND window, DWORD time) {
+    const auto entry = g_restoredWindowPresentations.find(window);
+    if (entry == g_restoredWindowPresentations.end()) return false;
+    if (GetTickCount64() - entry->second > 3000) {
+        g_restoredWindowPresentations.erase(entry);
+        return false;
+    }
+    return time - static_cast<DWORD>(entry->second) <= 3000;
+}
 
 static bool SetWindowPresented(HWND h, bool visible, UINT flags = 0) {
-    if (visible) {
-        const auto now = GetTickCount64();
-        std::erase_if(g_restoredWindowShows, [now](const auto& event) {
-            return now - event.second > 3000;
-        });
-        g_restoredWindowShows[h] = now;
-    }
+    if (visible) RecordLassoWindowRestoration(h);
     if (SetWindowPos(h, nullptr, 0, 0, 0, 0,
             WINDOW_FRAME_FLAGS | flags | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW))) return true;
-    if (visible) g_restoredWindowShows.erase(h);
+    if (visible) g_restoredWindowPresentations.erase(h);
     return false;
 }
 
@@ -718,6 +727,7 @@ struct SealedWindowState {
     bool wasVisible = false;
     bool wasIconic = false;
     bool hiddenByLasso = false;
+    ULONGLONG sealedAt = 0;
 };
 static std::unordered_map<HWND, SealedWindowState> g_sealedWindowStates;
 
@@ -1179,6 +1189,7 @@ static bool ShowWindowAndShowTaskbarIcon(HWND h, bool preview = false) {
 
     auto& original = it->second;
     if (preview && !IsOriginalWindowEligibleForPreview(h)) return false;
+    if (!preview) RecordLassoWindowRestoration(h);
 
     // Like the original switcher path, temporarily make the preview an
     // app window and explicitly show it. The snapshot owns the final style.
@@ -1240,7 +1251,7 @@ static bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
 
 static void RestoreAllSealedWindows() {
     // This shared cleanup path also runs during shutdown. Do not couple it to
-    // temporary primary transparency; only explicit user input restores that state.
+    // temporary primary minimization; only explicit user input restores that state.
     for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
         const HWND h = (it++)->first;
         ShowWindowAndShowTaskbarIcon(h);
@@ -1261,44 +1272,6 @@ static void SuppressHiddenWindows(HWND hwnd, DWORD event) {
 		}
 	}
 }
-
-static void RefreshWindowCache() {
-	g_HiddenWindowsCache.clear();
-
-	// 1. 初始化 COM 接口（建议在主线程初始化一次，这里为了演示逻辑完整性）
-	IVirtualDesktopManager* pVDM = nullptr;
-	HRESULT hr = CoCreateInstance(CLSID_VirtualDesktopManager, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pVDM));
-
-	if (FAILED(hr)) {
-		// 如果接口获取失败（极少数旧系统情况），回退到基础逻辑
-		return;
-	}
-
-	// 2. 遍历窗口
-	EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-		IVirtualDesktopManager* pManager = reinterpret_cast<IVirtualDesktopManager*>(lp);
-
-		// 只有我们标记过的“封印”窗口才进缓存
-		if (GetPropW(h, L"MTU_EXE_TAG")) {
-			BOOL isCurrent = FALSE;
-
-			// --- 核心判定：由系统告诉你这个窗口是否在当前活跃桌面 ---
-			if (SUCCEEDED(pManager->IsWindowOnCurrentVirtualDesktop(h, &isCurrent))) {
-				if (isCurrent) {
-					// 在当前桌面，加入待管理缓存
-					g_HiddenWindowsCache.push_back(h);
-				}
-				// Foreign-desktop windows are never modified while refreshing cache.
-			}
-		}
-		return TRUE;
-		}, (LPARAM)pVDM);
-
-	// 3. 释放接口
-	pVDM->Release();
-}
-
-
 
 #include <commctrl.h>
 // 显式链接库文件
@@ -1574,6 +1547,8 @@ static bool SealWindow(HWND h, const std::wstring& process, REFGUID desktop) {
         return false;
     }
 
+    g_sealedWindowStates.at(h).sealedAt = GetTickCount64();
+
     //wchar_t title[512]{};
     //const std::wstring prefix = L"🕸";
     //if (GetWindowTextW(h, title, static_cast<int>(std::size(title))) > 0 &&
@@ -1647,18 +1622,25 @@ static BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 // 隐藏同类型窗口后，alt+tab临时查看下。
 // --- 全局变量与状态控制 ---
 static GUID g_altTabPreviewDesktop{};
-// Each grouped proxy is a one-line EXE title card; the spider overlay belongs
-// only to its window icons, never to the DWM thumbnail bitmap.
-static constexpr int PROXY_THUMBNAIL_HEIGHT = 137;
+static constexpr int PROXY_THUMBNAIL_MIN_HEIGHT = 137;
 static constexpr int PROXY_TITLE_FONT_SIZE = 19;
 static constexpr int PROXY_TITLE_PADDING_X = 0;
+static constexpr int PROXY_TITLE_PADDING_Y = 8;
+static constexpr int PROXY_HEADER_GAP = 8;
+
+struct ProxyThumbnailLayout {
+    int width = 0;
+    int height = 0;
+    int rowHeight = 0;
+};
 
 struct AltTabProxy {
     HWND window = nullptr;
     std::wstring process;
-    std::wstring title;
+    std::wstring caption;
     std::vector<HWND> targets;
-    int thumbnailWidth = 0;
+    std::vector<std::wstring> windowTitles;
+    ProxyThumbnailLayout layout;
     HICON sourceIcon = nullptr;
     ~AltTabProxy() {
         if (window) {
@@ -1682,26 +1664,24 @@ static BITMAPINFO ProxyBitmapInfo(int width, int height) {
     return info;
 }
 
-struct ProxyThumbnailLayout {
-    int width = 0;
-    int height = PROXY_THUMBNAIL_HEIGHT;
-    int fontHeight = PROXY_TITLE_FONT_SIZE;
-    int paddingX = PROXY_TITLE_PADDING_X;
-    int textWidth = 0;
-    int textHeight = 0;
-};
-
-static HFONT CreateProxyTitleFont(int height = PROXY_TITLE_FONT_SIZE) {
-    return CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+static HFONT CreateProxyTitleFont() {
+    return CreateFontW(-PROXY_TITLE_FONT_SIZE, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
 }
 
-// The EXE tag is the only line in a grouped card. Size the bitmap from its
-// measured width so the default 19 px title never wraps or needs ellipsis.
-static bool MeasureProxyThumbnailLayout(HDC dc, const std::wstring& title,
+static std::wstring ReadProxyWindowTitle(HWND window) {
+    std::wstring title(GetWindowTextLengthW(window) + 1, L'\0');
+    title.resize(GetWindowTextW(window, title.data(), static_cast<int>(title.size())));
+    for (auto& ch : title) {
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+    }
+    return title.find_first_not_of(L' ') == std::wstring::npos ? L"（无标题）" : title;
+}
+
+static bool MeasureProxyThumbnailLayout(HDC dc, const std::vector<std::wstring>& windowTitles,
                                         ProxyThumbnailLayout& layout) {
-    if (!dc || title.empty() || title.size() > 4096) return false;
+    if (!dc || windowTitles.empty()) return false;
     HFONT font = CreateProxyTitleFont();
     if (!font) return false;
     const HGDIOBJ previous = SelectObject(dc, font);
@@ -1709,62 +1689,93 @@ static bool MeasureProxyThumbnailLayout(HDC dc, const std::wstring& title,
         DeleteObject(font);
         return false;
     }
-    SIZE extent{};
     TEXTMETRICW metrics{};
-    const int length = static_cast<int>(title.size());
-    const bool measured = GetTextExtentPoint32W(dc, title.c_str(), length, &extent) != FALSE &&
-        GetTextMetricsW(dc, &metrics) != FALSE;
+    bool measured = GetTextMetricsW(dc, &metrics) && metrics.tmHeight > 0;
+    int widest = 0;
+    for (const auto& title : windowTitles) {
+        SIZE extent{};
+        if (!GetTextExtentPoint32W(dc, title.c_str(), static_cast<int>(title.size()), &extent)) {
+            measured = false;
+            break;
+        }
+        widest = (std::max)(widest, static_cast<int>(extent.cx));
+    }
     SelectObject(dc, previous);
     DeleteObject(font);
-    if (!measured || extent.cx < 0 || metrics.tmHeight <= 0) return false;
+    if (!measured) return false;
 
-    layout.width = (std::max)(1, static_cast<int>(extent.cx) + PROXY_TITLE_PADDING_X * 2);
-    layout.height = PROXY_THUMBNAIL_HEIGHT;
-    layout.fontHeight = PROXY_TITLE_FONT_SIZE;
-    layout.paddingX = PROXY_TITLE_PADDING_X;
-    layout.textWidth = extent.cx;
-    layout.textHeight = metrics.tmHeight;
+    layout.width = (std::max)(1, widest + PROXY_TITLE_PADDING_X * 2);
+    layout.rowHeight = metrics.tmHeight + metrics.tmExternalLeading;
+    const int contentHeight = (static_cast<int>(windowTitles.size()) + 1) * layout.rowHeight +
+        PROXY_HEADER_GAP + PROXY_TITLE_PADDING_Y * 2;
+    layout.height = (std::max)(PROXY_THUMBNAIL_MIN_HEIGHT, contentHeight);
     return true;
 }
 
-static bool DrawProxyTitle(HDC dc, int width, int height, const std::wstring& title,
-                           COLORREF color, int fontHeight = PROXY_TITLE_FONT_SIZE,
-                           int paddingX = PROXY_TITLE_PADDING_X) {
-    if (!dc || width <= 0 || height <= 0 || title.empty()) return false;
-    HFONT font = CreateProxyTitleFont(fontHeight);
-    if (!font) return false;
-    const HGDIOBJ previous = SelectObject(dc, font);
-    if (!previous || previous == HGDI_ERROR) {
-        DeleteObject(font);
-        return false;
-    }
-    TEXTMETRICW metrics{};
-    if (!GetTextMetricsW(dc, &metrics)) {
-        SelectObject(dc, previous);
-        DeleteObject(font);
-        return false;
-    }
-    const int oldMode = SetBkMode(dc, TRANSPARENT);
-    const COLORREF oldColor = SetTextColor(dc, color);
-    const int y = (std::max)(0, (height - static_cast<int>(metrics.tmHeight)) / 2);
-    const BOOL drawn = TextOutW(dc, paddingX, y, title.c_str(), static_cast<int>(title.size()));
-    SetTextColor(dc, oldColor);
-    SetBkMode(dc, oldMode);
-    SelectObject(dc, previous);
-    DeleteObject(font);
-    return drawn != FALSE;
+static bool UpdateAltTabProxyTitles(AltTabProxy& proxy) {
+    std::vector<std::wstring> titles;
+    titles.reserve(proxy.targets.size());
+    for (HWND target : proxy.targets) titles.push_back(ReadProxyWindowTitle(target));
+
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    ProxyThumbnailLayout layout;
+    const bool measured = MeasureProxyThumbnailLayout(dc, titles, layout);
+    ReleaseDC(nullptr, dc);
+    if (!measured) return false;
+    proxy.caption = proxy.process + L" 「" + std::to_wstring(titles.size()) + L"」";
+    proxy.windowTitles = std::move(titles);
+    proxy.layout = layout;
+    return true;
 }
 
-// Render only the EXE title into a transparent premultiplied-alpha DIB.
-// No spider/web mask is composited into the thumbnail image.
+static bool DrawAltTabProxyCard(HDC dc, int width, int height, const AltTabProxy& proxy,
+                                COLORREF color) {
+    if (!dc || width <= 0 || height <= 0 || proxy.windowTitles.empty()) return false;
+    HFONT font = CreateProxyTitleFont();
+    if (!font) return false;
+    const int saved = SaveDC(dc);
+    if (!saved) {
+        DeleteObject(font);
+        return false;
+    }
+
+    const auto& layout = proxy.layout;
+    if (width != layout.width || height != layout.height) {
+        SetMapMode(dc, MM_ANISOTROPIC);
+        SetWindowExtEx(dc, layout.width, layout.height, nullptr);
+        SetViewportExtEx(dc, width, height, nullptr);
+    }
+    const HGDIOBJ previous = SelectObject(dc, font);
+    bool drawn = previous && previous != HGDI_ERROR;
+    if (drawn) {
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, color);
+        SetTextAlign(dc, TA_LEFT | TA_TOP | TA_NOUPDATECP);
+        RECT header{PROXY_TITLE_PADDING_X, PROXY_TITLE_PADDING_Y,
+                    layout.width - PROXY_TITLE_PADDING_X, PROXY_TITLE_PADDING_Y + layout.rowHeight};
+        DrawTextW(dc, proxy.caption.c_str(), static_cast<int>(proxy.caption.size()), &header,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        int y = header.bottom + PROXY_HEADER_GAP;
+        for (const auto& title : proxy.windowTitles) {
+            if (!TextOutW(dc, PROXY_TITLE_PADDING_X, y, title.c_str(), static_cast<int>(title.size())))
+                drawn = false;
+            y += layout.rowHeight;
+        }
+    }
+    RestoreDC(dc, saved);
+    DeleteObject(font);
+    return drawn;
+}
+
+// The preview uses a transparent premultiplied-alpha DIB. The web is drawn on the icons.
 static bool RenderProxyTitleBitmap(HDC dc, DWORD* pixels, int width, int height,
-                                   const std::wstring& title, COLORREF accent,
-                                   int fontHeight = PROXY_TITLE_FONT_SIZE,
-                                   int paddingX = PROXY_TITLE_PADDING_X) {
+                                    const AltTabProxy& proxy, COLORREF accent) {
     if (!dc || !pixels || width <= 0 || height <= 0) return false;
     const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
     std::fill_n(pixels, pixelCount, 0u);
-    if (!DrawProxyTitle(dc, width, height, title, RGB(255, 255, 255), fontHeight, paddingX))
+    if (!DrawAltTabProxyCard(dc, width, height, proxy, RGB(255, 255, 255)))
         return false;
     GdiFlush();
     const DWORD red = GetRValue(accent), green = GetGValue(accent), blue = GetBValue(accent);
@@ -1784,21 +1795,13 @@ static bool RenderProxyTitleBitmap(HDC dc, DWORD* pixels, int width, int height,
     return true;
 }
 
-static void PaintAltTabProxy(HDC dc, int width, int height, const AltTabProxy& proxy) {
-    if (width <= 0 || height <= 0) return;
-    DrawProxyTitle(dc, width, height, proxy.process, GetTaskbarAccentColor());
-}
-
 static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT message,
                                     int maxWidth, int maxHeight) {
-    int width = proxy.thumbnailWidth;
-    int height = PROXY_THUMBNAIL_HEIGHT;
-    int fontHeight = PROXY_TITLE_FONT_SIZE;
-    int paddingX = PROXY_TITLE_PADDING_X;
+    int width = proxy.layout.width;
+    int height = proxy.layout.height;
     if (width <= 0 || height <= 0) return;
 
-    // DWM supplies maximum dimensions for a thumbnail. Scale the complete
-    // one-line card only when those limits are smaller than its natural size.
+    // Fit the full card within the DWM limits using a single scale for both axes.
     int scaleNumerator = 1;
     int scaleDenominator = 1;
     if (message == WM_DWMSENDICONICTHUMBNAIL) {
@@ -1816,8 +1819,6 @@ static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT messa
     if (scaleNumerator < scaleDenominator) {
         width = (std::max)(1, MulDiv(width, scaleNumerator, scaleDenominator));
         height = (std::max)(1, MulDiv(height, scaleNumerator, scaleDenominator));
-        fontHeight = (std::max)(1, MulDiv(fontHeight, scaleNumerator, scaleDenominator));
-        paddingX = (std::max)(1, MulDiv(paddingX, scaleNumerator, scaleDenominator));
     }
 
     HDC dc = CreateCompatibleDC(nullptr);
@@ -1829,7 +1830,7 @@ static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT messa
         const HGDIOBJ previous = SelectObject(dc, bitmap);
         if (previous && previous != HGDI_ERROR) {
             if (RenderProxyTitleBitmap(dc, static_cast<DWORD*>(bits), width, height,
-                    proxy.process, GetTaskbarAccentColor(), fontHeight, paddingX)) {
+                    proxy, GetTaskbarAccentColor())) {
                 GdiFlush();
                 if (message == WM_DWMSENDICONICTHUMBNAIL)
                     DwmSetIconicThumbnail(h, bitmap, 0);
@@ -1856,14 +1857,14 @@ static LRESULT CALLBACK AltTabProxyWndProc(HWND h, UINT message, WPARAM wp, LPAR
             return 0;
         case WM_DWMSENDICONICLIVEPREVIEWBITMAP:
             SupplyAltTabProxyBitmap(h, *proxy, message,
-                proxy->thumbnailWidth, PROXY_THUMBNAIL_HEIGHT);
+                proxy->layout.width, proxy->layout.height);
             return 0;
         case WM_PAINT: {
             PAINTSTRUCT paint{};
             const HDC dc = BeginPaint(h, &paint);
             RECT rect{};
             GetClientRect(h, &rect);
-            PaintAltTabProxy(dc, rect.right, rect.bottom, *proxy);
+            DrawAltTabProxyCard(dc, rect.right, rect.bottom, *proxy, GetTaskbarAccentColor());
             EndPaint(h, &paint);
             return 0;
         }
@@ -1872,6 +1873,14 @@ static LRESULT CALLBACK AltTabProxyWndProc(HWND h, UINT message, WPARAM wp, LPAR
         }
     }
     return DefWindowProcW(h, message, wp, lp);
+}
+
+static RECT OffscreenAltTabProxyBounds(const ProxyThumbnailLayout& layout) {
+    RECT bounds{0, 0, layout.width, layout.height};
+    AdjustWindowRectEx(&bounds, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_APPWINDOW);
+    OffsetRect(&bounds, GetSystemMetrics(SM_XVIRTUALSCREEN) - bounds.right - 64,
+        GetSystemMetrics(SM_YVIRTUALSCREEN) - bounds.top);
+    return bounds;
 }
 
 static std::unique_ptr<AltTabProxy> CreateAltTabProxy(const AltTabProxyGroup& group) {
@@ -1883,34 +1892,24 @@ static std::unique_ptr<AltTabProxy> CreateAltTabProxy(const AltTabProxyGroup& gr
     wc.hInstance = instance;
     wc.lpfnWndProc = AltTabProxyWndProc;
     wc.lpszClassName = ALT_TAB_PROXY_CLASS;
+    wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return nullptr;
 
     auto proxy = std::make_unique<AltTabProxy>();
     proxy->process = group.process;
-    proxy->title = proxy->process; // The native Alt+Tab title is the MTU_EXE_TAG value.
     proxy->targets = group.targets;
-
-    HDC measureDc = GetDC(nullptr);
-    if (!measureDc) return nullptr;
-    ProxyThumbnailLayout layout{};
-    const bool measured = MeasureProxyThumbnailLayout(measureDc, proxy->process, layout);
-    ReleaseDC(nullptr, measureDc);
-    if (!measured) return nullptr;
-    proxy->thumbnailWidth = layout.width;
+    if (!UpdateAltTabProxyTitles(*proxy)) return nullptr;
 
     HICON icon = QueryWindowIconForPreview(representative, ICON_BIG);
     if (!icon) icon = reinterpret_cast<HICON>(GetClassLongPtrW(representative, GCLP_HICON));
     if (!icon) icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
     proxy->sourceIcon = icon ? CopyIcon(icon) : nullptr;
 
-    RECT windowBounds{0, 0, layout.width, layout.height};
-    AdjustWindowRectEx(&windowBounds, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_APPWINDOW);
+    const RECT windowBounds = OffscreenAltTabProxyBounds(proxy->layout);
     const int windowWidth = windowBounds.right - windowBounds.left;
     const int windowHeight = windowBounds.bottom - windowBounds.top;
-    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN) - windowWidth - 64;
-    const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const HWND h = CreateWindowExW(WS_EX_APPWINDOW, ALT_TAB_PROXY_CLASS, proxy->title.c_str(),
-        WS_OVERLAPPEDWINDOW, x, y, windowWidth, windowHeight, nullptr,
+    const HWND h = CreateWindowExW(WS_EX_APPWINDOW, ALT_TAB_PROXY_CLASS, proxy->caption.c_str(),
+        WS_OVERLAPPEDWINDOW, windowBounds.left, windowBounds.top, windowWidth, windowHeight, nullptr,
         nullptr, instance, proxy.get());
     if (!h) return nullptr;
     proxy->window = h;
@@ -1922,7 +1921,7 @@ static std::unique_ptr<AltTabProxy> CreateAltTabProxy(const AltTabProxyGroup& gr
     DwmSetWindowAttribute(h, DWMWA_FORCE_ICONIC_REPRESENTATION, &enabled, sizeof(enabled));
     DwmSetWindowAttribute(h, DWMWA_HAS_ICONIC_BITMAP, &enabled, sizeof(enabled));
     SetWindowSealedIcon(h, representative);
-    SetWindowPos(h, HWND_BOTTOM, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (!IsWindowVisible(h)) return nullptr;
     return proxy;
 }
@@ -1939,11 +1938,13 @@ static HWND FindAltTabProxyTarget(HWND window) {
 }
 
 static void RefreshAltTabProxyPresentation(AltTabProxy& proxy) {
-    proxy.title = proxy.process;
-    if (!IsWindow(proxy.window)) return;
-    SetWindowTextW(proxy.window, proxy.title.c_str());
+    if (!IsWindow(proxy.window) || !UpdateAltTabProxyTitles(proxy)) return;
+    SetWindowTextW(proxy.window, proxy.caption.c_str());
+    const RECT bounds = OffscreenAltTabProxyBounds(proxy.layout);
+    SetWindowPos(proxy.window, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
+        bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
     DwmInvalidateIconicBitmaps(proxy.window);
-    InvalidateRect(proxy.window, nullptr, FALSE);
+    InvalidateRect(proxy.window, nullptr, TRUE);
 }
 
 // ============================================================================
@@ -2034,7 +2035,7 @@ static bool BeginNativeAltTabProxies(ReadCurrentDesktop readCurrentDesktop, HWND
         g_altTabPreviewDesktop = GUID{};
         return false;
     }
-    // EnumWindows supplies z-order; each EXE tag gets one card per virtual desktop.
+    // Keep EnumWindows' top-to-bottom order in each group's targets and title rows.
     for (const auto& group : groups) {
         if (auto proxy = CreateAltTabProxy(group))
             g_altTabProxies.push_back(std::move(proxy));
@@ -2389,87 +2390,67 @@ static bool FindShowDesktopClickBounds(HWND taskbar, POINT point, bool click, RE
 static RECT g_showDesktopPressedBounds{};
 static HWND g_showDesktopPressedTaskbar = nullptr;
 
-struct PrimaryWindowTransparency {
+struct PrimaryWindowMinimization {
     HWND window;
-    LONG_PTR extendedStyle;
-    COLORREF colorKey = 0;
-    BYTE alpha = 255;
-    DWORD layerFlags = 0;
+    bool pending;
 };
 
-static std::vector<PrimaryWindowTransparency> g_hiddenPrimaryWindows;
-static ULONGLONG g_primaryHideCompletedAt = 0;
+static std::vector<PrimaryWindowMinimization> g_minimizedPrimaryWindows;
+static ULONGLONG g_primaryMinimizeCompletedAt = 0;
 
-static bool SetPrimaryExtendedStyle(HWND h, LONG_PTR style) {
-    SetLastError(ERROR_SUCCESS);
-    return SetWindowLongPtrW(h, GWL_EXSTYLE, style) != 0 || GetLastError() == ERROR_SUCCESS;
+static auto FindPrimaryWindowMinimization(HWND window) {
+    return std::find_if(g_minimizedPrimaryWindows.begin(), g_minimizedPrimaryWindows.end(),
+        [window](const auto& state) { return state.window == window; });
 }
 
-static void RefreshPrimaryWindowFrame(HWND h) {
-    SetWindowPos(h, nullptr, 0, 0, 0, 0, WINDOW_FRAME_FLAGS | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
-}
-
-static bool HidePrimaryWindow(HWND h) {
-    if (!IsWindow(h) || !IsWindowVisible(h) ||
-        std::any_of(g_hiddenPrimaryWindows.begin(), g_hiddenPrimaryWindows.end(),
-            [h](const auto& state) { return state.window == h; })) return false;
-    PrimaryWindowTransparency state{h, GetWindowLongPtrW(h, GWL_EXSTYLE)};
-    if ((state.extendedStyle & WS_EX_LAYERED) &&
-        !GetLayeredWindowAttributes(h, &state.colorKey, &state.alpha, &state.layerFlags)) return false;
-
-    // Preserve WS_VISIBLE and the original shell-facing extended styles.
-    if (!SetPrimaryExtendedStyle(h, state.extendedStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT))
-        return false;
-    if (!SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA)) {
-        SetPrimaryExtendedStyle(h, state.extendedStyle);
-        RefreshPrimaryWindowFrame(h);
-        return false;
-    }
-    g_hiddenPrimaryWindows.push_back(state);
-    RefreshPrimaryWindowFrame(h);
+static bool MinimizePrimaryWindow(HWND window) {
+    if (!IsWindowVisible(window) || IsIconic(window) ||
+        FindPrimaryWindowMinimization(window) != g_minimizedPrimaryWindows.end()) return false;
+    if (!ShowWindowAsync(window, SW_SHOWMINNOACTIVE)) return false;
+    g_minimizedPrimaryWindows.push_back({window, !IsIconic(window)});
     return true;
 }
 
-static bool RestorePrimaryWindow(const PrimaryWindowTransparency& state) {
-    const HWND h = state.window;
-    if (!IsWindow(h)) return true;
-    const DWORD flags = (state.extendedStyle & WS_EX_LAYERED) ? state.layerFlags : LWA_ALPHA;
-    if (!SetLayeredWindowAttributes(h, state.colorKey, state.alpha, flags)) return false;
-    if (!SetPrimaryExtendedStyle(h, state.extendedStyle)) {
-        SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-        return false;
+static void RestoreMinimizedPrimaryWindows() {
+    g_primaryMinimizeCompletedAt = 0;
+    std::vector<PrimaryWindowMinimization> batch;
+    batch.swap(g_minimizedPrimaryWindows);
+    for (const auto& state : batch) {
+        // A restore queued behind an outstanding minimize also handles a fast second click.
+        if (!IsWindow(state.window) || (!state.pending && !IsIconic(state.window))) continue;
+        RecordLassoWindowRestoration(state.window);
+        if (!ShowWindowAsync(state.window, SW_SHOWNOACTIVATE)) {
+            g_restoredWindowPresentations.erase(state.window);
+            g_minimizedPrimaryWindows.push_back(state);
+        }
     }
-    RefreshPrimaryWindowFrame(h);
-    return true;
 }
 
-static void RestoreHiddenPrimaryWindows() {
-    g_primaryHideCompletedAt = 0;
-    std::vector<PrimaryWindowTransparency> batch;
-    batch.swap(g_hiddenPrimaryWindows);
-    for (const auto& state : batch)
-        if (!RestorePrimaryWindow(state)) g_hiddenPrimaryWindows.push_back(state);
+static bool IsPrimaryMinimizeFeedback(DWORD event, DWORD time) {
+    if (!g_primaryMinimizeCompletedAt || GetTickCount64() - g_primaryMinimizeCompletedAt >= 1500)
+        return false;
+    const auto sinceMinimize = static_cast<LONG>(time - static_cast<DWORD>(g_primaryMinimizeCompletedAt));
+    const bool activation = event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_FOCUS;
+    // Minimizing the foreground window can activate a different HWND asynchronously.
+    return sinceMinimize <= 0 || (activation && sinceMinimize <= 300);
 }
 
 static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
                                          DWORD ownProcess = GetCurrentProcessId()) {
-    if (g_hiddenPrimaryWindows.empty() ||
+    if (g_minimizedPrimaryWindows.empty() ||
         (event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW))
         return;
     if (GetAncestor(h, GA_ROOT) != h || !IsValidAppWindow(h) || IsSwitcherWindow(h) ||
-        g_sealedWindowStates.contains(h)) return;
+        IsIconic(h) || g_sealedWindowStates.contains(h)) return;
     DWORD process = 0;
     GetWindowThreadProcessId(h, &process);
     if (!process || process == ownProcess ||
         (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
-    // An automatic foreground change caused by hiding the active window
-    // is delivered asynchronously by WinEvent after the batch ends.
-    if (g_primaryHideCompletedAt && GetTickCount64() - g_primaryHideCompletedAt < 1500 &&
-        static_cast<LONG>(time - static_cast<DWORD>(g_primaryHideCompletedAt)) <= 0)
-        return;
+
+    if (IsPrimaryMinimizeFeedback(event, time)) return;
     if (event == EVENT_SYSTEM_FOREGROUND && GetForegroundWindow() != h) return;
     if (event != EVENT_OBJECT_CREATE && !IsWindowVisible(h)) return;
-    RestoreHiddenPrimaryWindows();
+    RestoreMinimizedPrimaryWindows();
 }
 
 // Keep the original candidate filters: current desktop, visible, not minimized,
@@ -2500,8 +2481,8 @@ static BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
 
 static void TogglePrimaryWindows() {
     if (g_InSnapWindows) ExecuteCollectRestore();
-    if (!g_hiddenPrimaryWindows.empty()) {
-        RestoreHiddenPrimaryWindows();
+    if (!g_minimizedPrimaryWindows.empty()) {
+        RestoreMinimizedPrimaryWindows();
         return;
     }
 
@@ -2509,12 +2490,9 @@ static void TogglePrimaryWindows() {
     std::vector<HWND> candidates;
     ToggleContext context{&candidates, primary};
     EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
-    for (HWND h : candidates) HidePrimaryWindow(h);
-    const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
-    if (std::any_of(g_hiddenPrimaryWindows.begin(), g_hiddenPrimaryWindows.end(),
-            [foreground](const auto& state) { return state.window == foreground; }))
-        SetForegroundWindow(GetShellWindow());
-    g_primaryHideCompletedAt = GetTickCount64();
+    g_minimizedPrimaryWindows.reserve(candidates.size());
+    for (HWND window : candidates) MinimizePrimaryWindow(window);
+    if (!g_minimizedPrimaryWindows.empty()) g_primaryMinimizeCompletedAt = GetTickCount64();
 }
 
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -2648,6 +2626,58 @@ std::mutex g_fileMutex;
 	return (finalStyle & WS_VISIBLE) != 0;
 }
 
+// Opening a file can activate an existing app window without creating a new one.
+static void RestoreSealedApplicationOnEvent(DWORD event, HWND window, DWORD time,
+                                            ReadWindowDesktop readDesktop = GetWindowDesktopGuid,
+                                            DWORD ownProcess = GetCurrentProcessId()) {
+    const bool activating = event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_FOCUS;
+    if (g_InSnapWindows || g_sealedWindowStates.empty() ||
+        (!activating && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW) ||
+        !IsWindow(window) || GetAncestor(window, GA_ROOT) != window || IsSwitcherWindow(window))
+        return;
+    if (activating && (GetForegroundWindow() != window || IsPrimaryMinimizeFeedback(event, time))) return;
+    if (IsLassoRestorationEvent(window, time)) return;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (!pid || pid == ownProcess) return;
+
+    const auto sealed = g_sealedWindowStates.find(window);
+    const bool tagged = GetPropW(window, L"MTU_EXE_TAG") != nullptr;
+    if (tagged) {
+        if (!activating || sealed == g_sealedWindowStates.end()) return;
+        const auto sealedAt = sealed->second.sealedAt;
+        if (sealedAt && GetTickCount64() - sealedAt < 3000 &&
+            static_cast<LONG>(time - static_cast<DWORD>(sealedAt)) <= 0) return;
+    } else if (!IsValidAppWindow(window)) {
+        return;
+    }
+
+    const std::wstring process = tagged ? ReadTaggedExe(window) : GetRealProcessName(window);
+    if (!IsIdentifiedProcess(process) ||
+        (_wcsicmp(process.c_str(), L"explorer.exe") == 0 && !WindowClassIs(window, L"CabinetWClass")))
+        return;
+    GUID desktop{};
+    if (!readDesktop(window, desktop, true) &&
+        (!tagged || !GetCurrentDesktopGuid(desktop))) return;
+    if (tagged && !TaggedDesktopMatches(window, desktop)) return;
+
+    // Snapshot candidates before restoring, since success erases the seal records.
+    std::vector<HWND> matches;
+    for (const auto& entry : g_sealedWindowStates) {
+        const HWND target = entry.first;
+        if (target != window && IsWindow(target) && TaggedDesktopMatches(target, desktop) &&
+            _wcsicmp(ReadTaggedExe(target).c_str(), process.c_str()) == 0) {
+            GUID targetDesktop{};
+            if (!readDesktop(target, targetDesktop, false) || IsEqualGUID(targetDesktop, desktop))
+                matches.push_back(target);
+        }
+    }
+    for (HWND target : matches) ShowWindowAndShowTaskbarIcon(target);
+    // An existing window opened through a file association keeps its focus.
+    if (tagged) ShowWindowAndShowTaskbarIcon(window);
+}
+
 static HWND g_taskViewWindow = nullptr;
 
 static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
@@ -2659,13 +2689,9 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
         // onto a different window that later receives the same handle value.
         DiscardWindowSealedIcon(hwnd);
         g_sealedWindowStates.erase(hwnd);
-        g_restoredWindowShows.erase(hwnd);
-        auto forget = [hwnd](std::vector<HWND>& v) {
-            v.erase(std::remove(v.begin(), v.end(), hwnd), v.end());
-        };
-        forget(g_HiddenWindowsCache);
+        g_restoredWindowPresentations.erase(hwnd);
         RemoveAltTabProxyTarget(hwnd);
-        std::erase_if(g_hiddenPrimaryWindows,
+        std::erase_if(g_minimizedPrimaryWindows,
             [hwnd](const auto& state) { return state.window == hwnd; });
         return;
     }
@@ -2678,60 +2704,31 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 	std::wstring className = cls;
 	std::wstring windowTitle = title;
 
-    bool restoredByLasso = false;
-    if (event == EVENT_OBJECT_SHOW && idC == CHILDID_SELF) {
-        const auto show = g_restoredWindowShows.find(hwnd);
-        if (show != g_restoredWindowShows.end()) {
-            // WinEvent's timestamp and the low 32 bits of uptime use the same
-            // clock. Unsigned subtraction also handles the timestamp wrap.
-            restoredByLasso = dwM - static_cast<DWORD>(show->second) <= 3000;
-            if (restoredByLasso || GetTickCount64() - show->second > 3000)
-                g_restoredWindowShows.erase(show);
+    const bool restoredByLasso = idC == CHILDID_SELF &&
+        IsLassoRestorationEvent(hwnd, dwM);
+
+    if (idC == CHILDID_SELF &&
+        (event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND)) {
+        const auto primary = FindPrimaryWindowMinimization(hwnd);
+        if (primary != g_minimizedPrimaryWindows.end()) {
+            if (event == EVENT_SYSTEM_MINIMIZESTART) {
+                if (IsIconic(hwnd)) primary->pending = false;
+                if (g_primaryMinimizeCompletedAt && GetTickCount64() - g_primaryMinimizeCompletedAt < 1500)
+                    g_primaryMinimizeCompletedAt = GetTickCount64();
+            } else if (!IsIconic(hwnd)) {
+                g_minimizedPrimaryWindows.erase(primary);
+                RestoreMinimizedPrimaryWindows();
+            }
+            return;
         }
     }
 
     if (idC == CHILDID_SELF && !restoredByLasso)
         RestorePrimaryWindowsOnEvent(event, hwnd, dwM);
 
-    // A new window can wake its local app group. A show event generated by
-    // Alt+Tab must not unseal the other windows in that same group.
-    if (!restoredByLasso && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE) &&
-        idC == CHILDID_SELF && !g_InSnapWindows &&
-        !IsSwitcherWindow(hwnd) &&
-        IsWindowOnCurrentVirtualDesktop(hwnd)) {
-
-        // A show/create event for an already tagged window must not trigger
-        // a recursive reactivation as we change its styles.
-        const bool tagged = GetPropW(hwnd, L"MTU_EXE_TAG") != nullptr;
-        if (!tagged) {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(hwnd, &pid);
-            if (pid && pid != GetCurrentProcessId()) {
-                std::wstring process = GetRealProcessName(hwnd);
-                if (_wcsicmp(process.c_str(), L"explorer.exe") == 0 &&
-                    className != L"CabinetWClass") process.clear();
-                if (!process.empty() && process != L"Unknown" &&
-                    _wcsicmp(process.c_str(), L"ApplicationFrameHost.exe") != 0 &&
-                    !g_sealedWindowStates.empty()) {
-                    RefreshWindowCache();
-                    g_HiddenWindowsCache.erase(
-                        std::remove_if(g_HiddenWindowsCache.begin(),
-                            g_HiddenWindowsCache.end(),
-                            [&](HWND h) {
-                                if (!IsWindow(h)) return true;
-                                if (!CanUnsealOnCurrentDesktop(h)) return false;
-                                HANDLE prop = GetPropW(h, L"MTU_EXE_TAG");
-                                wchar_t taggedName[MAX_PATH]{};
-                                if (!prop || !GlobalGetAtomNameW(
-                                    static_cast<ATOM>(reinterpret_cast<UINT_PTR>(prop)),
-                                    taggedName, MAX_PATH)) return false;
-                                if (_wcsicmp(process.c_str(), taggedName) != 0) return false;
-                                return ShowWindowAndShowTaskbarIcon(h);
-                            }), g_HiddenWindowsCache.end());
-                }
-            }
-        }
-    }
+    if (idC == CHILDID_SELF)
+        RestoreSealedApplicationOnEvent(event, hwnd, dwM);
+    if (event == EVENT_OBJECT_FOCUS) return;
 
 	// --- 2. 最小化/恢复监控 (仅针对窗口自身 idC == CHILDID_SELF) ---
 	if (idC == CHILDID_SELF) {
@@ -2821,7 +2818,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 // taskbar and hide/restore work. Hook callbacks live on the main message thread.
 static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDesktop = GetWindowDesktopGuid,
                                    bool (*isOnCurrentDesktop)(HWND) = IsWindowOnCurrentVirtualDesktop) {
-    RestoreHiddenPrimaryWindows();
+    RestoreMinimizedPrimaryWindows();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !isOnCurrentDesktop(root)) return;
@@ -2843,7 +2840,7 @@ static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDeskto
 }
 
 static void HideOtherApplications(HWND foreground) {
-    RestoreHiddenPrimaryWindows();
+    RestoreMinimizedPrimaryWindows();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;
@@ -2901,7 +2898,7 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         break;
     case WM_CLOSE:
         ExecuteCollectRestore();
-        RestoreHiddenPrimaryWindows();
+        RestoreMinimizedPrimaryWindows();
         RestoreAllSealedWindows();
         DestroyWindow(hwnd);
         return 0;
@@ -2940,6 +2937,9 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     g_hObjHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
+    const HWINEVENTHOOK focusHook = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
+        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
     SetEvent(ready);
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -2948,8 +2948,9 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     }
     if (g_hSysHook) UnhookWinEvent(g_hSysHook);
     if (g_hObjHook) UnhookWinEvent(g_hObjHook);
+    if (focusHook) UnhookWinEvent(focusHook);
     ExecuteCollectRestore();
-    RestoreHiddenPrimaryWindows();
+    RestoreMinimizedPrimaryWindows();
     RestoreAllSealedWindows();
     g_hLassoCoordinator = nullptr;
     winrt::uninit_apartment();

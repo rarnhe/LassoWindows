@@ -17,6 +17,15 @@ struct Window {
     operator HWND() const { return h; }
     Window(const Window&) = delete;
 };
+
+static void DispatchPendingWindowMessages() {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+
 struct Ini {
     std::filesystem::path path;
     Ini() {
@@ -128,65 +137,132 @@ void run(const std::string& name) {
         g_testWindowDesktopIds.clear();
         return;
     }
-    if (name == "primary_hide_roundtrip") {
-        Window plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED);
+    if (name == "primary_minimize_roundtrip") {
+        Window plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED), alreadyMinimized;
         ShowWindow(plain, SW_SHOWNOACTIVATE);
-        ShowWindow(layered, SW_SHOWNOACTIVATE);
+        ShowWindow(layered, SW_SHOWMAXIMIZED);
+        ShowWindow(alreadyMinimized, SW_SHOWMINNOACTIVE);
+        CHECK(IsZoomed(layered) && IsIconic(alreadyMinimized));
         CHECK(SetLayeredWindowAttributes(layered, RGB(13, 42, 71), 173, LWA_ALPHA));
         const LONG_PTR plainStyle = GetWindowLongPtrW(plain, GWL_EXSTYLE);
         const LONG_PTR layeredStyle = GetWindowLongPtrW(layered, GWL_EXSTYLE);
-        CHECK(HidePrimaryWindow(plain));
-        CHECK(HidePrimaryWindow(layered));
-        CHECK(g_hiddenPrimaryWindows.size() == 2 &&
-            g_hiddenPrimaryWindows[0].window == plain.h && g_hiddenPrimaryWindows[1].window == layered.h);
-        for (HWND h : {plain.h, layered.h}) {
-            CHECK(IsWindowVisible(h));
-            CHECK((GetWindowLongPtrW(h, GWL_EXSTYLE) & (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW)) == WS_EX_APPWINDOW);
-            CHECK(GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TRANSPARENT);
-            BYTE hiddenAlpha = 255;
-            CHECK(GetLayeredWindowAttributes(h, nullptr, &hiddenAlpha, nullptr) && hiddenAlpha == 0);
-        }
-        CHECK(!HidePrimaryWindow(plain));
+        CHECK(MinimizePrimaryWindow(plain));
+        CHECK(MinimizePrimaryWindow(layered));
+        CHECK(!MinimizePrimaryWindow(alreadyMinimized));
+        CHECK(g_minimizedPrimaryWindows.size() == 2 &&
+            g_minimizedPrimaryWindows[0].window == plain.h && g_minimizedPrimaryWindows[1].window == layered.h);
+        DispatchPendingWindowMessages();
+        CHECK(IsIconic(plain) && IsIconic(layered));
+        CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
+        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
+        CHECK(!MinimizePrimaryWindow(plain));
         CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
-        CHECK(g_hiddenPrimaryWindows.empty());
-        CHECK(IsWindowVisible(plain) && IsWindowVisible(layered));
+        CHECK(g_minimizedPrimaryWindows.empty());
+        DispatchPendingWindowMessages();
+        CHECK(!IsIconic(plain) && !IsIconic(layered) && IsIconic(alreadyMinimized));
+        CHECK(IsZoomed(layered)); // Preserve the pre-minimize maximized placement.
         CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
         CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
         BYTE alpha = 0;
         DWORD flags = 0;
         CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
         CHECK(alpha == 173 && flags == LWA_ALPHA);
+
+        CHECK(MinimizePrimaryWindow(plain));
+        CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
+        DispatchPendingWindowMessages();
+        CHECK(!IsIconic(plain));
         return;
     }
-    if (name == "primary_hide_events") {
+    if (name == "primary_minimize_events") {
         Window a, b, incoming;
         for (HWND h : {a.h, b.h, incoming.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
         const DWORD noOwnProcess = 0;
         for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND}) {
-            CHECK(HidePrimaryWindow(a));
-            CHECK(HidePrimaryWindow(b));
-            g_primaryHideCompletedAt = GetTickCount64();
-            DWORD time = static_cast<DWORD>(g_primaryHideCompletedAt);
+            CHECK(MinimizePrimaryWindow(a));
+            CHECK(MinimizePrimaryWindow(b));
+            DispatchPendingWindowMessages();
+            CHECK(IsIconic(a) && IsIconic(b));
+            g_primaryMinimizeCompletedAt = GetTickCount64();
+            DWORD time = static_cast<DWORD>(g_primaryMinimizeCompletedAt);
             if (event == EVENT_SYSTEM_FOREGROUND) {
                 SetForegroundWindow(incoming);
                 CHECK(GetForegroundWindow() == incoming.h);
             }
             RestorePrimaryWindowsOnEvent(event, incoming, time, noOwnProcess);
-            CHECK(g_hiddenPrimaryWindows.size() == 2); // Ignore events already queued at hide time.
+            CHECK(g_minimizedPrimaryWindows.size() == 2); // Ignore events queued before minimizing.
             RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, noOwnProcess);
-            CHECK(g_hiddenPrimaryWindows.size() == 2);
+            CHECK(g_minimizedPrimaryWindows.size() == 2);
             RestorePrimaryWindowsOnEvent(event, incoming, time + 1); // Own process.
-            CHECK(g_hiddenPrimaryWindows.size() == 2);
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
-            CHECK(g_hiddenPrimaryWindows.empty());
-            CHECK(IsWindowVisible(a) && IsWindowVisible(b));
+            CHECK(g_minimizedPrimaryWindows.size() == 2);
+            if (event == EVENT_SYSTEM_FOREGROUND) {
+                RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
+                CHECK(g_minimizedPrimaryWindows.size() == 2);
+            }
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 301, noOwnProcess);
+            CHECK(g_minimizedPrimaryWindows.empty());
+            DispatchPendingWindowMessages();
+            CHECK(!IsIconic(a) && !IsIconic(b));
         }
-        CHECK(HidePrimaryWindow(a));
-        CHECK(HidePrimaryWindow(b));
+        CHECK(MinimizePrimaryWindow(a));
+        CHECK(MinimizePrimaryWindow(b));
+        DispatchPendingWindowMessages();
+        WinEventProc(nullptr, EVENT_SYSTEM_MINIMIZESTART, b, OBJID_WINDOW, CHILDID_SELF, 0, 0);
+        CHECK(!g_minimizedPrimaryWindows.back().pending);
         WinEventProc(nullptr, EVENT_OBJECT_DESTROY, a, OBJID_WINDOW, CHILDID_SELF, 0, 0);
-        CHECK(g_hiddenPrimaryWindows.size() == 1 && g_hiddenPrimaryWindows.front().window == b.h);
-        RestoreHiddenPrimaryWindows();
-        CHECK(IsWindowVisible(b) && !(GetWindowLongPtrW(b, GWL_EXSTYLE) & WS_EX_LAYERED));
+        CHECK(g_minimizedPrimaryWindows.size() == 1 && g_minimizedPrimaryWindows.front().window == b.h);
+        RestoreMinimizedPrimaryWindows();
+        DispatchPendingWindowMessages();
+        CHECK(!IsIconic(b) && !(GetWindowLongPtrW(b, GWL_EXSTYLE) & WS_EX_LAYERED));
+        return;
+    }
+    if (name == "app_open_unseals_group") {
+        Window reused, sibling, anotherDesktop, moved, otherApp, launched;
+        static constexpr GUID here{1}, there{2};
+        for (HWND h : {reused.h, sibling.h, anotherDesktop.h, moved.h, otherApp.h, launched.h}) {
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+            g_testWindowDesktopIds[h] = here;
+        }
+        g_testWindowDesktopIds[anotherDesktop.h] = there;
+        g_testWindowDesktopIds[moved.h] = there;
+        const auto process = GetRealProcessName(launched);
+        CHECK(IsIdentifiedProcess(process));
+        CHECK(SealWindow(reused, process, here));
+        CHECK(SealWindow(sibling, process, here));
+        CHECK(SealWindow(anotherDesktop, process, there));
+        CHECK(SealWindow(moved, process, here));
+        CHECK(SealWindow(otherApp, L"other.exe", here));
+
+        const auto readDesktop = +[](HWND h, GUID& id, bool requireCurrent) {
+            const auto it = g_testWindowDesktopIds.find(h);
+            if (it == g_testWindowDesktopIds.end()) return false;
+            id = it->second;
+            return !requireCurrent || IsEqualGUID(id, here);
+        };
+        SetForegroundWindow(reused);
+        CHECK(GetForegroundWindow() == reused.h);
+        const auto sealTime = static_cast<DWORD>(g_sealedWindowStates.at(reused.h).sealedAt);
+        const auto userEventTime = static_cast<DWORD>(GetTickCount64()) + 1;
+        RestoreSealedApplicationOnEvent(EVENT_OBJECT_SHOW, reused, userEventTime, readDesktop, 0);
+        RestoreSealedApplicationOnEvent(EVENT_SYSTEM_FOREGROUND, reused, sealTime, readDesktop, 0);
+        CHECK(g_sealedWindowStates.size() == 5);
+        g_InSnapWindows = true;
+        RestoreSealedApplicationOnEvent(EVENT_SYSTEM_FOREGROUND, reused, userEventTime, readDesktop, 0);
+        CHECK(g_sealedWindowStates.size() == 5);
+        g_InSnapWindows = false;
+        RestoreSealedApplicationOnEvent(EVENT_OBJECT_FOCUS, reused, userEventTime, readDesktop, 0);
+        CHECK(ReadTaggedExe(reused).empty() && ReadTaggedExe(sibling).empty());
+        CHECK(GetForegroundWindow() == reused.h);
+        CHECK(g_sealedWindowStates.size() == 3);
+
+        CHECK(SealWindow(sibling, process, here));
+        RestoreSealedApplicationOnEvent(EVENT_OBJECT_CREATE, launched, userEventTime, readDesktop, 0);
+        CHECK(ReadTaggedExe(sibling).empty());
+        CHECK(g_sealedWindowStates.contains(anotherDesktop.h));
+        CHECK(g_sealedWindowStates.contains(moved.h));
+        CHECK(g_sealedWindowStates.contains(otherApp.h));
+        RestoreAllSealedWindows();
+        g_testWindowDesktopIds.clear();
         return;
     }
     if (name == "show_desktop_button_hit_test") {
@@ -267,6 +343,8 @@ void run(const std::string& name) {
         CHECK(SealWindow(desktopB, L"shared-fixture.exe", deskB));
         CHECK(SealWindow(desktopBSibling, L"shared-fixture.exe", deskB));
         CHECK(SealWindow(desktopBOtherApp, L"separate-fixture.exe", deskB));
+        CHECK(SetWindowPos(desktopB, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE));
         CHECK(TaggedDesktopMatches(desktopA, deskA));
         CHECK(TaggedDesktopMatches(desktopB, deskB));
         CHECK(TaggedDesktopMatches(desktopBSibling, deskB));
@@ -304,7 +382,9 @@ void run(const std::string& name) {
         const auto* sharedGroup = FindAltTabProxy(sharedProxy);
         CHECK(sharedGroup && sharedGroup->targets.size() == 2);
         CHECK(sharedGroup->process == L"shared-fixture.exe");
-        CHECK(sharedGroup->title == L"shared-fixture.exe");
+        CHECK((sharedGroup->targets == std::vector<HWND>{desktopB.h, desktopBSibling.h}));
+        CHECK((sharedGroup->windowTitles == std::vector<std::wstring>{
+            L"Shared document A", L"Shared document B"}));
         CHECK(GetWindowLongPtrW(desktopA, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
@@ -698,9 +778,14 @@ void run(const std::string& name) {
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     } else if (name == "collect") {
+        Window sibling;
         ShowWindow(w, SW_SHOWNOACTIVATE);
-        SetWindowTextW(w, L"Preview fixture title");
+        ShowWindow(sibling, SW_SHOWNOACTIVATE);
+        SetWindowTextW(w, L"A long preview fixture window title");
+        SetWindowTextW(sibling, L"A\nB");
         CHECK(SealWindow(w, L"preview-fixture.exe", GUID{1}));
+        CHECK(SealWindow(sibling, L"preview-fixture.exe", GUID{1}));
+        CHECK(SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE));
         const auto currentDesktop = +[](GUID& id) { id = GUID{1}; return true; };
         CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
         const HWND proxy = ProxyFor(w);
@@ -708,36 +793,47 @@ void run(const std::string& name) {
         CHECK(FindAltTabProxyTarget(proxy) == w.h);
         const auto* card = FindAltTabProxy(proxy);
         CHECK(card && card->process == L"preview-fixture.exe");
-        CHECK(card->title == L"preview-fixture.exe");
-        CHECK(card->targets.size() == 1);
+        CHECK((card->windowTitles == std::vector<std::wstring>{L"A long preview fixture window title", L"A B"}));
         wchar_t proxyCaption[MAX_PATH]{};
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
-        CHECK(std::wstring(proxyCaption) == L"preview-fixture.exe");
-        CHECK(card->thumbnailWidth > 0);
+        CHECK(std::wstring(proxyCaption) == L"preview-fixture.exe 「2」");
+        const int originalWidth = card->layout.width;
+        CHECK(originalWidth > 0);
         CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
         CHECK(g_altTabProxies.size() == 1 && ProxyFor(w) == proxy);
+        RemoveAltTabProxyTarget(w);
+        CHECK(FindAltTabProxyTarget(proxy) == sibling.h);
+        CHECK(card->windowTitles == std::vector<std::wstring>{L"A B"});
+        CHECK(card->layout.width < originalWidth);
+        CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
+        CHECK(std::wstring(proxyCaption) == L"preview-fixture.exe 「1」");
         ExecuteCollectRestore();
         CHECK(!IsWindow(proxy) && g_altTabProxies.empty() && !g_InSnapWindows);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(ReadTaggedExe(w) == L"preview-fixture.exe");
         CHECK(ShowWindowAndShowTaskbarIcon(w));
+        CHECK(ShowWindowAndShowTaskbarIcon(sibling));
         CHECK(ReadTaggedExe(w).empty());
     } else if (name == "proxy_title_thumbnail") {
-        const std::wstring title =
-            L"TheLongestApplicationExecutableNameInThisGroupMustRemainOnOneLine.exe";
+        AltTabProxy proxy;
+        proxy.caption = L"Windows fixture.exe 「8」";
+        const std::wstring longest =
+            L"Windows with a long title must appear on one line, even after multiple short titles";
+        proxy.windowTitles = {L"W1", L"W2", L"W3", longest, L"W5", L"W6", L"W7", L"W8"};
         const COLORREF accent = RGB(42, 130, 218);
         HDC dc = CreateCompatibleDC(nullptr);
         CHECK(dc);
 
-        ProxyThumbnailLayout layout{};
-        CHECK(MeasureProxyThumbnailLayout(dc, title, layout));
-        CHECK(layout.height == 60);
-        CHECK(layout.fontHeight == 19);
-        CHECK(layout.paddingX == 12);
-        CHECK(layout.textWidth > 0);
-        CHECK(layout.width == layout.textWidth + layout.paddingX * 2);
+        auto& layout = proxy.layout;
+        CHECK(MeasureProxyThumbnailLayout(dc, proxy.windowTitles, layout));
+        CHECK(layout.height > PROXY_THUMBNAIL_MIN_HEIGHT);
+        ProxyThumbnailLayout longestLayout;
+        CHECK(MeasureProxyThumbnailLayout(dc, {longest}, longestLayout));
+        CHECK(layout.width == longestLayout.width);
+        CHECK(layout.height == PROXY_TITLE_PADDING_Y * 2 + PROXY_HEADER_GAP +
+            (static_cast<int>(proxy.windowTitles.size()) + 1) * layout.rowHeight);
 
         HFONT font = CreateProxyTitleFont();
         CHECK(font);
@@ -754,11 +850,25 @@ void run(const std::string& name) {
         const HGDIOBJ old = SelectObject(dc, bitmap);
         CHECK(old && old != HGDI_ERROR);
         CHECK(RenderProxyTitleBitmap(dc, static_cast<DWORD*>(bits), layout.width,
-            layout.height, title, accent));
+            layout.height, proxy, accent));
         GdiFlush();
 
         const auto* pixels = static_cast<const DWORD*>(bits);
         CHECK((pixels[0] >> 24) == 0); // The thumbnail background stays transparent.
+        auto leftmostInk = [&](int top) {
+            int left = layout.width;
+            for (int y = top; y < top + layout.rowHeight; ++y) {
+                for (int x = PROXY_TITLE_PADDING_X; x < left; ++x) {
+                    if (pixels[static_cast<size_t>(y) * layout.width + x] >> 24) left = x;
+                }
+            }
+            return left;
+        };
+        const int headerLeft = leftmostInk(PROXY_TITLE_PADDING_Y);
+        CHECK(headerLeft < layout.width);
+        int rowTop = PROXY_TITLE_PADDING_Y + layout.rowHeight + PROXY_HEADER_GAP;
+        for (size_t i = 0; i < proxy.windowTitles.size(); ++i, rowTop += layout.rowHeight)
+            CHECK(leftmostInk(rowTop) == headerLeft); // Every line starts with the same "W" glyph.
         size_t visiblePixels = 0;
         for (size_t i = 0; i < static_cast<size_t>(layout.width) * layout.height; ++i) {
             const DWORD pixel = pixels[i];
