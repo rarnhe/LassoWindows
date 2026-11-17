@@ -129,7 +129,7 @@ if ($LogDirectory) {
 
 $lines.Add("")
 $lines.Add("## 覆盖范围")
-$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、EXE 文件名与虚拟桌面 GUID 双标签、跨虚拟桌面同名 EXE 封印、Shift+Win+C 跨全部虚拟桌面隐藏其他应用及 UWP WM_CLOSE、会话级虚拟桌面 GUID 优先解析、Alt+Tab 按 MTU_EXE_TAG 合并代理并以 EXE 名称作为标题、代理缩略图 60 px 高/微软雅黑 19 px/按标题实测宽度/透明背景且不叠加蛛网、Alt+Tab 标题图标黑色蛛网与任务栏强调色蛛网图标及图标资源恢复、主屏原生 Show Desktop 按钮精确命中、主屏窗口透明化及还原、桌面图标点击例外/双击/右键规则、临时透明样式不添加 WS_EX_TOOLWINDOW、键盘与其他鼠标操作恢复、关闭/清理边界、图标缓存和主屏筛选条件。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
+$lines.Add("真实编译 LassoWindows.cpp，验证 INI 图标解析、EXE 文件名与虚拟桌面 GUID 双标签、跨虚拟桌面同名 EXE 封印、Shift+Win+C 跨全部虚拟桌面隐藏其他应用及 UWP WM_CLOSE、会话级虚拟桌面 GUID 优先解析、Alt+Tab 按 MTU_EXE_TAG 合并代理、Z 序窗口标题及代理收窄、缩略图内 EXE 标题与多行窗口标题左对齐、按最宽窗口标题与行数计算尺寸、透明背景及主题强调色文字、Alt+Tab 标题图标黑色蛛网与任务栏强调色蛛网图标及图标资源恢复、主屏原生 Show Desktop 按钮精确命中、主屏窗口透明化及还原、桌面图标点击例外/双击/右键规则、临时透明样式不添加 WS_EX_TOOLWINDOW、键盘与其他鼠标操作恢复、关闭/清理边界、图标缓存和主屏筛选条件。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。")
 $lines.Add("")
 $lines.Add("全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。")
 

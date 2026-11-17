@@ -267,6 +267,8 @@ void run(const std::string& name) {
         CHECK(SealWindow(desktopB, L"shared-fixture.exe", deskB));
         CHECK(SealWindow(desktopBSibling, L"shared-fixture.exe", deskB));
         CHECK(SealWindow(desktopBOtherApp, L"separate-fixture.exe", deskB));
+        CHECK(SetWindowPos(desktopB, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE));
         CHECK(TaggedDesktopMatches(desktopA, deskA));
         CHECK(TaggedDesktopMatches(desktopB, deskB));
         CHECK(TaggedDesktopMatches(desktopBSibling, deskB));
@@ -304,7 +306,9 @@ void run(const std::string& name) {
         const auto* sharedGroup = FindAltTabProxy(sharedProxy);
         CHECK(sharedGroup && sharedGroup->targets.size() == 2);
         CHECK(sharedGroup->process == L"shared-fixture.exe");
-        CHECK(sharedGroup->title == L"shared-fixture.exe");
+        CHECK((sharedGroup->targets == std::vector<HWND>{desktopB.h, desktopBSibling.h}));
+        CHECK((sharedGroup->windowTitles == std::vector<std::wstring>{
+            L"Shared document A", L"Shared document B"}));
         CHECK(GetWindowLongPtrW(desktopA, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
@@ -698,9 +702,14 @@ void run(const std::string& name) {
         SuppressHiddenWindows(w, EVENT_OBJECT_SHOW);
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     } else if (name == "collect") {
+        Window sibling;
         ShowWindow(w, SW_SHOWNOACTIVATE);
-        SetWindowTextW(w, L"Preview fixture title");
+        ShowWindow(sibling, SW_SHOWNOACTIVATE);
+        SetWindowTextW(w, L"A long preview fixture window title");
+        SetWindowTextW(sibling, L"A\nB");
         CHECK(SealWindow(w, L"preview-fixture.exe", GUID{1}));
+        CHECK(SealWindow(sibling, L"preview-fixture.exe", GUID{1}));
+        CHECK(SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE));
         const auto currentDesktop = +[](GUID& id) { id = GUID{1}; return true; };
         CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
         const HWND proxy = ProxyFor(w);
@@ -708,36 +717,45 @@ void run(const std::string& name) {
         CHECK(FindAltTabProxyTarget(proxy) == w.h);
         const auto* card = FindAltTabProxy(proxy);
         CHECK(card && card->process == L"preview-fixture.exe");
-        CHECK(card->title == L"preview-fixture.exe");
-        CHECK(card->targets.size() == 1);
+        CHECK((card->windowTitles == std::vector<std::wstring>{L"A long preview fixture window title", L"A B"}));
         wchar_t proxyCaption[MAX_PATH]{};
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
         CHECK(std::wstring(proxyCaption) == L"preview-fixture.exe");
-        CHECK(card->thumbnailWidth > 0);
+        const int originalWidth = card->layout.width;
+        CHECK(originalWidth > 0);
         CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
         CHECK(g_altTabProxies.size() == 1 && ProxyFor(w) == proxy);
+        RemoveAltTabProxyTarget(w);
+        CHECK(FindAltTabProxyTarget(proxy) == sibling.h);
+        CHECK(card->windowTitles == std::vector<std::wstring>{L"A B"});
+        CHECK(card->layout.width < originalWidth);
         ExecuteCollectRestore();
         CHECK(!IsWindow(proxy) && g_altTabProxies.empty() && !g_InSnapWindows);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(ReadTaggedExe(w) == L"preview-fixture.exe");
         CHECK(ShowWindowAndShowTaskbarIcon(w));
+        CHECK(ShowWindowAndShowTaskbarIcon(sibling));
         CHECK(ReadTaggedExe(w).empty());
     } else if (name == "proxy_title_thumbnail") {
-        const std::wstring title =
-            L"TheLongestApplicationExecutableNameInThisGroupMustRemainOnOneLine.exe";
+        AltTabProxy proxy;
+        proxy.process = L"Windows fixture.exe";
+        const std::wstring longest =
+            L"Windows with a long title must appear on one line, even after multiple short titles";
+        proxy.windowTitles = {L"W1", L"W2", L"W3", longest, L"W5", L"W6", L"W7", L"W8"};
         const COLORREF accent = RGB(42, 130, 218);
         HDC dc = CreateCompatibleDC(nullptr);
         CHECK(dc);
 
-        ProxyThumbnailLayout layout{};
-        CHECK(MeasureProxyThumbnailLayout(dc, title, layout));
-        CHECK(layout.height == 60);
-        CHECK(layout.fontHeight == 19);
-        CHECK(layout.paddingX == 12);
-        CHECK(layout.textWidth > 0);
-        CHECK(layout.width == layout.textWidth + layout.paddingX * 2);
+        auto& layout = proxy.layout;
+        CHECK(MeasureProxyThumbnailLayout(dc, proxy.windowTitles, layout));
+        CHECK(layout.height > PROXY_THUMBNAIL_MIN_HEIGHT);
+        ProxyThumbnailLayout longestLayout;
+        CHECK(MeasureProxyThumbnailLayout(dc, {longest}, longestLayout));
+        CHECK(layout.width == longestLayout.width);
+        CHECK(layout.height == PROXY_TITLE_PADDING_Y * 2 + PROXY_HEADER_GAP +
+            (static_cast<int>(proxy.windowTitles.size()) + 1) * layout.rowHeight);
 
         HFONT font = CreateProxyTitleFont();
         CHECK(font);
@@ -754,11 +772,25 @@ void run(const std::string& name) {
         const HGDIOBJ old = SelectObject(dc, bitmap);
         CHECK(old && old != HGDI_ERROR);
         CHECK(RenderProxyTitleBitmap(dc, static_cast<DWORD*>(bits), layout.width,
-            layout.height, title, accent));
+            layout.height, proxy, accent));
         GdiFlush();
 
         const auto* pixels = static_cast<const DWORD*>(bits);
         CHECK((pixels[0] >> 24) == 0); // The thumbnail background stays transparent.
+        auto leftmostInk = [&](int top) {
+            int left = layout.width;
+            for (int y = top; y < top + layout.rowHeight; ++y) {
+                for (int x = PROXY_TITLE_PADDING_X; x < left; ++x) {
+                    if (pixels[static_cast<size_t>(y) * layout.width + x] >> 24) left = x;
+                }
+            }
+            return left;
+        };
+        const int headerLeft = leftmostInk(PROXY_TITLE_PADDING_Y);
+        CHECK(headerLeft < layout.width);
+        int rowTop = PROXY_TITLE_PADDING_Y + layout.rowHeight + PROXY_HEADER_GAP;
+        for (size_t i = 0; i < proxy.windowTitles.size(); ++i, rowTop += layout.rowHeight)
+            CHECK(leftmostInk(rowTop) == headerLeft); // Every line starts with the same "W" glyph.
         size_t visiblePixels = 0;
         for (size_t i = 0; i < static_cast<size_t>(layout.width) * layout.height; ++i) {
             const DWORD pixel = pixels[i];
