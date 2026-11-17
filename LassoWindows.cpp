@@ -1718,7 +1718,7 @@ static bool MeasureProxyThumbnailLayout(HDC dc, const std::wstring& title,
     DeleteObject(font);
     if (!measured || extent.cx < 0 || metrics.tmHeight <= 0) return false;
 
-    layout.width = (std::max)(1, extent.cx + PROXY_TITLE_PADDING_X * 2);
+    layout.width = (std::max)(1, static_cast<int>(extent.cx) + PROXY_TITLE_PADDING_X * 2);
     layout.height = PROXY_THUMBNAIL_HEIGHT;
     layout.fontHeight = PROXY_TITLE_FONT_SIZE;
     layout.paddingX = PROXY_TITLE_PADDING_X;
