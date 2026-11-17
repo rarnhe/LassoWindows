@@ -1622,11 +1622,9 @@ static BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 // 隐藏同类型窗口后，alt+tab临时查看下。
 // --- 全局变量与状态控制 ---
 static GUID g_altTabPreviewDesktop{};
-static constexpr int PROXY_THUMBNAIL_MIN_HEIGHT = 137;
 static constexpr int PROXY_TITLE_FONT_SIZE = 19;
 static constexpr int PROXY_TITLE_PADDING_X = 0;
 static constexpr int PROXY_TITLE_PADDING_Y = 8;
-static constexpr int PROXY_HEADER_GAP = 8;
 
 struct ProxyThumbnailLayout {
     int width = 0;
@@ -1706,9 +1704,8 @@ static bool MeasureProxyThumbnailLayout(HDC dc, const std::vector<std::wstring>&
 
     layout.width = (std::max)(1, widest + PROXY_TITLE_PADDING_X * 2);
     layout.rowHeight = metrics.tmHeight + metrics.tmExternalLeading;
-    const int contentHeight = (static_cast<int>(windowTitles.size()) + 1) * layout.rowHeight +
-        PROXY_HEADER_GAP + PROXY_TITLE_PADDING_Y * 2;
-    layout.height = (std::max)(PROXY_THUMBNAIL_MIN_HEIGHT, contentHeight);
+    layout.height = static_cast<int>(windowTitles.size()) * layout.rowHeight +
+        PROXY_TITLE_PADDING_Y * 2;
     return true;
 }
 
@@ -1723,7 +1720,11 @@ static bool UpdateAltTabProxyTitles(AltTabProxy& proxy) {
     const bool measured = MeasureProxyThumbnailLayout(dc, titles, layout);
     ReleaseDC(nullptr, dc);
     if (!measured) return false;
-    proxy.caption = proxy.process + L" 「" + std::to_wstring(titles.size()) + L"」";
+    std::wstring displayProcess = proxy.process;
+    if (displayProcess.size() >= 4 &&
+        _wcsicmp(displayProcess.c_str() + displayProcess.size() - 4, L".exe") == 0)
+        displayProcess.resize(displayProcess.size() - 4);
+    proxy.caption = displayProcess + L" 「" + std::to_wstring(titles.size()) + L"」";
     proxy.windowTitles = std::move(titles);
     proxy.layout = layout;
     return true;
@@ -1752,12 +1753,7 @@ static bool DrawAltTabProxyCard(HDC dc, int width, int height, const AltTabProxy
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, color);
         SetTextAlign(dc, TA_LEFT | TA_TOP | TA_NOUPDATECP);
-        RECT header{PROXY_TITLE_PADDING_X, PROXY_TITLE_PADDING_Y,
-                    layout.width - PROXY_TITLE_PADDING_X, PROXY_TITLE_PADDING_Y + layout.rowHeight};
-        DrawTextW(dc, proxy.caption.c_str(), static_cast<int>(proxy.caption.size()), &header,
-            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-
-        int y = header.bottom + PROXY_HEADER_GAP;
+        int y = PROXY_TITLE_PADDING_Y;
         for (const auto& title : proxy.windowTitles) {
             if (!TextOutW(dc, PROXY_TITLE_PADDING_X, y, title.c_str(), static_cast<int>(title.size())))
                 drawn = false;
