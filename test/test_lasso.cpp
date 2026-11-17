@@ -796,7 +796,7 @@ void run(const std::string& name) {
         CHECK((card->windowTitles == std::vector<std::wstring>{L"A long preview fixture window title", L"A B"}));
         wchar_t proxyCaption[MAX_PATH]{};
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
-        CHECK(std::wstring(proxyCaption) == L"preview-fixture.exe 「2」");
+        CHECK(std::wstring(proxyCaption) == L"preview-fixture 「2」");
         const int originalWidth = card->layout.width;
         CHECK(originalWidth > 0);
         CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
@@ -808,7 +808,7 @@ void run(const std::string& name) {
         CHECK(card->windowTitles == std::vector<std::wstring>{L"A B"});
         CHECK(card->layout.width < originalWidth);
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
-        CHECK(std::wstring(proxyCaption) == L"preview-fixture.exe 「1」");
+        CHECK(std::wstring(proxyCaption) == L"preview-fixture 「1」");
         ExecuteCollectRestore();
         CHECK(!IsWindow(proxy) && g_altTabProxies.empty() && !g_InSnapWindows);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
@@ -817,8 +817,18 @@ void run(const std::string& name) {
         CHECK(ShowWindowAndShowTaskbarIcon(sibling));
         CHECK(ReadTaggedExe(w).empty());
     } else if (name == "proxy_title_thumbnail") {
+        Window captionWindow;
+        AltTabProxy captionCase;
+        captionCase.process = L"Notepad.EXE";
+        captionCase.targets = {captionWindow.h};
+        CHECK(UpdateAltTabProxyTitles(captionCase));
+        CHECK(captionCase.caption == L"Notepad 「1」");
+        captionCase.process = L"Notepad";
+        CHECK(UpdateAltTabProxyTitles(captionCase));
+        CHECK(captionCase.caption == L"Notepad 「1」");
+
         AltTabProxy proxy;
-        proxy.caption = L"Windows fixture.exe 「8」";
+        proxy.caption = L"Windows fixture 「8」";
         const std::wstring longest =
             L"Windows with a long title must appear on one line, even after multiple short titles";
         proxy.windowTitles = {L"W1", L"W2", L"W3", longest, L"W5", L"W6", L"W7", L"W8"};
@@ -828,12 +838,11 @@ void run(const std::string& name) {
 
         auto& layout = proxy.layout;
         CHECK(MeasureProxyThumbnailLayout(dc, proxy.windowTitles, layout));
-        CHECK(layout.height > PROXY_THUMBNAIL_MIN_HEIGHT);
         ProxyThumbnailLayout longestLayout;
         CHECK(MeasureProxyThumbnailLayout(dc, {longest}, longestLayout));
         CHECK(layout.width == longestLayout.width);
-        CHECK(layout.height == PROXY_TITLE_PADDING_Y * 2 + PROXY_HEADER_GAP +
-            (static_cast<int>(proxy.windowTitles.size()) + 1) * layout.rowHeight);
+        CHECK(layout.height == PROXY_TITLE_PADDING_Y * 2 +
+            static_cast<int>(proxy.windowTitles.size()) * layout.rowHeight);
 
         HFONT font = CreateProxyTitleFont();
         CHECK(font);
@@ -864,11 +873,14 @@ void run(const std::string& name) {
             }
             return left;
         };
-        const int headerLeft = leftmostInk(PROXY_TITLE_PADDING_Y);
-        CHECK(headerLeft < layout.width);
-        int rowTop = PROXY_TITLE_PADDING_Y + layout.rowHeight + PROXY_HEADER_GAP;
+        const int firstRowLeft = leftmostInk(PROXY_TITLE_PADDING_Y);
+        CHECK(firstRowLeft < layout.width);
+        int rowTop = PROXY_TITLE_PADDING_Y;
         for (size_t i = 0; i < proxy.windowTitles.size(); ++i, rowTop += layout.rowHeight)
-            CHECK(leftmostInk(rowTop) == headerLeft); // Every line starts with the same "W" glyph.
+            CHECK(leftmostInk(rowTop) == firstRowLeft); // Every line starts with the same "W" glyph.
+        for (int y = 0; y < PROXY_TITLE_PADDING_Y; ++y)
+            for (int x = 0; x < layout.width; ++x)
+                CHECK((pixels[static_cast<size_t>(y) * layout.width + x] >> 24) == 0);
         size_t visiblePixels = 0;
         for (size_t i = 0; i < static_cast<size_t>(layout.width) * layout.height; ++i) {
             const DWORD pixel = pixels[i];
