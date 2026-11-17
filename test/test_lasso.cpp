@@ -302,9 +302,9 @@ void run(const std::string& name) {
         CHECK(separateProxy && separateProxy != sharedProxy);
         CHECK(!ProxyFor(desktopA));
         const auto* sharedGroup = FindAltTabProxy(sharedProxy);
-        CHECK(sharedGroup && sharedGroup->targets.size() == 2 && sharedGroup->titles.size() == 2);
-        CHECK(std::find(sharedGroup->titles.begin(), sharedGroup->titles.end(), L"Shared document A") != sharedGroup->titles.end());
-        CHECK(std::find(sharedGroup->titles.begin(), sharedGroup->titles.end(), L"Shared document B") != sharedGroup->titles.end());
+        CHECK(sharedGroup && sharedGroup->targets.size() == 2);
+        CHECK(sharedGroup->process == L"shared-fixture.exe");
+        CHECK(sharedGroup->title == L"shared-fixture.exe");
         CHECK(GetWindowLongPtrW(desktopA, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
