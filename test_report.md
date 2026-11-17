@@ -1,9 +1,9 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-17 07:36:18
-- 测试源码基准提交：0e68b6b57644a6e0feb142e23c64a4f6331338fb
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/44039900796
+- 时间（UTC）：2026-11-17 08:46:03
+- 测试源码基准提交：4c711ff26e456c77d22e5f810049ef7b390e556f
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/44049429178
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
 - 统计：通过 45 / 失败 0 / 跳过 0 / 共 45
@@ -47,7 +47,7 @@
 | untracked_restore | 通过 |
 | suppress | 通过 |
 | collect | 通过 |
-| proxy_title_bitmap | 通过 |
+| proxy_title_thumbnail | 通过 |
 | icon_cache | 通过 |
 | toggle_filter | 通过 |
 | hide_others_all_desktops | 通过 |
@@ -69,6 +69,6 @@
 ## 失败详情
 
 ## 覆盖范围
-真实编译 LassoWindows.cpp，验证 INI 图标解析、EXE 文件名与虚拟桌面 GUID 双标签、跨虚拟桌面同名 EXE 封印、Shift+Win+C 跨全部虚拟桌面隐藏其他应用及 UWP WM_CLOSE、会话级虚拟桌面 GUID 优先解析、切换桌面后 Alt+Tab 按 MTU_EXE_TAG 合并当前虚拟桌面代理卡片、逐行绘制标题并验证透明背景与主题强调色、主屏原生 Show Desktop 按钮精确命中、主屏窗口透明化及还原、桌面图标点击例外/双击/右键规则、临时透明样式不添加 WS_EX_TOOLWINDOW、键盘与其他鼠标操作恢复、关闭/清理边界、图标缓存和主屏筛选条件。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
+真实编译 LassoWindows.cpp，验证 INI 图标解析、EXE 文件名与虚拟桌面 GUID 双标签、跨虚拟桌面同名 EXE 封印、Shift+Win+C 跨全部虚拟桌面隐藏其他应用及 UWP WM_CLOSE、会话级虚拟桌面 GUID 优先解析、Alt+Tab 按 MTU_EXE_TAG 合并代理并以 EXE 名称作为标题、代理缩略图 60 px 高/微软雅黑 19 px/按标题实测宽度/透明背景且不叠加蛛网、Alt+Tab 标题图标黑色蛛网与任务栏强调色蛛网图标及图标资源恢复、主屏原生 Show Desktop 按钮精确命中、主屏窗口透明化及还原、桌面图标点击例外/双击/右键规则、临时透明样式不添加 WS_EX_TOOLWINDOW、键盘与其他鼠标操作恢复、关闭/清理边界、图标缓存和主屏筛选条件。测试仅操作自己创建的窗口，不启动 WinMain 或安装全局钩子。
 
 全局快捷键、Alt+Tab 实际缩略图、Explorer/UWP、任务栏视觉效果、多显示器/不同 DPI、虚拟桌面切换与通知仍需交互式人工验证；这些项目未计入自动测试通过数。
