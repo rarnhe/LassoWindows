@@ -17,6 +17,15 @@ struct Window {
     operator HWND() const { return h; }
     Window(const Window&) = delete;
 };
+
+static void DispatchPendingWindowMessages() {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+
 struct Ini {
     std::filesystem::path path;
     Ini() {
@@ -142,12 +151,14 @@ void run(const std::string& name) {
         CHECK(!MinimizePrimaryWindow(alreadyMinimized));
         CHECK(g_minimizedPrimaryWindows.size() == 2 &&
             g_minimizedPrimaryWindows[0].window == plain.h && g_minimizedPrimaryWindows[1].window == layered.h);
+        DispatchPendingWindowMessages();
         CHECK(IsIconic(plain) && IsIconic(layered));
         CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
         CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
         CHECK(!MinimizePrimaryWindow(plain));
         CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
         CHECK(g_minimizedPrimaryWindows.empty());
+        DispatchPendingWindowMessages();
         CHECK(!IsIconic(plain) && !IsIconic(layered) && IsIconic(alreadyMinimized));
         CHECK(IsZoomed(layered)); // Preserve the pre-minimize maximized placement.
         CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
@@ -156,6 +167,11 @@ void run(const std::string& name) {
         DWORD flags = 0;
         CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
         CHECK(alpha == 173 && flags == LWA_ALPHA);
+
+        CHECK(MinimizePrimaryWindow(plain));
+        CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
+        DispatchPendingWindowMessages();
+        CHECK(!IsIconic(plain));
         return;
     }
     if (name == "primary_minimize_events") {
@@ -165,6 +181,8 @@ void run(const std::string& name) {
         for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND}) {
             CHECK(MinimizePrimaryWindow(a));
             CHECK(MinimizePrimaryWindow(b));
+            DispatchPendingWindowMessages();
+            CHECK(IsIconic(a) && IsIconic(b));
             g_primaryMinimizeCompletedAt = GetTickCount64();
             DWORD time = static_cast<DWORD>(g_primaryMinimizeCompletedAt);
             if (event == EVENT_SYSTEM_FOREGROUND) {
@@ -172,7 +190,7 @@ void run(const std::string& name) {
                 CHECK(GetForegroundWindow() == incoming.h);
             }
             RestorePrimaryWindowsOnEvent(event, incoming, time, noOwnProcess);
-            CHECK(g_minimizedPrimaryWindows.size() == 2); // Ignore events already queued at hide time.
+            CHECK(g_minimizedPrimaryWindows.size() == 2); // Ignore events queued before minimizing.
             RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, noOwnProcess);
             CHECK(g_minimizedPrimaryWindows.size() == 2);
             RestorePrimaryWindowsOnEvent(event, incoming, time + 1); // Own process.
@@ -183,15 +201,18 @@ void run(const std::string& name) {
             }
             RestorePrimaryWindowsOnEvent(event, incoming, time + 301, noOwnProcess);
             CHECK(g_minimizedPrimaryWindows.empty());
+            DispatchPendingWindowMessages();
             CHECK(!IsIconic(a) && !IsIconic(b));
         }
         CHECK(MinimizePrimaryWindow(a));
         CHECK(MinimizePrimaryWindow(b));
+        DispatchPendingWindowMessages();
         WinEventProc(nullptr, EVENT_SYSTEM_MINIMIZESTART, b, OBJID_WINDOW, CHILDID_SELF, 0, 0);
         CHECK(!g_minimizedPrimaryWindows.back().pending);
         WinEventProc(nullptr, EVENT_OBJECT_DESTROY, a, OBJID_WINDOW, CHILDID_SELF, 0, 0);
         CHECK(g_minimizedPrimaryWindows.size() == 1 && g_minimizedPrimaryWindows.front().window == b.h);
         RestoreMinimizedPrimaryWindows();
+        DispatchPendingWindowMessages();
         CHECK(!IsIconic(b) && !(GetWindowLongPtrW(b, GWL_EXSTYLE) & WS_EX_LAYERED));
         return;
     }

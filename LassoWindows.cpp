@@ -2417,10 +2417,22 @@ static void RestoreMinimizedPrimaryWindows() {
     batch.swap(g_minimizedPrimaryWindows);
     for (const auto& state : batch) {
         // A restore queued behind an outstanding minimize also handles a fast second click.
-        if (IsWindow(state.window) && (state.pending || IsIconic(state.window)) &&
-            !ShowWindowAsync(state.window, SW_SHOWNOACTIVATE))
+        if (!IsWindow(state.window) || (!state.pending && !IsIconic(state.window))) continue;
+        RecordLassoWindowRestoration(state.window);
+        if (!ShowWindowAsync(state.window, SW_SHOWNOACTIVATE)) {
+            g_restoredWindowPresentations.erase(state.window);
             g_minimizedPrimaryWindows.push_back(state);
+        }
     }
+}
+
+static bool IsPrimaryMinimizeFeedback(DWORD event, DWORD time) {
+    if (!g_primaryMinimizeCompletedAt || GetTickCount64() - g_primaryMinimizeCompletedAt >= 1500)
+        return false;
+    const auto sinceMinimize = static_cast<LONG>(time - static_cast<DWORD>(g_primaryMinimizeCompletedAt));
+    const bool activation = event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_FOCUS;
+    // Minimizing the foreground window can activate a different HWND asynchronously.
+    return sinceMinimize <= 0 || (activation && sinceMinimize <= 300);
 }
 
 static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
@@ -2435,12 +2447,7 @@ static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
     if (!process || process == ownProcess ||
         (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
 
-    const auto elapsed = GetTickCount64() - g_primaryMinimizeCompletedAt;
-    const auto sinceMinimize = static_cast<LONG>(time - static_cast<DWORD>(g_primaryMinimizeCompletedAt));
-    // A minimize can hand off foreground activation asynchronously, including to another monitor.
-    if (g_primaryMinimizeCompletedAt && elapsed < 1500 &&
-        (sinceMinimize <= 0 || (event == EVENT_SYSTEM_FOREGROUND && sinceMinimize <= 300)))
-        return;
+    if (IsPrimaryMinimizeFeedback(event, time)) return;
     if (event == EVENT_SYSTEM_FOREGROUND && GetForegroundWindow() != h) return;
     if (event != EVENT_OBJECT_CREATE && !IsWindowVisible(h)) return;
     RestoreMinimizedPrimaryWindows();
@@ -2628,7 +2635,7 @@ static void RestoreSealedApplicationOnEvent(DWORD event, HWND window, DWORD time
         (!activating && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW) ||
         !IsWindow(window) || GetAncestor(window, GA_ROOT) != window || IsSwitcherWindow(window))
         return;
-    if (activating && GetForegroundWindow() != window) return;
+    if (activating && (GetForegroundWindow() != window || IsPrimaryMinimizeFeedback(event, time))) return;
     if (IsLassoRestorationEvent(window, time)) return;
 
     DWORD pid = 0;
@@ -2657,7 +2664,8 @@ static void RestoreSealedApplicationOnEvent(DWORD event, HWND window, DWORD time
 
     // Snapshot candidates before restoring, since success erases the seal records.
     std::vector<HWND> matches;
-    for (const auto& [target, state] : g_sealedWindowStates) {
+    for (const auto& entry : g_sealedWindowStates) {
+        const HWND target = entry.first;
         if (target != window && IsWindow(target) && TaggedDesktopMatches(target, desktop) &&
             _wcsicmp(ReadTaggedExe(target).c_str(), process.c_str()) == 0) {
             GUID targetDesktop{};
@@ -2718,7 +2726,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
     if (idC == CHILDID_SELF && !restoredByLasso)
         RestorePrimaryWindowsOnEvent(event, hwnd, dwM);
 
-    if (idC == CHILDID_SELF && !restoredByLasso)
+    if (idC == CHILDID_SELF)
         RestoreSealedApplicationOnEvent(event, hwnd, dwM);
     if (event == EVENT_OBJECT_FOCUS) return;
 
