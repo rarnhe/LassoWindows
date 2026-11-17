@@ -1735,14 +1735,15 @@ static bool MeasureProxyTitleLayout(HDC dc, int width, int height,
             TEXTMETRICW metrics{};
             const bool hasMetrics = GetTextMetricsW(dc, &metrics) != FALSE;
             const int lineHeight = hasMetrics
-                ? (std::max)(1, metrics.tmHeight + metrics.tmExternalLeading) : 0;
+                ? (std::max)(1, static_cast<int>(metrics.tmHeight + metrics.tmExternalLeading)) : 0;
             int maxTextWidth = 0;
             if (hasMetrics) {
                 for (const auto& title : titles) {
                     RECT measured{0, 0, 0, 0};
                     DrawTextW(dc, title.c_str(), static_cast<int>(title.size()), &measured,
                         DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-                    maxTextWidth = (std::max)(maxTextWidth, measured.right - measured.left);
+                    const int measuredWidth = static_cast<int>(measured.right - measured.left);
+                    maxTextWidth = (std::max)(maxTextWidth, measuredWidth);
                 }
             }
             SelectObject(dc, previous);
