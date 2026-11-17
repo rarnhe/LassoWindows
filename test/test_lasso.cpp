@@ -302,9 +302,9 @@ void run(const std::string& name) {
         CHECK(separateProxy && separateProxy != sharedProxy);
         CHECK(!ProxyFor(desktopA));
         const auto* sharedGroup = FindAltTabProxy(sharedProxy);
-        CHECK(sharedGroup && sharedGroup->targets.size() == 2 && sharedGroup->titles.size() == 2);
-        CHECK(std::find(sharedGroup->titles.begin(), sharedGroup->titles.end(), L"Shared document A") != sharedGroup->titles.end());
-        CHECK(std::find(sharedGroup->titles.begin(), sharedGroup->titles.end(), L"Shared document B") != sharedGroup->titles.end());
+        CHECK(sharedGroup && sharedGroup->targets.size() == 2);
+        CHECK(sharedGroup->process == L"shared-fixture.exe");
+        CHECK(sharedGroup->title == L"shared-fixture.exe");
         CHECK(GetWindowLongPtrW(desktopA, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
@@ -708,8 +708,12 @@ void run(const std::string& name) {
         CHECK(FindAltTabProxyTarget(proxy) == w.h);
         const auto* card = FindAltTabProxy(proxy);
         CHECK(card && card->process == L"preview-fixture.exe");
-        CHECK(card->targets.size() == 1 && card->titles.size() == 1);
-        CHECK(card->titles.front() == L"Preview fixture title");
+        CHECK(card->title == L"preview-fixture.exe");
+        CHECK(card->targets.size() == 1);
+        wchar_t proxyCaption[MAX_PATH]{};
+        CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
+        CHECK(std::wstring(proxyCaption) == L"preview-fixture.exe");
+        CHECK(card->thumbnailWidth > 0);
         CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
@@ -720,35 +724,43 @@ void run(const std::string& name) {
         CHECK(ReadTaggedExe(w) == L"preview-fixture.exe");
         CHECK(ShowWindowAndShowTaskbarIcon(w));
         CHECK(ReadTaggedExe(w).empty());
-    } else if (name == "proxy_title_bitmap") {
-        constexpr int width = PROXY_FRAME_WIDTH;
-        constexpr int height = PROXY_FRAME_HEIGHT;
-        const std::vector<std::wstring> titles{
-            L"Short title",
-            L"The longest window caption in this group must fit on one line without wrapping"
-        };
+    } else if (name == "proxy_title_thumbnail") {
+        const std::wstring title =
+            L"TheLongestApplicationExecutableNameInThisGroupMustRemainOnOneLine.exe";
         const COLORREF accent = RGB(42, 130, 218);
         HDC dc = CreateCompatibleDC(nullptr);
         CHECK(dc);
+
+        ProxyThumbnailLayout layout{};
+        CHECK(MeasureProxyThumbnailLayout(dc, title, layout));
+        CHECK(layout.height == 60);
+        CHECK(layout.fontHeight == 19);
+        CHECK(layout.paddingX == 12);
+        CHECK(layout.textWidth > 0);
+        CHECK(layout.width == layout.textWidth + layout.paddingX * 2);
+
+        HFONT font = CreateProxyTitleFont();
+        CHECK(font);
+        LOGFONTW logFont{};
+        CHECK(GetObjectW(font, sizeof(logFont), &logFont) == sizeof(logFont));
+        CHECK(logFont.lfHeight == -19);
+        CHECK(wcscmp(logFont.lfFaceName, L"Microsoft YaHei") == 0);
+        DeleteObject(font);
+
         void* bits = nullptr;
-        const auto info = ProxyBitmapInfo(width, height);
+        const auto info = ProxyBitmapInfo(layout.width, layout.height);
         HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
         CHECK(bitmap && bits);
         const HGDIOBJ old = SelectObject(dc, bitmap);
         CHECK(old && old != HGDI_ERROR);
-
-        ProxyTitleLayout layout{};
-        CHECK(MeasureProxyTitleLayout(dc, width, height, titles, layout));
-        CHECK(layout.fontHeight > 0);
-        CHECK(layout.maxTextWidth <= width - layout.paddingX * 2);
-        CHECK(layout.lineHeight * static_cast<int>(titles.size()) <= height - layout.paddingY * 2);
-        CHECK(RenderProxyTitleBitmap(dc, static_cast<DWORD*>(bits), width, height, titles, accent));
+        CHECK(RenderProxyTitleBitmap(dc, static_cast<DWORD*>(bits), layout.width,
+            layout.height, title, accent));
         GdiFlush();
 
         const auto* pixels = static_cast<const DWORD*>(bits);
-        CHECK((pixels[0] >> 24) == 0); // The bitmap background is transparent.
+        CHECK((pixels[0] >> 24) == 0); // The thumbnail background stays transparent.
         size_t visiblePixels = 0;
-        for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+        for (size_t i = 0; i < static_cast<size_t>(layout.width) * layout.height; ++i) {
             const DWORD pixel = pixels[i];
             const int alpha = static_cast<int>((pixel >> 24) & 0xff);
             const int red = static_cast<int>((pixel >> 16) & 0xff);
