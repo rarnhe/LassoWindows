@@ -81,7 +81,8 @@ void iniTest(const std::string& name) {
 }
 static HWND ProxyFor(HWND target) {
     for (const auto& proxy : g_altTabProxies)
-        if (proxy->target == target) return proxy->window;
+        if (std::find(proxy->targets.begin(), proxy->targets.end(), target) != proxy->targets.end())
+            return proxy->window;
     return nullptr;
 }
 
@@ -301,17 +302,22 @@ void run(const std::string& name) {
         return;
     }
     if (name == "alt_tab_after_desktop_switch") {
-        Window desktopA, desktopB, desktopBSibling, coordinator;
+        Window desktopA, desktopB, desktopBSibling, desktopBOtherApp, coordinator;
         static constexpr GUID deskA{0x83fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xf9}};
         static constexpr GUID deskB{0x83fa8748, 0xa4c9, 0x4470, {0x8c, 0x7a, 0xe5, 0x7a, 0xa3, 0x2d, 0x85, 0xfa}};
-        for (HWND h : {desktopA.h, desktopB.h, desktopBSibling.h})
+        for (HWND h : {desktopA.h, desktopB.h, desktopBSibling.h, desktopBOtherApp.h})
             ShowWindow(h, SW_SHOWNOACTIVATE);
+        SetWindowTextW(desktopB, L"Shared document A");
+        SetWindowTextW(desktopBSibling, L"Shared document B");
+        SetWindowTextW(desktopBOtherApp, L"Separate application window");
         CHECK(SealWindow(desktopA, L"shared-fixture.exe", deskA));
         CHECK(SealWindow(desktopB, L"shared-fixture.exe", deskB));
         CHECK(SealWindow(desktopBSibling, L"shared-fixture.exe", deskB));
+        CHECK(SealWindow(desktopBOtherApp, L"separate-fixture.exe", deskB));
         CHECK(TaggedDesktopMatches(desktopA, deskA));
         CHECK(TaggedDesktopMatches(desktopB, deskB));
         CHECK(TaggedDesktopMatches(desktopBSibling, deskB));
+        CHECK(TaggedDesktopMatches(desktopBOtherApp, deskB));
 
         // Simulate the case where all same-EXE windows are sealed and the
         // foreground is the Shell: VDM cannot identify a current sealed HWND.
@@ -323,7 +329,7 @@ void run(const std::string& name) {
                 return true;
             }
             if (_wcsicmp(key, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops") == 0) {
-                id = deskA; // Stale unscoped value from the desktop we left.
+                id = deskA;
                 return true;
             }
             return false;
@@ -337,16 +343,24 @@ void run(const std::string& name) {
         g_hLassoCoordinator = coordinator;
         CHECK(BeginAltTabPreview(coordinator, nullptr, currentDesktop));
         CHECK(g_altTabProxies.size() == 2);
-        CHECK(ProxyFor(desktopB));
-        CHECK(ProxyFor(desktopBSibling));
+        const HWND sharedProxy = ProxyFor(desktopB);
+        const HWND separateProxy = ProxyFor(desktopBOtherApp);
+        CHECK(sharedProxy && sharedProxy == ProxyFor(desktopBSibling));
+        CHECK(separateProxy && separateProxy != sharedProxy);
         CHECK(!ProxyFor(desktopA));
+        const auto* sharedGroup = FindAltTabProxy(sharedProxy);
+        CHECK(sharedGroup && sharedGroup->targets.size() == 2 && sharedGroup->titles.size() == 2);
+        CHECK(std::find(sharedGroup->titles.begin(), sharedGroup->titles.end(), L"Shared document A") != sharedGroup->titles.end());
+        CHECK(std::find(sharedGroup->titles.begin(), sharedGroup->titles.end(), L"Shared document B") != sharedGroup->titles.end());
         CHECK(GetWindowLongPtrW(desktopA, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(desktopB, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
 
-        FinishAltTabPreview(ProxyFor(desktopB), currentDesktop);
+        FinishAltTabPreview(sharedProxy, currentDesktop);
         CHECK(!g_InSnapWindows && g_altTabProxies.empty());
         CHECK(GetPropW(desktopA, L"MTU_EXE_TAG") && GetPropW(desktopA, L"MTU_VD_TAG"));
         CHECK(g_sealedWindowStates.contains(desktopA.h));
+        CHECK(GetPropW(desktopBOtherApp, L"MTU_EXE_TAG"));
+        CHECK(g_sealedWindowStates.contains(desktopBOtherApp.h));
         for (HWND h : {desktopB.h, desktopBSibling.h}) {
             CHECK(!GetPropW(h, L"MTU_EXE_TAG") && !GetPropW(h, L"MTU_VD_TAG"));
             CHECK(!g_sealedWindowStates.contains(h));
@@ -354,8 +368,10 @@ void run(const std::string& name) {
         }
         g_hLassoCoordinator = nullptr;
         RestoreAllSealedWindows();
+        g_testWindowDesktopIds.clear();
         return;
     }
+
     if (name == "alt_tab_consecutive_previews") {
         Window preview(0), otherApp, coordinator;
         ShowWindow(preview, SW_SHOWNOACTIVATE);
@@ -730,84 +746,80 @@ void run(const std::string& name) {
         CHECK(!(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     } else if (name == "collect") {
         ShowWindow(w, SW_SHOWNOACTIVATE);
+        SetWindowTextW(w, L"Preview fixture title");
         CHECK(SealWindow(w, L"preview-fixture.exe", GUID{1}));
         const auto currentDesktop = +[](GUID& id) { id = GUID{1}; return true; };
         CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
         const HWND proxy = ProxyFor(w);
         CHECK(proxy && proxy != w.h && IsWindowVisible(proxy));
         CHECK(FindAltTabProxyTarget(proxy) == w.h);
+        const auto* card = FindAltTabProxy(proxy);
+        CHECK(card && card->process == L"preview-fixture.exe");
+        CHECK(card->targets.size() == 1 && card->titles.size() == 1);
+        CHECK(card->titles.front() == L"Preview fixture title");
         CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(BeginNativeAltTabProxies(currentDesktop, nullptr));
         CHECK(g_altTabProxies.size() == 1 && ProxyFor(w) == proxy);
-
-        HDC dc = CreateCompatibleDC(nullptr);
-        CHECK(dc);
-        void* bits = nullptr;
-        const auto info = ProxyBitmapInfo(PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT);
-        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-        CHECK(bitmap && bits);
-        HGDIOBJ old = SelectObject(dc, bitmap);
-        CHECK(old && old != HGDI_ERROR);
-        const auto& card = *g_altTabProxies.front();
-        card.frame->width = 8;
-        card.frame->height = 1;
-        card.frame->pixels.assign(8, 0xff224466);
-        PaintAltTabProxy(dc, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, card);
-        GdiFlush();
-        const auto* pixels = static_cast<const DWORD*>(bits);
-        constexpr int imageHeight = PROXY_FRAME_WIDTH / 8;
-        constexpr int imageTop = (PROXY_FRAME_HEIGHT - imageHeight) / 2;
-        constexpr int imageBottom = imageTop + imageHeight;
-        const auto rendered = std::vector<DWORD>(pixels, pixels +
-            static_cast<size_t>(PROXY_FRAME_WIDTH) * PROXY_FRAME_HEIGHT);
-
-        // The same glyph height yields the same centered pixels in a narrower box.
-        PatBlt(dc, 0, 0, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, WHITENESS);
-        constexpr int inset = 120;
-        DrawPreviewWeb(dc, RECT{inset, imageTop, PROXY_FRAME_WIDTH - inset, imageBottom});
-        GdiFlush();
-        RECT web{PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, 0, 0};
-        size_t blackPixels = 0;
-        size_t backgroundPixels = 0;
-        for (LONG y = 0; y < PROXY_FRAME_HEIGHT; ++y) {
-            for (LONG x = 0; x < PROXY_FRAME_WIDTH; ++x) {
-                const auto index = y * PROXY_FRAME_WIDTH + x;
-                const auto pixel = rendered[index] & 0xffffff;
-                const auto narrowPixel = pixels[index] & 0xffffff;
-                if (y < imageTop || y >= imageBottom) {
-                    CHECK(pixel == 0x000000);
-                    CHECK(narrowPixel == 0xffffff);
-                    continue;
-                }
-                if (pixel == 0x000000) ++blackPixels;
-                if (pixel == 0x224466) ++backgroundPixels;
-                else {
-                    web.left = (std::min)(web.left, x);
-                    web.top = (std::min)(web.top, y);
-                    web.right = (std::max)(web.right, x + 1);
-                    web.bottom = (std::max)(web.bottom, y + 1);
-                }
-                if (x >= inset && x < PROXY_FRAME_WIDTH - inset) {
-                    if (narrowPixel == 0x000000) CHECK(pixel == 0x000000);
-                    if (narrowPixel == 0xffffff) CHECK(pixel == 0x224466);
-                }
-            }
-        }
-        CHECK(blackPixels > 100 && backgroundPixels > 1000);
-        CHECK(web.top <= imageTop + 1 && web.bottom >= imageBottom - 1);
-        CHECK(web.left > inset && web.right < PROXY_FRAME_WIDTH - inset);
-        CHECK(abs(web.left + web.right - PROXY_FRAME_WIDTH) <= 3);
-        SelectObject(dc, old);
-        DeleteObject(bitmap);
-        DeleteDC(dc);
-
         ExecuteCollectRestore();
         CHECK(!IsWindow(proxy) && g_altTabProxies.empty() && !g_InSnapWindows);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(ReadTaggedExe(w) == L"preview-fixture.exe");
         CHECK(ShowWindowAndShowTaskbarIcon(w));
         CHECK(ReadTaggedExe(w).empty());
+    } else if (name == "proxy_title_bitmap") {
+        constexpr int width = PROXY_FRAME_WIDTH;
+        constexpr int height = PROXY_FRAME_HEIGHT;
+        const std::vector<std::wstring> titles{
+            L"Short title",
+            L"The longest window caption in this group must fit on one line without wrapping"
+        };
+        const COLORREF accent = RGB(42, 130, 218);
+        HDC dc = CreateCompatibleDC(nullptr);
+        CHECK(dc);
+        void* bits = nullptr;
+        const auto info = ProxyBitmapInfo(width, height);
+        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        CHECK(bitmap && bits);
+        const HGDIOBJ old = SelectObject(dc, bitmap);
+        CHECK(old && old != HGDI_ERROR);
+
+        ProxyTitleLayout layout{};
+        CHECK(MeasureProxyTitleLayout(dc, width, height, titles, layout));
+        CHECK(layout.fontHeight > 0);
+        CHECK(layout.maxTextWidth <= width - layout.paddingX * 2);
+        CHECK(layout.lineHeight * static_cast<int>(titles.size()) <= height - layout.paddingY * 2);
+        CHECK(RenderProxyTitleBitmap(dc, static_cast<DWORD*>(bits), width, height, titles, accent));
+        GdiFlush();
+
+        const auto* pixels = static_cast<const DWORD*>(bits);
+        CHECK((pixels[0] >> 24) == 0); // The bitmap background is transparent.
+        size_t visiblePixels = 0;
+        for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+            const DWORD pixel = pixels[i];
+            const int alpha = static_cast<int>((pixel >> 24) & 0xff);
+            const int red = static_cast<int>((pixel >> 16) & 0xff);
+            const int green = static_cast<int>((pixel >> 8) & 0xff);
+            const int blue = static_cast<int>(pixel & 0xff);
+            if (!alpha) {
+                CHECK((pixel & 0xffffff) == 0);
+                continue;
+            }
+            ++visiblePixels;
+            const int expectedRed = (GetRValue(accent) * alpha + 127) / 255;
+            const int expectedGreen = (GetGValue(accent) * alpha + 127) / 255;
+            const int expectedBlue = (GetBValue(accent) * alpha + 127) / 255;
+            CHECK(red >= expectedRed - 1 && red <= expectedRed + 1);
+            CHECK(green >= expectedGreen - 1 && green <= expectedGreen + 1);
+            CHECK(blue >= expectedBlue - 1 && blue <= expectedBlue + 1);
+        }
+        CHECK(visiblePixels > 100);
+        SelectObject(dc, old);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
+        return;
+
+
     } else if (name == "sealed_preview_icon_roundtrip") {
         RegisterFixtureClass(L"SealedPreviewIconFixture");
         Window w(WS_EX_APPWINDOW, nullptr, L"SealedPreviewIconFixture");
