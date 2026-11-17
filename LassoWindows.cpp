@@ -1868,9 +1868,12 @@ static LRESULT CALLBACK AltTabProxyWndProc(HWND h, UINT message, WPARAM wp, LPAR
         case WM_DWMSENDICONICTHUMBNAIL:
             SupplyAltTabProxyBitmap(h, *proxy, message, HIWORD(lp), LOWORD(lp));
             return 0;
-        case WM_DWMSENDICONICLIVEPREVIEWBITMAP:
-            SupplyAltTabProxyBitmap(h, *proxy, message, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT);
+        case WM_DWMSENDICONICLIVEPREVIEWBITMAP: {
+            RECT client{};
+            GetClientRect(h, &client);
+            SupplyAltTabProxyBitmap(h, *proxy, message, client.right, client.bottom);
             return 0;
+        }
         case WM_PAINT: {
             PAINTSTRUCT paint{};
             const HDC dc = BeginPaint(h, &paint);
