@@ -493,7 +493,8 @@ void run(const std::string& name) {
         CHECK(desktopReads == 1);
         CHECK(BeginNativeAltTabProxies(firstDesktop, nullptr)); // Repeated tabs reuse the preview.
         CHECK(desktopReads == 1);
-        CHECK(g_altTabProxies.size() == 3);
+        CHECK(g_altTabProxies.size() == 2); // current + selected share one EXE proxy; otherProcess has its own.
+        CHECK(ProxyFor(current) == ProxyFor(selected));
         CHECK(GetWindowLongPtrW(selected, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(otherProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
         CHECK(GetWindowLongPtrW(invalidProcess, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
@@ -514,7 +515,8 @@ void run(const std::string& name) {
         checkSealed(otherDesktopSibling, deskB);
 
         CHECK(BeginNativeAltTabProxies(secondDesktop, nullptr));
-        CHECK(g_altTabProxies.size() == 2);
+        CHECK(g_altTabProxies.size() == 1);
+        CHECK(ProxyFor(otherDesktop) == ProxyFor(otherDesktopSibling));
         for (HWND h : {otherDesktop.h, otherDesktopSibling.h}) {
             CHECK(ProxyFor(h));
             CHECK(IsWindowVisible(h) && (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
