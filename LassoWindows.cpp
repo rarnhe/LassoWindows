@@ -1647,16 +1647,18 @@ static BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 // 隐藏同类型窗口后，alt+tab临时查看下。
 // --- 全局变量与状态控制 ---
 static GUID g_altTabPreviewDesktop{};
-// The native switcher sees one Lasso-owned top-level window per sealed EXE group.
-static constexpr int PROXY_FRAME_WIDTH = 480;
-static constexpr int PROXY_FRAME_HEIGHT = 270;
+// Each grouped proxy is a one-line EXE title card; the spider overlay belongs
+// only to its window icons, never to the DWM thumbnail bitmap.
+static constexpr int PROXY_THUMBNAIL_HEIGHT = 60;
+static constexpr int PROXY_TITLE_FONT_SIZE = 19;
+static constexpr int PROXY_TITLE_PADDING_X = 12;
 
 struct AltTabProxy {
     HWND window = nullptr;
     std::wstring process;
     std::wstring title;
     std::vector<HWND> targets;
-    std::vector<std::wstring> titles;
+    int thumbnailWidth = 0;
     HICON sourceIcon = nullptr;
     ~AltTabProxy() {
         if (window) {
@@ -1671,7 +1673,6 @@ struct AltTabProxy {
 struct AltTabProxyGroup {
     std::wstring process;
     std::vector<HWND> targets;
-    std::vector<std::wstring> titles;
 };
 static std::vector<std::unique_ptr<AltTabProxy>> g_altTabProxies;
 
@@ -1681,104 +1682,90 @@ static BITMAPINFO ProxyBitmapInfo(int width, int height) {
     return info;
 }
 
-struct ProxyTitleLayout {
-    int fontHeight = 0;
-    int fontWidth = 0;
-    int lineHeight = 0;
-    int paddingX = 0;
-    int paddingY = 0;
-    int maxTextWidth = 0;
+struct ProxyThumbnailLayout {
+    int width = 0;
+    int height = PROXY_THUMBNAIL_HEIGHT;
+    int fontHeight = PROXY_TITLE_FONT_SIZE;
+    int paddingX = PROXY_TITLE_PADDING_X;
+    int textWidth = 0;
+    int textHeight = 0;
 };
 
-static HFONT CreateProxyTitleFont(int height, int width) {
-    return CreateFontW(-height, width, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+static HFONT CreateProxyTitleFont(int height = PROXY_TITLE_FONT_SIZE) {
+    return CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
 }
 
-// Select the largest font that keeps every title on one line and all rows in the card.
-static bool MeasureProxyTitleLayout(HDC dc, int width, int height,
-                                    const std::vector<std::wstring>& titles,
-                                    ProxyTitleLayout& layout) {
-    if (!dc || width <= 0 || height <= 0 || titles.empty()) return false;
-    const int paddingX = (std::min)(width / 4, (std::max)(2, width / 24));
-    const int paddingY = (std::min)(height / 4, (std::max)(2, height / 24));
-    const int availableWidth = (std::max)(1, width - paddingX * 2);
-    const int availableHeight = (std::max)(1, height - paddingY * 2);
-    const int maxFontHeight = (std::max)(1, (std::min)(28,
-        availableHeight / static_cast<int>(titles.size())));
-
-    for (int fontHeight = maxFontHeight; fontHeight >= 1; --fontHeight) {
-        for (const int fontWidth : {0, 1}) {
-            HFONT font = CreateProxyTitleFont(fontHeight, fontWidth);
-            if (!font) continue;
-            const HGDIOBJ previous = SelectObject(dc, font);
-            if (!previous || previous == HGDI_ERROR) {
-                DeleteObject(font);
-                continue;
-            }
-            TEXTMETRICW metrics{};
-            const bool hasMetrics = GetTextMetricsW(dc, &metrics) != FALSE;
-            const int lineHeight = hasMetrics
-                ? (std::max)(1, static_cast<int>(metrics.tmHeight + metrics.tmExternalLeading)) : 0;
-            int maxTextWidth = 0;
-            if (hasMetrics) {
-                for (const auto& title : titles) {
-                    RECT measured{0, 0, 0, 0};
-                    DrawTextW(dc, title.c_str(), static_cast<int>(title.size()), &measured,
-                        DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-                    const int measuredWidth = static_cast<int>(measured.right - measured.left);
-                    maxTextWidth = (std::max)(maxTextWidth, measuredWidth);
-                }
-            }
-            SelectObject(dc, previous);
-            DeleteObject(font);
-            if (hasMetrics && maxTextWidth <= availableWidth &&
-                static_cast<long long>(lineHeight) * titles.size() <= availableHeight) {
-                layout = {fontHeight, fontWidth, lineHeight, paddingX, paddingY, maxTextWidth};
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static bool DrawProxyTitleList(HDC dc, int width, int height,
-                               const std::vector<std::wstring>& titles, COLORREF color) {
-    ProxyTitleLayout layout{};
-    if (!MeasureProxyTitleLayout(dc, width, height, titles, layout)) return false;
-    HFONT font = CreateProxyTitleFont(layout.fontHeight, layout.fontWidth);
+// The EXE tag is the only line in a grouped card. Size the bitmap from its
+// measured width so the default 19 px title never wraps or needs ellipsis.
+static bool MeasureProxyThumbnailLayout(HDC dc, const std::wstring& title,
+                                        ProxyThumbnailLayout& layout) {
+    if (!dc || title.empty() || title.size() > 4096) return false;
+    HFONT font = CreateProxyTitleFont();
     if (!font) return false;
     const HGDIOBJ previous = SelectObject(dc, font);
     if (!previous || previous == HGDI_ERROR) {
         DeleteObject(font);
         return false;
     }
+    SIZE extent{};
+    TEXTMETRICW metrics{};
+    const int length = static_cast<int>(title.size());
+    const bool measured = GetTextExtentPoint32W(dc, title.c_str(), length, &extent) != FALSE &&
+        GetTextMetricsW(dc, &metrics) != FALSE;
+    SelectObject(dc, previous);
+    DeleteObject(font);
+    if (!measured || extent.cx < 0 || metrics.tmHeight <= 0) return false;
+
+    layout.width = (std::max)(1, extent.cx + PROXY_TITLE_PADDING_X * 2);
+    layout.height = PROXY_THUMBNAIL_HEIGHT;
+    layout.fontHeight = PROXY_TITLE_FONT_SIZE;
+    layout.paddingX = PROXY_TITLE_PADDING_X;
+    layout.textWidth = extent.cx;
+    layout.textHeight = metrics.tmHeight;
+    return true;
+}
+
+static bool DrawProxyTitle(HDC dc, int width, int height, const std::wstring& title,
+                           COLORREF color, int fontHeight = PROXY_TITLE_FONT_SIZE,
+                           int paddingX = PROXY_TITLE_PADDING_X) {
+    if (!dc || width <= 0 || height <= 0 || title.empty()) return false;
+    HFONT font = CreateProxyTitleFont(fontHeight);
+    if (!font) return false;
+    const HGDIOBJ previous = SelectObject(dc, font);
+    if (!previous || previous == HGDI_ERROR) {
+        DeleteObject(font);
+        return false;
+    }
+    TEXTMETRICW metrics{};
+    if (!GetTextMetricsW(dc, &metrics)) {
+        SelectObject(dc, previous);
+        DeleteObject(font);
+        return false;
+    }
     const int oldMode = SetBkMode(dc, TRANSPARENT);
     const COLORREF oldColor = SetTextColor(dc, color);
-    const int top = (height - layout.lineHeight * static_cast<int>(titles.size())) / 2;
-    bool drawn = true;
-    for (size_t i = 0; i < titles.size(); ++i) {
-        const int y = top + static_cast<int>(i) * layout.lineHeight;
-        RECT row{layout.paddingX, y, width - layout.paddingX, y + layout.lineHeight};
-        if (!DrawTextW(dc, titles[i].c_str(), static_cast<int>(titles[i].size()), &row,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX))
-            drawn = false;
-    }
+    const int y = (std::max)(0, (height - static_cast<int>(metrics.tmHeight)) / 2);
+    const BOOL drawn = TextOutW(dc, paddingX, y, title.c_str(), static_cast<int>(title.size()));
     SetTextColor(dc, oldColor);
     SetBkMode(dc, oldMode);
     SelectObject(dc, previous);
     DeleteObject(font);
-    return drawn;
+    return drawn != FALSE;
 }
 
-// Render text into a premultiplied-alpha DIB. Untouched pixels remain fully transparent.
+// Render only the EXE title into a transparent premultiplied-alpha DIB.
+// No spider/web mask is composited into the thumbnail image.
 static bool RenderProxyTitleBitmap(HDC dc, DWORD* pixels, int width, int height,
-                                   const std::vector<std::wstring>& titles, COLORREF accent) {
+                                   const std::wstring& title, COLORREF accent,
+                                   int fontHeight = PROXY_TITLE_FONT_SIZE,
+                                   int paddingX = PROXY_TITLE_PADDING_X) {
     if (!dc || !pixels || width <= 0 || height <= 0) return false;
     const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
     std::fill_n(pixels, pixelCount, 0u);
-    if (!DrawProxyTitleList(dc, width, height, titles, RGB(255, 255, 255))) return false;
+    if (!DrawProxyTitle(dc, width, height, title, RGB(255, 255, 255), fontHeight, paddingX))
+        return false;
     GdiFlush();
     const DWORD red = GetRValue(accent), green = GetGValue(accent), blue = GetBValue(accent);
     for (size_t i = 0; i < pixelCount; ++i) {
@@ -1797,29 +1784,42 @@ static bool RenderProxyTitleBitmap(HDC dc, DWORD* pixels, int width, int height,
     return true;
 }
 
-static std::wstring ReadWindowTitleForProxy(HWND h) {
-    const int reportedLength = GetWindowTextLengthW(h);
-    if (reportedLength <= 0) return L"(无标题)";
-    const int length = (std::min)(reportedLength, 4096);
-    std::wstring title(static_cast<size_t>(length) + 1, L'\0');
-    const int copied = GetWindowTextW(h, title.data(), static_cast<int>(title.size()));
-    if (copied <= 0) return L"(无标题)";
-    title.resize(static_cast<size_t>(copied));
-    for (auto& ch : title)
-        if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
-    return title.empty() ? L"(无标题)" : title;
-}
-
 static void PaintAltTabProxy(HDC dc, int width, int height, const AltTabProxy& proxy) {
     if (width <= 0 || height <= 0) return;
-    DrawProxyTitleList(dc, width, height, proxy.titles, GetTaskbarAccentColor());
+    DrawProxyTitle(dc, width, height, proxy.process, GetTaskbarAccentColor());
 }
 
 static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT message,
-                                    int width, int height) {
+                                    int maxWidth, int maxHeight) {
+    int width = proxy.thumbnailWidth;
+    int height = PROXY_THUMBNAIL_HEIGHT;
+    int fontHeight = PROXY_TITLE_FONT_SIZE;
+    int paddingX = PROXY_TITLE_PADDING_X;
     if (width <= 0 || height <= 0) return;
-    width = (std::min)(width, PROXY_FRAME_WIDTH);
-    height = (std::min)(height, PROXY_FRAME_HEIGHT);
+
+    // DWM supplies maximum dimensions for a thumbnail. Scale the complete
+    // one-line card only when those limits are smaller than its natural size.
+    int scaleNumerator = 1;
+    int scaleDenominator = 1;
+    if (message == WM_DWMSENDICONICTHUMBNAIL) {
+        auto applyLimit = [&](int limit, int natural) {
+            if (limit > 0 && limit < natural &&
+                static_cast<long long>(limit) * scaleDenominator <
+                    static_cast<long long>(scaleNumerator) * natural) {
+                scaleNumerator = limit;
+                scaleDenominator = natural;
+            }
+        };
+        applyLimit(maxWidth, width);
+        applyLimit(maxHeight, height);
+    }
+    if (scaleNumerator < scaleDenominator) {
+        width = (std::max)(1, MulDiv(width, scaleNumerator, scaleDenominator));
+        height = (std::max)(1, MulDiv(height, scaleNumerator, scaleDenominator));
+        fontHeight = (std::max)(1, MulDiv(fontHeight, scaleNumerator, scaleDenominator));
+        paddingX = (std::max)(1, MulDiv(paddingX, scaleNumerator, scaleDenominator));
+    }
+
     HDC dc = CreateCompatibleDC(nullptr);
     if (!dc) return;
     void* bits = nullptr;
@@ -1829,7 +1829,7 @@ static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT messa
         const HGDIOBJ previous = SelectObject(dc, bitmap);
         if (previous && previous != HGDI_ERROR) {
             if (RenderProxyTitleBitmap(dc, static_cast<DWORD*>(bits), width, height,
-                    proxy.titles, GetTaskbarAccentColor())) {
+                    proxy.process, GetTaskbarAccentColor(), fontHeight, paddingX)) {
                 GdiFlush();
                 if (message == WM_DWMSENDICONICTHUMBNAIL)
                     DwmSetIconicThumbnail(h, bitmap, 0);
@@ -1854,12 +1854,10 @@ static LRESULT CALLBACK AltTabProxyWndProc(HWND h, UINT message, WPARAM wp, LPAR
         case WM_DWMSENDICONICTHUMBNAIL:
             SupplyAltTabProxyBitmap(h, *proxy, message, HIWORD(lp), LOWORD(lp));
             return 0;
-        case WM_DWMSENDICONICLIVEPREVIEWBITMAP: {
-            RECT client{};
-            GetClientRect(h, &client);
-            SupplyAltTabProxyBitmap(h, *proxy, message, client.right, client.bottom);
+        case WM_DWMSENDICONICLIVEPREVIEWBITMAP:
+            SupplyAltTabProxyBitmap(h, *proxy, message,
+                proxy->thumbnailWidth, PROXY_THUMBNAIL_HEIGHT);
             return 0;
-        }
         case WM_PAINT: {
             PAINTSTRUCT paint{};
             const HDC dc = BeginPaint(h, &paint);
@@ -1889,19 +1887,30 @@ static std::unique_ptr<AltTabProxy> CreateAltTabProxy(const AltTabProxyGroup& gr
 
     auto proxy = std::make_unique<AltTabProxy>();
     proxy->process = group.process;
+    proxy->title = proxy->process; // The native Alt+Tab title is the MTU_EXE_TAG value.
     proxy->targets = group.targets;
-    proxy->titles = group.titles;
-    proxy->title = proxy->process + L" (" + std::to_wstring(proxy->targets.size()) + L")";
+
+    HDC measureDc = GetDC(nullptr);
+    if (!measureDc) return nullptr;
+    ProxyThumbnailLayout layout{};
+    const bool measured = MeasureProxyThumbnailLayout(measureDc, proxy->process, layout);
+    ReleaseDC(nullptr, measureDc);
+    if (!measured) return nullptr;
+    proxy->thumbnailWidth = layout.width;
 
     HICON icon = QueryWindowIconForPreview(representative, ICON_BIG);
     if (!icon) icon = reinterpret_cast<HICON>(GetClassLongPtrW(representative, GCLP_HICON));
     if (!icon) icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
     proxy->sourceIcon = icon ? CopyIcon(icon) : nullptr;
 
-    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN) - PROXY_FRAME_WIDTH - 64;
+    RECT windowBounds{0, 0, layout.width, layout.height};
+    AdjustWindowRectEx(&windowBounds, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_APPWINDOW);
+    const int windowWidth = windowBounds.right - windowBounds.left;
+    const int windowHeight = windowBounds.bottom - windowBounds.top;
+    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN) - windowWidth - 64;
     const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const HWND h = CreateWindowExW(WS_EX_APPWINDOW, ALT_TAB_PROXY_CLASS, proxy->title.c_str(),
-        WS_OVERLAPPEDWINDOW, x, y, PROXY_FRAME_WIDTH, PROXY_FRAME_HEIGHT, nullptr,
+        WS_OVERLAPPEDWINDOW, x, y, windowWidth, windowHeight, nullptr,
         nullptr, instance, proxy.get());
     if (!h) return nullptr;
     proxy->window = h;
@@ -1930,7 +1939,7 @@ static HWND FindAltTabProxyTarget(HWND window) {
 }
 
 static void RefreshAltTabProxyPresentation(AltTabProxy& proxy) {
-    proxy.title = proxy.process + L" (" + std::to_wstring(proxy.targets.size()) + L")";
+    proxy.title = proxy.process;
     if (!IsWindow(proxy.window)) return;
     SetWindowTextW(proxy.window, proxy.title.c_str());
     DwmInvalidateIconicBitmaps(proxy.window);
@@ -2002,7 +2011,6 @@ static BOOL CALLBACK EnumAltTabProxyGroupProc(HWND h, LPARAM data) {
             group->process = process;
         }
         group->targets.push_back(h);
-        group->titles.push_back(ReadWindowTitleForProxy(h));
     } catch (...) {
         context->failed = true;
         return FALSE;
@@ -2101,10 +2109,7 @@ static void RemoveAltTabProxyTarget(HWND target) {
             ++it;
             continue;
         }
-        const size_t index = static_cast<size_t>(std::distance(proxy.targets.begin(), found));
         proxy.targets.erase(found);
-        if (index < proxy.titles.size())
-            proxy.titles.erase(proxy.titles.begin() + static_cast<std::ptrdiff_t>(index));
         if (proxy.targets.empty()) {
             it = g_altTabProxies.erase(it);
             continue;
