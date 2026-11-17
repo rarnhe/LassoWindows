@@ -1875,7 +1875,7 @@ static LRESULT CALLBACK AltTabProxyWndProc(HWND h, UINT message, WPARAM wp, LPAR
 }
 
 static std::unique_ptr<AltTabProxy> CreateAltTabProxy(const AltTabProxyGroup& group) {
-    if (group.targets.empty() || group.targets.size() != group.titles.size()) return nullptr;
+    if (group.targets.empty()) return nullptr;
     const HWND representative = group.targets.front();
     if (!IsWindow(representative)) return nullptr;
     const HINSTANCE instance = GetModuleHandleW(nullptr);
