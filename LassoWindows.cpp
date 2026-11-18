@@ -2416,26 +2416,26 @@ static HWND g_showDesktopPressedTaskbar = nullptr;
 
 struct PrimaryWindowPosition {
     HWND window;
-    POINT original;
+    RECT original;
 };
 
 static std::vector<PrimaryWindowPosition> g_displacedPrimaryWindows;
 static ULONGLONG g_primaryMoveCompletedAt = 0;
+static DWORD g_primaryTaskbarProcess = 0;
 
-static int GetTaskbarHeight() {
+static int GetTaskbarHeight(HWND taskbar) {
     RECT bounds{};
-    const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
     return taskbar && GetWindowRect(taskbar, &bounds) ? bounds.bottom - bounds.top : 0;
 }
 
-static int PrimaryDesktopWindowTop(int screenHeight, int captionHeight, int taskbarHeight) {
-    const int bottomGap = captionHeight > 0 ? 2 * captionHeight : taskbarHeight;
-    return screenHeight - bottomGap;
+static int PrimaryDesktopWindowTop(int screenHeight, int taskbarHeight) {
+    return screenHeight - 2 * taskbarHeight;
 }
 
-static bool MovePrimaryWindowTo(HWND window, int x, int y) {
-    return SetWindowPos(window, nullptr, x, y, 0, 0,
-        SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) != FALSE;
+static bool SetPrimaryWindowRect(HWND window, const RECT& bounds, UINT flags = 0) {
+    return SetWindowPos(window, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
+        bounds.bottom - bounds.top,
+        flags | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) != FALSE;
 }
 
 static bool ParkPrimaryWindow(HWND window, int top) {
@@ -2443,18 +2443,31 @@ static bool ParkPrimaryWindow(HWND window, int top) {
         std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
             [window](const auto& state) { return state.window == window; })) return false;
     RECT bounds{};
-    if (!GetWindowRect(window, &bounds) || bounds.top == top ||
-        !MovePrimaryWindowTo(window, bounds.left, top)) return false;
-    g_displacedPrimaryWindows.push_back({window, {bounds.left, bounds.top}});
+    if (!GetWindowRect(window, &bounds) || bounds.top == top) return false;
+    RECT moved = bounds;
+    OffsetRect(&moved, 0, top - bounds.top);
+    if (!SetPrimaryWindowRect(window, moved, SWP_NOSIZE)) return false;
+    g_displacedPrimaryWindows.push_back({window, bounds});
     return true;
 }
 
 static void RestoreDisplacedPrimaryWindows() {
     g_primaryMoveCompletedAt = 0;
     std::erase_if(g_displacedPrimaryWindows, [](const auto& state) {
-        return !IsWindow(state.window) ||
-            MovePrimaryWindowTo(state.window, state.original.x, state.original.y);
+        return !IsWindow(state.window) || SetPrimaryWindowRect(state.window, state.original);
     });
+    if (g_displacedPrimaryWindows.empty()) g_primaryTaskbarProcess = 0;
+}
+
+static bool IsUntitledWasdkHost(HWND window) {
+    if (!WindowClassIs(window, L"XamlExplorerHostIslandWindow_WASDK")) return false;
+    wchar_t title[256]{};
+    return GetWindowTextW(window, title, static_cast<int>(std::size(title))) == 0;
+}
+
+static bool IsUntitledWasdkHostOrOwnedWindow(HWND window) {
+    const HWND owner = GetAncestor(window, GA_ROOTOWNER);
+    return IsUntitledWasdkHost(window) || (owner != window && IsUntitledWasdkHost(owner));
 }
 
 static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
@@ -2464,16 +2477,19 @@ static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
         return;
     if (GetAncestor(h, GA_ROOT) != h || !IsValidAppWindow(h) || IsSwitcherWindow(h) ||
         IsIconic(h) || g_sealedWindowStates.contains(h)) return;
-    if (WindowClassIs(h, L"XamlExplorerHostIslandWindow_WASDK") && GetWindowTextLengthW(h) == 0) return;
+    const HWND foreground = GetForegroundWindow();
+    if (IsUntitledWasdkHostOrOwnedWindow(h) || IsUntitledWasdkHostOrOwnedWindow(foreground)) return;
     DWORD process = 0;
     GetWindowThreadProcessId(h, &process);
     if (!process || process == ownProcess ||
         (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
+    // Explorer can create or show auxiliary top-level windows during a Shell interaction.
+    if (process == g_primaryTaskbarProcess && !WindowClassIs(h, L"CabinetWClass")) return;
 
     // Ignore events queued before the current move finished.
     if (g_primaryMoveCompletedAt && GetTickCount64() - g_primaryMoveCompletedAt < 1500 &&
         static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveCompletedAt)) <= 0) return;
-    if (event == EVENT_SYSTEM_FOREGROUND && GetForegroundWindow() != h) return;
+    if (event == EVENT_SYSTEM_FOREGROUND && foreground != h) return;
     if (event != EVENT_OBJECT_CREATE && !IsWindowVisible(h)) return;
     RestoreDisplacedPrimaryWindows();
 }
@@ -2511,15 +2527,23 @@ static void TogglePrimaryWindows() {
         return;
     }
 
+    const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    const int taskbarHeight = GetTaskbarHeight(taskbar);
+    const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    if (taskbarHeight <= 0 || taskbarHeight > screenHeight / 2) return;
+
     const HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     std::vector<HWND> candidates;
     ToggleContext context{&candidates, primary};
     EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
-    const int top = PrimaryDesktopWindowTop(GetSystemMetrics(SM_CYSCREEN),
-        GetSystemMetrics(SM_CYCAPTION), GetTaskbarHeight());
+    const int top = PrimaryDesktopWindowTop(screenHeight, taskbarHeight);
     g_displacedPrimaryWindows.reserve(candidates.size());
     for (HWND window : candidates) ParkPrimaryWindow(window, top);
-    if (!g_displacedPrimaryWindows.empty()) g_primaryMoveCompletedAt = GetTickCount64();
+    if (!g_displacedPrimaryWindows.empty()) {
+        g_primaryTaskbarProcess = 0;
+        GetWindowThreadProcessId(taskbar, &g_primaryTaskbarProcess);
+        g_primaryMoveCompletedAt = GetTickCount64();
+    }
 }
 
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
