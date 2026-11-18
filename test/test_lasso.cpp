@@ -861,6 +861,7 @@ void run(const std::string& name) {
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
         CHECK(std::wstring(proxyCaption) == L"preview-fixture 「2」");
         const int originalWidth = card->layout.width;
+        const int originalHeight = card->layout.height;
         CHECK(originalWidth > 0);
         CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
@@ -870,6 +871,7 @@ void run(const std::string& name) {
         CHECK(FindAltTabProxyTarget(proxy) == sibling.h);
         CHECK(card->windowTitles == std::vector<std::wstring>{L"A B"});
         CHECK(card->layout.width < originalWidth);
+        CHECK(card->layout.height == originalHeight - card->layout.rowHeight);
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
         CHECK(std::wstring(proxyCaption) == L"preview-fixture 「1」");
         ExecuteCollectRestore();
@@ -905,13 +907,19 @@ void run(const std::string& name) {
         systemMetrics.cbSize = sizeof(systemMetrics);
         CHECK(SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, systemMetrics.cbSize,
             &systemMetrics, 0, GetDpiForWindow(captionWindow)));
+        ProxyThumbnailLayout emptyLayout;
+        CHECK(!MeasureProxyThumbnailLayout(dc, {}, proxy.captionFont, emptyLayout));
+        CHECK(emptyLayout.height == 0);
         CHECK(MeasureProxyThumbnailLayout(dc, proxy.windowTitles, proxy.captionFont, layout));
         ProxyThumbnailLayout longestLayout;
         CHECK(MeasureProxyThumbnailLayout(dc, {longest}, proxy.captionFont, longestLayout));
         CHECK(layout.width == longestLayout.width);
-        CHECK(longestLayout.height == PROXY_THUMBNAIL_MIN_HEIGHT);
-        CHECK(layout.height == (std::max)(PROXY_THUMBNAIL_MIN_HEIGHT, PROXY_TITLE_PADDING_Y * 2 +
-            static_cast<int>(proxy.windowTitles.size()) * layout.rowHeight));
+        CHECK(longestLayout.height == PROXY_TITLE_PADDING_Y * 2 + longestLayout.rowHeight);
+        ProxyThumbnailLayout twoRows;
+        CHECK(MeasureProxyThumbnailLayout(dc, {longest, L"W2"}, proxy.captionFont, twoRows));
+        CHECK(twoRows.height - longestLayout.height == longestLayout.rowHeight);
+        CHECK(layout.height == PROXY_TITLE_PADDING_Y * 2 +
+            static_cast<int>(proxy.windowTitles.size()) * layout.rowHeight);
         const SIZE narrow = FitProxyThumbnail(layout, layout.width / 2, layout.height + 100);
         CHECK(narrow.cx == layout.width / 2 && narrow.cy == layout.height);
         const SIZE shortRequest = FitProxyThumbnail(layout, layout.width, layout.height / 2);

@@ -1635,7 +1635,6 @@ static BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 static GUID g_altTabPreviewDesktop{};
 static DWORD g_altTabPreviewStartedAt = 0;
 static std::vector<HWND> g_cascadiaSwitchers;
-static constexpr int PROXY_THUMBNAIL_MIN_HEIGHT = 137;
 static constexpr int PROXY_TITLE_PADDING_X = 0;
 static constexpr int PROXY_TITLE_PADDING_Y = 8;
 
@@ -1722,9 +1721,8 @@ static bool MeasureProxyThumbnailLayout(HDC dc, const std::vector<std::wstring>&
 
     layout.width = (std::max)(1, widest + PROXY_TITLE_PADDING_X * 2);
     layout.rowHeight = metrics.tmHeight + metrics.tmExternalLeading;
-    const int contentHeight = static_cast<int>(windowTitles.size()) * layout.rowHeight +
+    layout.height = static_cast<int>(windowTitles.size()) * layout.rowHeight +
         PROXY_TITLE_PADDING_Y * 2;
-    layout.height = (std::max)(PROXY_THUMBNAIL_MIN_HEIGHT, contentHeight);
     return true;
 }
 
