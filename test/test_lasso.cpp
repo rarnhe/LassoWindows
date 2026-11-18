@@ -139,6 +139,7 @@ void run(const std::string& name) {
     }
     if (name == "primary_position_roundtrip") {
         Window plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED), alreadyMinimized;
+        Window taskbar(0, nullptr, L"STATIC", 0, 1032, 1920, 48, WS_POPUP);
         ShowWindow(plain, SW_SHOWNOACTIVATE);
         ShowWindow(layered, SW_SHOWMAXIMIZED);
         ShowWindow(alreadyMinimized, SW_SHOWMINNOACTIVE);
@@ -147,14 +148,17 @@ void run(const std::string& name) {
         const LONG_PTR layeredStyle = GetWindowLongPtrW(layered, GWL_EXSTYLE);
         RECT plainOriginal{}, layeredOriginal{};
         CHECK(GetWindowRect(plain, &plainOriginal) && GetWindowRect(layered, &layeredOriginal));
-        CHECK(PrimaryDesktopWindowTop(1080, 23, 48) == 1034);
-        CHECK(PrimaryDesktopWindowTop(1080, 0, 48) == 1032);
-        constexpr int targetTop = 400;
+        CHECK(GetTaskbarHeight(taskbar) == 48);
+        CHECK(PrimaryDesktopWindowTop(1080, GetTaskbarHeight(taskbar)) == 984);
+        const int targetTop = PrimaryDesktopWindowTop(GetSystemMetrics(SM_CYSCREEN), GetTaskbarHeight(taskbar));
         CHECK(ParkPrimaryWindow(plain, targetTop));
         CHECK(ParkPrimaryWindow(layered, targetTop));
         CHECK(!ParkPrimaryWindow(alreadyMinimized, targetTop));
         CHECK(!ParkPrimaryWindow(plain, targetTop));
         CHECK(g_displacedPrimaryWindows.size() == 2);
+        CHECK(g_displacedPrimaryWindows[0].window == plain.h);
+        CHECK(EqualRect(&g_displacedPrimaryWindows[0].original, &plainOriginal));
+        CHECK(EqualRect(&g_displacedPrimaryWindows[1].original, &layeredOriginal));
         DispatchPendingWindowMessages();
 
         RECT parked{};
@@ -167,6 +171,7 @@ void run(const std::string& name) {
         CHECK(IsWindowVisible(plain) && IsWindowVisible(layered));
         CHECK(!IsIconic(plain) && !IsIconic(layered) && IsZoomed(layered));
 
+        CHECK(SetWindowPos(plain, nullptr, 0, 0, 300, 200, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE));
         CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
         DispatchPendingWindowMessages();
         CHECK(g_displacedPrimaryWindows.empty());
@@ -188,8 +193,10 @@ void run(const std::string& name) {
     }
     if (name == "primary_position_events") {
         RegisterFixtureClass(L"XamlExplorerHostIslandWindow_WASDK");
-        Window a, b, incoming, island(WS_EX_APPWINDOW, nullptr, L"XamlExplorerHostIslandWindow_WASDK");
-        for (HWND h : {a.h, b.h, incoming.h, island.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
+        RegisterFixtureClass(L"CabinetWClass");
+        Window a, b, incoming, island(WS_EX_APPWINDOW, nullptr, L"XamlExplorerHostIslandWindow_WASDK"),
+            explorer(WS_EX_APPWINDOW, nullptr, L"CabinetWClass");
+        for (HWND h : {a.h, b.h, incoming.h, island.h, explorer.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
         SetWindowTextW(island, L"");
         constexpr int targetTop = 400;
         constexpr DWORD noOwnProcess = 0;
@@ -199,19 +206,24 @@ void run(const std::string& name) {
             DispatchPendingWindowMessages();
             g_primaryMoveCompletedAt = GetTickCount64();
             const auto time = static_cast<DWORD>(g_primaryMoveCompletedAt);
-            if (event == EVENT_SYSTEM_FOREGROUND) SetForegroundWindow(island);
+            SetForegroundWindow(island);
+            CHECK(GetForegroundWindow() == island.h);
             RestorePrimaryWindowsOnEvent(event, island, time + 1, noOwnProcess);
             CHECK(g_displacedPrimaryWindows.size() == 2);
-            if (event == EVENT_SYSTEM_FOREGROUND) {
-                SetForegroundWindow(incoming);
-                CHECK(GetForegroundWindow() == incoming.h);
-            }
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
+            CHECK(g_displacedPrimaryWindows.size() == 2);
+            SetForegroundWindow(incoming);
+            CHECK(GetForegroundWindow() == incoming.h);
             RestorePrimaryWindowsOnEvent(event, incoming, time, noOwnProcess);
             CHECK(g_displacedPrimaryWindows.size() == 2);
             RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, noOwnProcess);
             CHECK(g_displacedPrimaryWindows.size() == 2);
             RestorePrimaryWindowsOnEvent(event, incoming, time + 1);
             CHECK(g_displacedPrimaryWindows.size() == 2);
+            g_primaryTaskbarProcess = GetCurrentProcessId();
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
+            CHECK(g_displacedPrimaryWindows.size() == 2);
+            g_primaryTaskbarProcess = 0;
             RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
             CHECK(g_displacedPrimaryWindows.empty());
             DispatchPendingWindowMessages();
@@ -221,6 +233,11 @@ void run(const std::string& name) {
         DispatchPendingWindowMessages();
         WinEventProc(nullptr, EVENT_OBJECT_DESTROY, a, OBJID_WINDOW, CHILDID_SELF, 0, 0);
         CHECK(g_displacedPrimaryWindows.size() == 1 && g_displacedPrimaryWindows.front().window == b.h);
+        g_primaryTaskbarProcess = GetCurrentProcessId();
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, explorer, static_cast<DWORD>(GetTickCount64()), noOwnProcess);
+        CHECK(g_displacedPrimaryWindows.empty() && !g_primaryTaskbarProcess);
+        DispatchPendingWindowMessages();
+        CHECK(ParkPrimaryWindow(b, targetTop));
         CHECK(SetWindowTextW(island, L"An ordinary titled window"));
         RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, island, static_cast<DWORD>(GetTickCount64()), noOwnProcess);
         CHECK(g_displacedPrimaryWindows.empty());
