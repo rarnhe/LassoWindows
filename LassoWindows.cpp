@@ -1251,7 +1251,7 @@ static bool HideWindowAndHideTaskbarIcon(HWND h, bool afterPreview = false) {
 
 static void RestoreAllSealedWindows() {
     // This shared cleanup path also runs during shutdown. Do not couple it to
-    // temporary primary minimization; only explicit user input restores that state.
+    // temporary primary window positions; only explicit user input restores that state.
     for (auto it = g_sealedWindowStates.begin(); it != g_sealedWindowStates.end();) {
         const HWND h = (it++)->first;
         ShowWindowAndShowTaskbarIcon(h);
@@ -1356,10 +1356,20 @@ static std::wstring GetRealProcessName(HWND hwnd) {
 
 static constexpr wchar_t ALT_TAB_PROXY_CLASS[] = L"LassoNativeAltTabProxy";
 
+static bool IsCascadiaSwitcher(HWND window) {
+    wchar_t name[96]{};
+    if (!GetClassNameW(window, name, static_cast<int>(std::size(name))) ||
+        wcscmp(name, L"CASCADIA_HOSTING_WINDOW_CLASS") != 0) return false;
+    wchar_t title[256]{};
+    GetWindowTextW(window, title, static_cast<int>(std::size(title)));
+    return wcscmp(title, L"任务视图") == 0 || wcscmp(title, L"任务切换") == 0;
+}
+
 static bool IsSwitcherWindow(HWND h) {
     wchar_t name[96]{};
     if (!GetClassNameW(h, name, static_cast<int>(std::size(name)))) return false;
     constexpr wchar_t simpleSwitcher[] = L"SimpleWindowSwitcher_";
+    if (wcscmp(name, L"CASCADIA_HOSTING_WINDOW_CLASS") == 0) return IsCascadiaSwitcher(h);
     return wcscmp(name, L"XamlExplorerHostIslandWindow") == 0 ||
         wcscmp(name, L"MultitaskingViewFrame") == 0 ||
         wcscmp(name, L"TaskSwitcherWnd") == 0 ||
@@ -1496,14 +1506,15 @@ static void OnCollectTimer(HWND hwnd, UINT_PTR idEvent) {
     if (!g_InSnapWindows || !g_altTabNextCollectAt || now < g_altTabNextCollectAt) return;
 
     HWND foreground = GetForegroundWindow();
-    const bool switcherActive = IsSwitcherWindow(foreground);
+    const bool foregroundVisible = IsWindowVisible(foreground) != FALSE;
+    const bool switcherActive = foregroundVisible && IsSwitcherWindow(foreground);
     if (switcherActive && now < g_altTabCollectDeadline &&
         SetTimer(hwnd, idEvent, 100, nullptr)) {
         g_altTabNextCollectAt = now + 100;
         return;
     }
     CancelAltTabCollectTimer(hwnd);
-    FinishAltTabPreview(switcherActive ? nullptr : foreground);
+    FinishAltTabPreview(foregroundVisible && !switcherActive ? foreground : nullptr);
 }
 
 //realname一致的同类窗口处理
@@ -1622,7 +1633,8 @@ static BOOL CALLBACK EnumHideOthersProc(HWND hWnd, LPARAM lParam) {
 // 隐藏同类型窗口后，alt+tab临时查看下。
 // --- 全局变量与状态控制 ---
 static GUID g_altTabPreviewDesktop{};
-static constexpr int PROXY_TITLE_FONT_SIZE = 19;
+static DWORD g_altTabPreviewStartedAt = 0;
+static std::vector<HWND> g_cascadiaSwitchers;
 static constexpr int PROXY_TITLE_PADDING_X = 0;
 static constexpr int PROXY_TITLE_PADDING_Y = 8;
 
@@ -1639,6 +1651,7 @@ struct AltTabProxy {
     std::vector<HWND> targets;
     std::vector<std::wstring> windowTitles;
     ProxyThumbnailLayout layout;
+    LOGFONTW captionFont{};
     HICON sourceIcon = nullptr;
     ~AltTabProxy() {
         if (window) {
@@ -1662,10 +1675,14 @@ static BITMAPINFO ProxyBitmapInfo(int width, int height) {
     return info;
 }
 
-static HFONT CreateProxyTitleFont() {
-    return CreateFontW(-PROXY_TITLE_FONT_SIZE, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+static bool ReadProxyCaptionFont(UINT dpi, LOGFONTW& font) {
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof(metrics);
+    if ((!dpi || !SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, metrics.cbSize, &metrics, 0, dpi)) &&
+        !SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, metrics.cbSize, &metrics, 0)) return false;
+    font = metrics.lfCaptionFont;
+    font.lfQuality = ANTIALIASED_QUALITY;
+    return true;
 }
 
 static std::wstring ReadProxyWindowTitle(HWND window) {
@@ -1678,9 +1695,9 @@ static std::wstring ReadProxyWindowTitle(HWND window) {
 }
 
 static bool MeasureProxyThumbnailLayout(HDC dc, const std::vector<std::wstring>& windowTitles,
-                                        ProxyThumbnailLayout& layout) {
+                                        const LOGFONTW& captionFont, ProxyThumbnailLayout& layout) {
     if (!dc || windowTitles.empty()) return false;
-    HFONT font = CreateProxyTitleFont();
+    HFONT font = CreateFontIndirectW(&captionFont);
     if (!font) return false;
     const HGDIOBJ previous = SelectObject(dc, font);
     if (!previous || previous == HGDI_ERROR) {
@@ -1714,10 +1731,12 @@ static bool UpdateAltTabProxyTitles(AltTabProxy& proxy) {
     titles.reserve(proxy.targets.size());
     for (HWND target : proxy.targets) titles.push_back(ReadProxyWindowTitle(target));
 
+    LOGFONTW captionFont{};
+    if (!ReadProxyCaptionFont(GetDpiForWindow(proxy.targets.front()), captionFont)) return false;
     HDC dc = GetDC(nullptr);
     if (!dc) return false;
     ProxyThumbnailLayout layout;
-    const bool measured = MeasureProxyThumbnailLayout(dc, titles, layout);
+    const bool measured = MeasureProxyThumbnailLayout(dc, titles, captionFont, layout);
     ReleaseDC(nullptr, dc);
     if (!measured) return false;
     std::wstring displayProcess = proxy.process;
@@ -1727,13 +1746,14 @@ static bool UpdateAltTabProxyTitles(AltTabProxy& proxy) {
     proxy.caption = displayProcess + L" 「" + std::to_wstring(titles.size()) + L"」";
     proxy.windowTitles = std::move(titles);
     proxy.layout = layout;
+    proxy.captionFont = captionFont;
     return true;
 }
 
 static bool DrawAltTabProxyCard(HDC dc, int width, int height, const AltTabProxy& proxy,
                                 COLORREF color) {
     if (!dc || width <= 0 || height <= 0 || proxy.windowTitles.empty()) return false;
-    HFONT font = CreateProxyTitleFont();
+    HFONT font = CreateFontIndirectW(&proxy.captionFont);
     if (!font) return false;
     const int saved = SaveDC(dc);
     if (!saved) {
@@ -1742,27 +1762,29 @@ static bool DrawAltTabProxyCard(HDC dc, int width, int height, const AltTabProxy
     }
 
     const auto& layout = proxy.layout;
-    if (width != layout.width || height != layout.height) {
-        SetMapMode(dc, MM_ANISOTROPIC);
-        SetWindowExtEx(dc, layout.width, layout.height, nullptr);
-        SetViewportExtEx(dc, width, height, nullptr);
-    }
     const HGDIOBJ previous = SelectObject(dc, font);
-    bool drawn = previous && previous != HGDI_ERROR;
-    if (drawn) {
+    bool drew = previous && previous != HGDI_ERROR;
+    if (drew) {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, color);
         SetTextAlign(dc, TA_LEFT | TA_TOP | TA_NOUPDATECP);
         int y = PROXY_TITLE_PADDING_Y;
         for (const auto& title : proxy.windowTitles) {
-            if (!TextOutW(dc, PROXY_TITLE_PADDING_X, y, title.c_str(), static_cast<int>(title.size())))
-                drawn = false;
+            if (y + layout.rowHeight > height) break;
+            const int length = static_cast<int>(title.size());
+            if (width < layout.width) {
+                RECT row{PROXY_TITLE_PADDING_X, y, width - PROXY_TITLE_PADDING_X, y + layout.rowHeight};
+                if (!DrawTextW(dc, title.c_str(), length, &row,
+                        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS)) drew = false;
+            } else if (!TextOutW(dc, PROXY_TITLE_PADDING_X, y, title.c_str(), length)) {
+                drew = false;
+            }
             y += layout.rowHeight;
         }
     }
     RestoreDC(dc, saved);
     DeleteObject(font);
-    return drawn;
+    return drew;
 }
 
 // The preview uses a transparent premultiplied-alpha DIB. The web is drawn on the icons.
@@ -1791,31 +1813,17 @@ static bool RenderProxyTitleBitmap(HDC dc, DWORD* pixels, int width, int height,
     return true;
 }
 
+static SIZE FitProxyThumbnail(const ProxyThumbnailLayout& layout, int maxWidth, int maxHeight) {
+    return {(std::min)(layout.width, maxWidth), (std::min)(layout.height, maxHeight)};
+}
+
 static void SupplyAltTabProxyBitmap(HWND h, const AltTabProxy& proxy, UINT message,
                                     int maxWidth, int maxHeight) {
-    int width = proxy.layout.width;
-    int height = proxy.layout.height;
+    // The DWM caps each dimension. Width alone must never reduce height or font size.
+    const auto size = FitProxyThumbnail(proxy.layout, maxWidth, maxHeight);
+    const int width = size.cx;
+    const int height = size.cy;
     if (width <= 0 || height <= 0) return;
-
-    // Fit the full card within the DWM limits using a single scale for both axes.
-    int scaleNumerator = 1;
-    int scaleDenominator = 1;
-    if (message == WM_DWMSENDICONICTHUMBNAIL) {
-        auto applyLimit = [&](int limit, int natural) {
-            if (limit > 0 && limit < natural &&
-                static_cast<long long>(limit) * scaleDenominator <
-                    static_cast<long long>(scaleNumerator) * natural) {
-                scaleNumerator = limit;
-                scaleDenominator = natural;
-            }
-        };
-        applyLimit(maxWidth, width);
-        applyLimit(maxHeight, height);
-    }
-    if (scaleNumerator < scaleDenominator) {
-        width = (std::max)(1, MulDiv(width, scaleNumerator, scaleDenominator));
-        height = (std::max)(1, MulDiv(height, scaleNumerator, scaleDenominator));
-    }
 
     HDC dc = CreateCompatibleDC(nullptr);
     if (!dc) return;
@@ -2024,6 +2032,7 @@ static bool BeginNativeAltTabProxies(ReadCurrentDesktop readCurrentDesktop, HWND
     if (!resolved || IsEqualGUID(currentDesktop, GUID{})) return false;
 
     g_altTabPreviewDesktop = currentDesktop;
+    g_altTabPreviewStartedAt = static_cast<DWORD>(GetTickCount64());
     std::vector<AltTabProxyGroup> groups;
     AltTabProxyCollectionContext context{&currentDesktop, &groups, false};
     EnumWindows(EnumAltTabProxyGroupProc, reinterpret_cast<LPARAM>(&context));
@@ -2089,6 +2098,7 @@ static void FinishAltTabPreview(HWND winner, ReadCurrentDesktop readCurrentDeskt
             SetForegroundWindow(activationTarget);
     }
     g_altTabProxies.clear();
+    g_cascadiaSwitchers.clear();
     g_altTabPreviewDesktop = GUID{};
     g_InSnapWindows = false;
 }
@@ -2123,6 +2133,24 @@ static void ScheduleAltTabCollect(HWND coordinator) {
     g_altTabNextCollectAt = now + 150;
     g_altTabCollectDeadline = now + 3000;
     if (!SetTimer(coordinator, TIMER_ID_COLLECT, 150, nullptr)) ExecuteCollectRestore();
+}
+
+static void WatchCascadiaSwitcher(HWND window, DWORD event, DWORD time) {
+    if (!g_InSnapWindows || static_cast<LONG>(time - g_altTabPreviewStartedAt) < 0) return;
+    if (event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY) {
+        if (event == EVENT_OBJECT_HIDE && IsWindowVisible(window)) return;
+        const bool wasTracked = std::erase(g_cascadiaSwitchers, window) != 0;
+        if (!wasTracked && !IsCascadiaSwitcher(window)) return;
+        // Keep the normal selection handoff: Explorer can publish the winning foreground later.
+        if (g_hLassoCoordinator) ScheduleAltTabCollect(g_hLassoCoordinator);
+        else ExecuteCollectRestore();
+    } else if ((event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW ||
+                event == EVENT_OBJECT_NAMECHANGE || event == EVENT_SYSTEM_FOREGROUND) &&
+                IsCascadiaSwitcher(window) &&
+                std::find(g_cascadiaSwitchers.begin(), g_cascadiaSwitchers.end(), window) ==
+                    g_cascadiaSwitchers.end()) {
+        g_cascadiaSwitchers.push_back(window);
+    }
 }
 
 static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
@@ -2386,67 +2414,68 @@ static bool FindShowDesktopClickBounds(HWND taskbar, POINT point, bool click, RE
 static RECT g_showDesktopPressedBounds{};
 static HWND g_showDesktopPressedTaskbar = nullptr;
 
-struct PrimaryWindowMinimization {
+struct PrimaryWindowPosition {
     HWND window;
-    bool pending;
+    POINT original;
 };
 
-static std::vector<PrimaryWindowMinimization> g_minimizedPrimaryWindows;
-static ULONGLONG g_primaryMinimizeCompletedAt = 0;
+static std::vector<PrimaryWindowPosition> g_displacedPrimaryWindows;
+static ULONGLONG g_primaryMoveCompletedAt = 0;
 
-static auto FindPrimaryWindowMinimization(HWND window) {
-    return std::find_if(g_minimizedPrimaryWindows.begin(), g_minimizedPrimaryWindows.end(),
-        [window](const auto& state) { return state.window == window; });
+static int GetTaskbarHeight() {
+    RECT bounds{};
+    const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    return taskbar && GetWindowRect(taskbar, &bounds) ? bounds.bottom - bounds.top : 0;
 }
 
-static bool MinimizePrimaryWindow(HWND window) {
+static int PrimaryDesktopWindowTop(int screenHeight, int captionHeight, int taskbarHeight) {
+    const int bottomGap = captionHeight > 0 ? 2 * captionHeight : taskbarHeight;
+    return screenHeight - bottomGap;
+}
+
+static bool MovePrimaryWindowTo(HWND window, int x, int y) {
+    return SetWindowPos(window, nullptr, x, y, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) != FALSE;
+}
+
+static bool ParkPrimaryWindow(HWND window, int top) {
     if (!IsWindowVisible(window) || IsIconic(window) ||
-        FindPrimaryWindowMinimization(window) != g_minimizedPrimaryWindows.end()) return false;
-    if (!ShowWindowAsync(window, SW_SHOWMINNOACTIVE)) return false;
-    g_minimizedPrimaryWindows.push_back({window, !IsIconic(window)});
+        std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
+            [window](const auto& state) { return state.window == window; })) return false;
+    RECT bounds{};
+    if (!GetWindowRect(window, &bounds) || bounds.top == top ||
+        !MovePrimaryWindowTo(window, bounds.left, top)) return false;
+    g_displacedPrimaryWindows.push_back({window, {bounds.left, bounds.top}});
     return true;
 }
 
-static void RestoreMinimizedPrimaryWindows() {
-    g_primaryMinimizeCompletedAt = 0;
-    std::vector<PrimaryWindowMinimization> batch;
-    batch.swap(g_minimizedPrimaryWindows);
-    for (const auto& state : batch) {
-        // A restore queued behind an outstanding minimize also handles a fast second click.
-        if (!IsWindow(state.window) || (!state.pending && !IsIconic(state.window))) continue;
-        RecordLassoWindowRestoration(state.window);
-        if (!ShowWindowAsync(state.window, SW_SHOWNOACTIVATE)) {
-            g_restoredWindowPresentations.erase(state.window);
-            g_minimizedPrimaryWindows.push_back(state);
-        }
-    }
-}
-
-static bool IsPrimaryMinimizeFeedback(DWORD event, DWORD time) {
-    if (!g_primaryMinimizeCompletedAt || GetTickCount64() - g_primaryMinimizeCompletedAt >= 1500)
-        return false;
-    const auto sinceMinimize = static_cast<LONG>(time - static_cast<DWORD>(g_primaryMinimizeCompletedAt));
-    const bool activation = event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_FOCUS;
-    // Minimizing the foreground window can activate a different HWND asynchronously.
-    return sinceMinimize <= 0 || (activation && sinceMinimize <= 300);
+static void RestoreDisplacedPrimaryWindows() {
+    g_primaryMoveCompletedAt = 0;
+    std::erase_if(g_displacedPrimaryWindows, [](const auto& state) {
+        return !IsWindow(state.window) ||
+            MovePrimaryWindowTo(state.window, state.original.x, state.original.y);
+    });
 }
 
 static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
                                          DWORD ownProcess = GetCurrentProcessId()) {
-    if (g_minimizedPrimaryWindows.empty() ||
+    if (g_displacedPrimaryWindows.empty() ||
         (event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW))
         return;
     if (GetAncestor(h, GA_ROOT) != h || !IsValidAppWindow(h) || IsSwitcherWindow(h) ||
         IsIconic(h) || g_sealedWindowStates.contains(h)) return;
+    if (WindowClassIs(h, L"XamlExplorerHostIslandWindow_WASDK") && GetWindowTextLengthW(h) == 0) return;
     DWORD process = 0;
     GetWindowThreadProcessId(h, &process);
     if (!process || process == ownProcess ||
         (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
 
-    if (IsPrimaryMinimizeFeedback(event, time)) return;
+    // Ignore events queued before the current move finished.
+    if (g_primaryMoveCompletedAt && GetTickCount64() - g_primaryMoveCompletedAt < 1500 &&
+        static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveCompletedAt)) <= 0) return;
     if (event == EVENT_SYSTEM_FOREGROUND && GetForegroundWindow() != h) return;
     if (event != EVENT_OBJECT_CREATE && !IsWindowVisible(h)) return;
-    RestoreMinimizedPrimaryWindows();
+    RestoreDisplacedPrimaryWindows();
 }
 
 // Keep the original candidate filters: current desktop, visible, not minimized,
@@ -2477,8 +2506,8 @@ static BOOL CALLBACK EnumWindowToggleProc(HWND hWnd, LPARAM lParam) {
 
 static void TogglePrimaryWindows() {
     if (g_InSnapWindows) ExecuteCollectRestore();
-    if (!g_minimizedPrimaryWindows.empty()) {
-        RestoreMinimizedPrimaryWindows();
+    if (!g_displacedPrimaryWindows.empty()) {
+        RestoreDisplacedPrimaryWindows();
         return;
     }
 
@@ -2486,9 +2515,11 @@ static void TogglePrimaryWindows() {
     std::vector<HWND> candidates;
     ToggleContext context{&candidates, primary};
     EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
-    g_minimizedPrimaryWindows.reserve(candidates.size());
-    for (HWND window : candidates) MinimizePrimaryWindow(window);
-    if (!g_minimizedPrimaryWindows.empty()) g_primaryMinimizeCompletedAt = GetTickCount64();
+    const int top = PrimaryDesktopWindowTop(GetSystemMetrics(SM_CYSCREEN),
+        GetSystemMetrics(SM_CYCAPTION), GetTaskbarHeight());
+    g_displacedPrimaryWindows.reserve(candidates.size());
+    for (HWND window : candidates) ParkPrimaryWindow(window, top);
+    if (!g_displacedPrimaryWindows.empty()) g_primaryMoveCompletedAt = GetTickCount64();
 }
 
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -2631,7 +2662,7 @@ static void RestoreSealedApplicationOnEvent(DWORD event, HWND window, DWORD time
         (!activating && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW) ||
         !IsWindow(window) || GetAncestor(window, GA_ROOT) != window || IsSwitcherWindow(window))
         return;
-    if (activating && (GetForegroundWindow() != window || IsPrimaryMinimizeFeedback(event, time))) return;
+    if (activating && GetForegroundWindow() != window) return;
     if (IsLassoRestorationEvent(window, time)) return;
 
     DWORD pid = 0;
@@ -2679,6 +2710,8 @@ static HWND g_taskViewWindow = nullptr;
 static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
+    if (idC == CHILDID_SELF) WatchCascadiaSwitcher(hwnd, event, dwM);
+    if (event == EVENT_OBJECT_NAMECHANGE || event == EVENT_OBJECT_HIDE) return;
     if (event == EVENT_OBJECT_DESTROY && idC == CHILDID_SELF) {
         if (g_taskViewWindow == hwnd) g_taskViewWindow = nullptr;
         // A HWND can be recycled after destruction; never restore stale state
@@ -2687,7 +2720,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
         g_sealedWindowStates.erase(hwnd);
         g_restoredWindowPresentations.erase(hwnd);
         RemoveAltTabProxyTarget(hwnd);
-        std::erase_if(g_minimizedPrimaryWindows,
+        std::erase_if(g_displacedPrimaryWindows,
             [hwnd](const auto& state) { return state.window == hwnd; });
         return;
     }
@@ -2702,22 +2735,6 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 
     const bool restoredByLasso = idC == CHILDID_SELF &&
         IsLassoRestorationEvent(hwnd, dwM);
-
-    if (idC == CHILDID_SELF &&
-        (event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND)) {
-        const auto primary = FindPrimaryWindowMinimization(hwnd);
-        if (primary != g_minimizedPrimaryWindows.end()) {
-            if (event == EVENT_SYSTEM_MINIMIZESTART) {
-                if (IsIconic(hwnd)) primary->pending = false;
-                if (g_primaryMinimizeCompletedAt && GetTickCount64() - g_primaryMinimizeCompletedAt < 1500)
-                    g_primaryMinimizeCompletedAt = GetTickCount64();
-            } else if (!IsIconic(hwnd)) {
-                g_minimizedPrimaryWindows.erase(primary);
-                RestoreMinimizedPrimaryWindows();
-            }
-            return;
-        }
-    }
 
     if (idC == CHILDID_SELF && !restoredByLasso)
         RestorePrimaryWindowsOnEvent(event, hwnd, dwM);
@@ -2814,7 +2831,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 // taskbar and hide/restore work. Hook callbacks live on the main message thread.
 static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDesktop = GetWindowDesktopGuid,
                                    bool (*isOnCurrentDesktop)(HWND) = IsWindowOnCurrentVirtualDesktop) {
-    RestoreMinimizedPrimaryWindows();
+    RestoreDisplacedPrimaryWindows();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !isOnCurrentDesktop(root)) return;
@@ -2836,7 +2853,7 @@ static void HideCurrentApplication(HWND foreground, ReadWindowDesktop readDeskto
 }
 
 static void HideOtherApplications(HWND foreground) {
-    RestoreMinimizedPrimaryWindows();
+    RestoreDisplacedPrimaryWindows();
     if (!IsWindow(foreground)) return;
     HWND root = GetAncestor(foreground, GA_ROOT);
     if (!root || !IsWindowOnCurrentVirtualDesktop(root)) return;
@@ -2894,7 +2911,7 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         break;
     case WM_CLOSE:
         ExecuteCollectRestore();
-        RestoreMinimizedPrimaryWindows();
+        RestoreDisplacedPrimaryWindows();
         RestoreAllSealedWindows();
         DestroyWindow(hwnd);
         return 0;
@@ -2930,10 +2947,12 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     RegisterAppShortcut();
     g_hSysHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    g_hObjHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW,
+    g_hObjHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     const HWINEVENTHOOK focusHook = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
+        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    const HWINEVENTHOOK nameHook = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE,
         nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     SetEvent(ready);
@@ -2945,8 +2964,9 @@ static DWORD WINAPI CoordinatorThreadProc(void* readyPtr) {
     if (g_hSysHook) UnhookWinEvent(g_hSysHook);
     if (g_hObjHook) UnhookWinEvent(g_hObjHook);
     if (focusHook) UnhookWinEvent(focusHook);
+    if (nameHook) UnhookWinEvent(nameHook);
     ExecuteCollectRestore();
-    RestoreMinimizedPrimaryWindows();
+    RestoreDisplacedPrimaryWindows();
     RestoreAllSealedWindows();
     g_hLassoCoordinator = nullptr;
     winrt::uninit_apartment();

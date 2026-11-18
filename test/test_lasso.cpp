@@ -137,83 +137,146 @@ void run(const std::string& name) {
         g_testWindowDesktopIds.clear();
         return;
     }
-    if (name == "primary_minimize_roundtrip") {
+    if (name == "primary_position_roundtrip") {
         Window plain, layered(WS_EX_APPWINDOW | WS_EX_LAYERED), alreadyMinimized;
         ShowWindow(plain, SW_SHOWNOACTIVATE);
         ShowWindow(layered, SW_SHOWMAXIMIZED);
         ShowWindow(alreadyMinimized, SW_SHOWMINNOACTIVE);
         CHECK(IsZoomed(layered) && IsIconic(alreadyMinimized));
         CHECK(SetLayeredWindowAttributes(layered, RGB(13, 42, 71), 173, LWA_ALPHA));
-        const LONG_PTR plainStyle = GetWindowLongPtrW(plain, GWL_EXSTYLE);
         const LONG_PTR layeredStyle = GetWindowLongPtrW(layered, GWL_EXSTYLE);
-        CHECK(MinimizePrimaryWindow(plain));
-        CHECK(MinimizePrimaryWindow(layered));
-        CHECK(!MinimizePrimaryWindow(alreadyMinimized));
-        CHECK(g_minimizedPrimaryWindows.size() == 2 &&
-            g_minimizedPrimaryWindows[0].window == plain.h && g_minimizedPrimaryWindows[1].window == layered.h);
+        RECT plainOriginal{}, layeredOriginal{};
+        CHECK(GetWindowRect(plain, &plainOriginal) && GetWindowRect(layered, &layeredOriginal));
+        CHECK(PrimaryDesktopWindowTop(1080, 23, 48) == 1034);
+        CHECK(PrimaryDesktopWindowTop(1080, 0, 48) == 1032);
+        constexpr int targetTop = 400;
+        CHECK(ParkPrimaryWindow(plain, targetTop));
+        CHECK(ParkPrimaryWindow(layered, targetTop));
+        CHECK(!ParkPrimaryWindow(alreadyMinimized, targetTop));
+        CHECK(!ParkPrimaryWindow(plain, targetTop));
+        CHECK(g_displacedPrimaryWindows.size() == 2);
         DispatchPendingWindowMessages();
-        CHECK(IsIconic(plain) && IsIconic(layered));
-        CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
-        CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
-        CHECK(!MinimizePrimaryWindow(plain));
+
+        RECT parked{};
+        CHECK(GetWindowRect(plain, &parked));
+        CHECK(parked.left == plainOriginal.left && parked.top == targetTop);
+        CHECK(parked.right - parked.left == plainOriginal.right - plainOriginal.left);
+        CHECK(parked.bottom - parked.top == plainOriginal.bottom - plainOriginal.top);
+        CHECK(GetWindowRect(layered, &parked));
+        CHECK(parked.left == layeredOriginal.left && parked.top == targetTop);
+        CHECK(IsWindowVisible(plain) && IsWindowVisible(layered));
+        CHECK(!IsIconic(plain) && !IsIconic(layered) && IsZoomed(layered));
+
         CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
-        CHECK(g_minimizedPrimaryWindows.empty());
         DispatchPendingWindowMessages();
-        CHECK(!IsIconic(plain) && !IsIconic(layered) && IsIconic(alreadyMinimized));
-        CHECK(IsZoomed(layered)); // Preserve the pre-minimize maximized placement.
-        CHECK(GetWindowLongPtrW(plain, GWL_EXSTYLE) == plainStyle);
+        CHECK(g_displacedPrimaryWindows.empty());
+        RECT restored{};
+        CHECK(GetWindowRect(plain, &restored) && EqualRect(&restored, &plainOriginal));
+        CHECK(GetWindowRect(layered, &restored) && EqualRect(&restored, &layeredOriginal));
+        CHECK(IsZoomed(layered) && IsIconic(alreadyMinimized));
         CHECK(GetWindowLongPtrW(layered, GWL_EXSTYLE) == layeredStyle);
         BYTE alpha = 0;
         DWORD flags = 0;
         CHECK(GetLayeredWindowAttributes(layered, nullptr, &alpha, &flags));
         CHECK(alpha == 173 && flags == LWA_ALPHA);
 
-        CHECK(MinimizePrimaryWindow(plain));
+        CHECK(ParkPrimaryWindow(plain, targetTop));
         CoordinatorWndProc(plain, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
         DispatchPendingWindowMessages();
-        CHECK(!IsIconic(plain));
+        CHECK(GetWindowRect(plain, &restored) && EqualRect(&restored, &plainOriginal));
         return;
     }
-    if (name == "primary_minimize_events") {
-        Window a, b, incoming;
-        for (HWND h : {a.h, b.h, incoming.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
-        const DWORD noOwnProcess = 0;
+    if (name == "primary_position_events") {
+        RegisterFixtureClass(L"XamlExplorerHostIslandWindow_WASDK");
+        Window a, b, incoming, island(WS_EX_APPWINDOW, nullptr, L"XamlExplorerHostIslandWindow_WASDK");
+        for (HWND h : {a.h, b.h, incoming.h, island.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
+        SetWindowTextW(island, L"");
+        constexpr int targetTop = 400;
+        constexpr DWORD noOwnProcess = 0;
         for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND}) {
-            CHECK(MinimizePrimaryWindow(a));
-            CHECK(MinimizePrimaryWindow(b));
+            CHECK(ParkPrimaryWindow(a, targetTop));
+            CHECK(ParkPrimaryWindow(b, targetTop));
             DispatchPendingWindowMessages();
-            CHECK(IsIconic(a) && IsIconic(b));
-            g_primaryMinimizeCompletedAt = GetTickCount64();
-            DWORD time = static_cast<DWORD>(g_primaryMinimizeCompletedAt);
+            g_primaryMoveCompletedAt = GetTickCount64();
+            const auto time = static_cast<DWORD>(g_primaryMoveCompletedAt);
+            if (event == EVENT_SYSTEM_FOREGROUND) SetForegroundWindow(island);
+            RestorePrimaryWindowsOnEvent(event, island, time + 1, noOwnProcess);
+            CHECK(g_displacedPrimaryWindows.size() == 2);
             if (event == EVENT_SYSTEM_FOREGROUND) {
                 SetForegroundWindow(incoming);
                 CHECK(GetForegroundWindow() == incoming.h);
             }
             RestorePrimaryWindowsOnEvent(event, incoming, time, noOwnProcess);
-            CHECK(g_minimizedPrimaryWindows.size() == 2); // Ignore events queued before minimizing.
+            CHECK(g_displacedPrimaryWindows.size() == 2);
             RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, noOwnProcess);
-            CHECK(g_minimizedPrimaryWindows.size() == 2);
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1); // Own process.
-            CHECK(g_minimizedPrimaryWindows.size() == 2);
-            if (event == EVENT_SYSTEM_FOREGROUND) {
-                RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
-                CHECK(g_minimizedPrimaryWindows.size() == 2);
-            }
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 301, noOwnProcess);
-            CHECK(g_minimizedPrimaryWindows.empty());
+            CHECK(g_displacedPrimaryWindows.size() == 2);
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1);
+            CHECK(g_displacedPrimaryWindows.size() == 2);
+            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
+            CHECK(g_displacedPrimaryWindows.empty());
             DispatchPendingWindowMessages();
-            CHECK(!IsIconic(a) && !IsIconic(b));
         }
-        CHECK(MinimizePrimaryWindow(a));
-        CHECK(MinimizePrimaryWindow(b));
+        CHECK(ParkPrimaryWindow(a, targetTop));
+        CHECK(ParkPrimaryWindow(b, targetTop));
         DispatchPendingWindowMessages();
-        WinEventProc(nullptr, EVENT_SYSTEM_MINIMIZESTART, b, OBJID_WINDOW, CHILDID_SELF, 0, 0);
-        CHECK(!g_minimizedPrimaryWindows.back().pending);
         WinEventProc(nullptr, EVENT_OBJECT_DESTROY, a, OBJID_WINDOW, CHILDID_SELF, 0, 0);
-        CHECK(g_minimizedPrimaryWindows.size() == 1 && g_minimizedPrimaryWindows.front().window == b.h);
-        RestoreMinimizedPrimaryWindows();
+        CHECK(g_displacedPrimaryWindows.size() == 1 && g_displacedPrimaryWindows.front().window == b.h);
+        CHECK(SetWindowTextW(island, L"An ordinary titled window"));
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, island, static_cast<DWORD>(GetTickCount64()), noOwnProcess);
+        CHECK(g_displacedPrimaryWindows.empty());
         DispatchPendingWindowMessages();
-        CHECK(!IsIconic(b) && !(GetWindowLongPtrW(b, GWL_EXSTYLE) & WS_EX_LAYERED));
+        RECT restored{};
+        CHECK(GetWindowRect(b, &restored) && restored.top == 50);
+        return;
+    }
+    if (name == "cascadia_switcher_close") {
+        RegisterFixtureClass(L"CASCADIA_HOSTING_WINDOW_CLASS");
+        Window target, switcher(WS_EX_APPWINDOW, nullptr, L"CASCADIA_HOSTING_WINDOW_CLASS"), other, coordinator;
+        ShowWindow(target, SW_SHOWNOACTIVATE);
+        CHECK(SealWindow(target, L"switcher-target.exe", GUID{1}));
+        const auto currentDesktop = +[](GUID& id) { id = GUID{1}; return true; };
+        g_hLassoCoordinator = coordinator;
+        CHECK(BeginAltTabPreview(coordinator, nullptr, currentDesktop));
+        auto send = [](HWND window, DWORD event) {
+            WinEventProc(nullptr, event, window, OBJID_WINDOW, CHILDID_SELF, 0,
+                static_cast<DWORD>(GetTickCount64()));
+        };
+
+        SetWindowTextW(switcher, L"Unrelated");
+        ShowWindow(switcher, SW_SHOWNOACTIVATE);
+        send(switcher, EVENT_OBJECT_SHOW);
+        ShowWindow(switcher, SW_HIDE);
+        send(switcher, EVENT_OBJECT_HIDE);
+        CHECK(g_InSnapWindows && !g_altTabNextCollectAt);
+
+        SetWindowTextW(switcher, L"任务切换");
+        ShowWindow(switcher, SW_SHOWNOACTIVATE);
+        send(switcher, EVENT_OBJECT_SHOW);
+        CHECK(IsSwitcherWindow(switcher) && g_cascadiaSwitchers.size() == 1);
+        SetWindowTextW(switcher, L"");
+        ShowWindow(switcher, SW_HIDE);
+        send(switcher, EVENT_OBJECT_HIDE);
+        CHECK(g_InSnapWindows && g_altTabNextCollectAt);
+        ShowWindow(other, SW_SHOW);
+        SetForegroundWindow(other);
+        g_altTabNextCollectAt = GetTickCount64();
+        OnCollectTimer(coordinator, TIMER_ID_COLLECT);
+        CHECK(!g_InSnapWindows && g_altTabProxies.empty() && g_cascadiaSwitchers.empty());
+        CHECK(ReadTaggedExe(target) == L"switcher-target.exe");
+
+        CHECK(BeginAltTabPreview(coordinator, other, currentDesktop));
+        SetWindowTextW(switcher, L"任务视图");
+        send(switcher, EVENT_OBJECT_NAMECHANGE);
+        const HWND destroyed = switcher.h;
+        CHECK(DestroyWindow(destroyed));
+        switcher.h = nullptr;
+        send(destroyed, EVENT_OBJECT_DESTROY);
+        CHECK(g_InSnapWindows && g_altTabNextCollectAt);
+        g_altTabNextCollectAt = GetTickCount64();
+        OnCollectTimer(coordinator, TIMER_ID_COLLECT);
+        CHECK(!g_InSnapWindows && g_altTabProxies.empty() && g_cascadiaSwitchers.empty());
+        CHECK(ShowWindowAndShowTaskbarIcon(target));
+        g_hLassoCoordinator = nullptr;
         return;
     }
     if (name == "app_open_unseals_group") {
@@ -798,6 +861,7 @@ void run(const std::string& name) {
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
         CHECK(std::wstring(proxyCaption) == L"preview-fixture 「2」");
         const int originalWidth = card->layout.width;
+        const int originalHeight = card->layout.height;
         CHECK(originalWidth > 0);
         CHECK(GetWindowLongPtrW(proxy, GWL_EXSTYLE) & WS_EX_APPWINDOW);
         CHECK(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
@@ -807,6 +871,7 @@ void run(const std::string& name) {
         CHECK(FindAltTabProxyTarget(proxy) == sibling.h);
         CHECK(card->windowTitles == std::vector<std::wstring>{L"A B"});
         CHECK(card->layout.width < originalWidth);
+        CHECK(card->layout.height == originalHeight - card->layout.rowHeight);
         CHECK(GetWindowTextW(proxy, proxyCaption, static_cast<int>(std::size(proxyCaption))) > 0);
         CHECK(std::wstring(proxyCaption) == L"preview-fixture 「1」");
         ExecuteCollectRestore();
@@ -837,19 +902,36 @@ void run(const std::string& name) {
         CHECK(dc);
 
         auto& layout = proxy.layout;
-        CHECK(MeasureProxyThumbnailLayout(dc, proxy.windowTitles, layout));
+        proxy.captionFont = captionCase.captionFont;
+        NONCLIENTMETRICSW systemMetrics{};
+        systemMetrics.cbSize = sizeof(systemMetrics);
+        CHECK(SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, systemMetrics.cbSize,
+            &systemMetrics, 0, GetDpiForWindow(captionWindow)));
+        ProxyThumbnailLayout emptyLayout;
+        CHECK(!MeasureProxyThumbnailLayout(dc, {}, proxy.captionFont, emptyLayout));
+        CHECK(emptyLayout.height == 0);
+        CHECK(MeasureProxyThumbnailLayout(dc, proxy.windowTitles, proxy.captionFont, layout));
         ProxyThumbnailLayout longestLayout;
-        CHECK(MeasureProxyThumbnailLayout(dc, {longest}, longestLayout));
+        CHECK(MeasureProxyThumbnailLayout(dc, {longest}, proxy.captionFont, longestLayout));
         CHECK(layout.width == longestLayout.width);
+        CHECK(longestLayout.height == PROXY_TITLE_PADDING_Y * 2 + longestLayout.rowHeight);
+        ProxyThumbnailLayout twoRows;
+        CHECK(MeasureProxyThumbnailLayout(dc, {longest, L"W2"}, proxy.captionFont, twoRows));
+        CHECK(twoRows.height - longestLayout.height == longestLayout.rowHeight);
         CHECK(layout.height == PROXY_TITLE_PADDING_Y * 2 +
             static_cast<int>(proxy.windowTitles.size()) * layout.rowHeight);
+        const SIZE narrow = FitProxyThumbnail(layout, layout.width / 2, layout.height + 100);
+        CHECK(narrow.cx == layout.width / 2 && narrow.cy == layout.height);
+        const SIZE shortRequest = FitProxyThumbnail(layout, layout.width, layout.height / 2);
+        CHECK(shortRequest.cx == layout.width && shortRequest.cy == layout.height / 2);
 
-        HFONT font = CreateProxyTitleFont();
+        HFONT font = CreateFontIndirectW(&proxy.captionFont);
         CHECK(font);
         LOGFONTW logFont{};
         CHECK(GetObjectW(font, sizeof(logFont), &logFont) == sizeof(logFont));
-        CHECK(logFont.lfHeight == -19);
-        CHECK(wcscmp(logFont.lfFaceName, L"Microsoft YaHei") == 0);
+        CHECK(logFont.lfHeight == systemMetrics.lfCaptionFont.lfHeight);
+        CHECK(logFont.lfWeight == systemMetrics.lfCaptionFont.lfWeight);
+        CHECK(wcscmp(logFont.lfFaceName, systemMetrics.lfCaptionFont.lfFaceName) == 0);
         DeleteObject(font);
 
         void* bits = nullptr;
@@ -903,6 +985,21 @@ void run(const std::string& name) {
         CHECK(visiblePixels > 100);
         SelectObject(dc, old);
         DeleteObject(bitmap);
+
+        const auto narrowInfo = ProxyBitmapInfo(narrow.cx, narrow.cy);
+        void* narrowBits = nullptr;
+        HBITMAP narrowBitmap = CreateDIBSection(dc, &narrowInfo, DIB_RGB_COLORS, &narrowBits, nullptr, 0);
+        CHECK(narrowBitmap && narrowBits);
+        CHECK(SelectObject(dc, narrowBitmap) == old);
+        CHECK(RenderProxyTitleBitmap(dc, static_cast<DWORD*>(narrowBits), narrow.cx, narrow.cy, proxy, accent));
+        const auto* narrowPixels = static_cast<const DWORD*>(narrowBits);
+        const int lastRow = PROXY_TITLE_PADDING_Y +
+            (static_cast<int>(proxy.windowTitles.size()) - 1) * layout.rowHeight;
+        const auto* lastRowBegin = narrowPixels + static_cast<size_t>(lastRow) * narrow.cx;
+        CHECK(std::any_of(lastRowBegin, lastRowBegin + static_cast<size_t>(layout.rowHeight) * narrow.cx,
+            [](DWORD pixel) { return (pixel >> 24) != 0; }));
+        SelectObject(dc, old);
+        DeleteObject(narrowBitmap);
         DeleteDC(dc);
         return;
     } else if (name == "sealed_preview_icon_roundtrip") {
