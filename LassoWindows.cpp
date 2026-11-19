@@ -2420,8 +2420,11 @@ struct PrimaryWindowPosition {
 };
 
 static std::vector<PrimaryWindowPosition> g_displacedPrimaryWindows;
-static ULONGLONG g_primaryMoveCompletedAt = 0;
+// Record when parking begins, not when asynchronous SetWindowPos requests finish.
+static ULONGLONG g_primaryMoveStartedAt = 0;
 static DWORD g_primaryTaskbarProcess = 0;
+// Prevent reentrant foreground callbacks from restoring a half-parked batch.
+static bool g_primaryPositionTransitioning = false;
 
 static int GetTaskbarHeight(HWND taskbar) {
     RECT bounds{};
@@ -2452,11 +2455,16 @@ static bool ParkPrimaryWindow(HWND window, int top) {
 }
 
 static void RestoreDisplacedPrimaryWindows() {
-    g_primaryMoveCompletedAt = 0;
+    if (g_primaryPositionTransitioning) return;
+    g_primaryPositionTransitioning = true;
     std::erase_if(g_displacedPrimaryWindows, [](const auto& state) {
         return !IsWindow(state.window) || SetPrimaryWindowRect(state.window, state.original);
     });
-    if (g_displacedPrimaryWindows.empty()) g_primaryTaskbarProcess = 0;
+    if (g_displacedPrimaryWindows.empty()) {
+        g_primaryMoveStartedAt = 0;
+        g_primaryTaskbarProcess = 0;
+    }
+    g_primaryPositionTransitioning = false;
 }
 
 static bool IsUntitledWasdkHost(HWND window) {
@@ -2472,25 +2480,28 @@ static bool IsUntitledWasdkHostOrOwnedWindow(HWND window) {
 
 static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
                                          DWORD ownProcess = GetCurrentProcessId()) {
-    if (g_displacedPrimaryWindows.empty() ||
-        (event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_SHOW))
-        return;
-    if (GetAncestor(h, GA_ROOT) != h || !IsValidAppWindow(h) || IsSwitcherWindow(h) ||
-        IsIconic(h) || g_sealedWindowStates.contains(h)) return;
+    // Parked windows remain visible (their title bars sit above the taskbar).
+    // CREATE/SHOW events are not evidence of user activation and must not
+    // restore the entire batch; only an actual foreground transition may do so.
+    if (event != EVENT_SYSTEM_FOREGROUND || g_primaryPositionTransitioning ||
+        g_displacedPrimaryWindows.empty() || !IsWindow(h)) return;
     const HWND foreground = GetForegroundWindow();
-    if (IsUntitledWasdkHostOrOwnedWindow(h) || IsUntitledWasdkHostOrOwnedWindow(foreground)) return;
+    if (foreground != h || !IsWindowVisible(h) || GetAncestor(h, GA_ROOT) != h ||
+        !IsValidAppWindow(h) || IsSwitcherWindow(h) || IsIconic(h) ||
+        g_sealedWindowStates.contains(h) || IsUntitledWasdkHostOrOwnedWindow(h)) return;
     DWORD process = 0;
     GetWindowThreadProcessId(h, &process);
     if (!process || process == ownProcess ||
         (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
-    // Explorer can create or show auxiliary top-level windows during a Shell interaction.
+    // Explorer auxiliary windows should not count as application activation.
     if (process == g_primaryTaskbarProcess && !WindowClassIs(h, L"CabinetWClass")) return;
 
-    // Ignore events queued before the current move finished.
-    if (g_primaryMoveCompletedAt && GetTickCount64() - g_primaryMoveCompletedAt < 1500 &&
-        static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveCompletedAt)) <= 0) return;
-    if (event == EVENT_SYSTEM_FOREGROUND && foreground != h) return;
-    if (event != EVENT_OBJECT_CREATE && !IsWindowVisible(h)) return;
+    // WinEvents are queued asynchronously. Reject stale foreground events
+    // regardless of how long delivery was delayed (DWORD tick wrap is safe
+    // while the parking session is younger than 2^31 milliseconds).
+    if (g_primaryMoveStartedAt &&
+        GetTickCount64() - g_primaryMoveStartedAt < 0x80000000ULL &&
+        static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveStartedAt)) <= 0) return;
     RestoreDisplacedPrimaryWindows();
 }
 
@@ -2536,13 +2547,18 @@ static void TogglePrimaryWindows() {
     std::vector<HWND> candidates;
     ToggleContext context{&candidates, primary};
     EnumWindows(EnumWindowToggleProc, reinterpret_cast<LPARAM>(&context));
+    if (candidates.empty()) return;
     const int top = PrimaryDesktopWindowTop(screenHeight, taskbarHeight);
     g_displacedPrimaryWindows.reserve(candidates.size());
+    g_primaryPositionTransitioning = true;
+    g_primaryMoveStartedAt = GetTickCount64();
+    g_primaryTaskbarProcess = 0;
+    GetWindowThreadProcessId(taskbar, &g_primaryTaskbarProcess);
     for (HWND window : candidates) ParkPrimaryWindow(window, top);
-    if (!g_displacedPrimaryWindows.empty()) {
+    g_primaryPositionTransitioning = false;
+    if (g_displacedPrimaryWindows.empty()) {
+        g_primaryMoveStartedAt = 0;
         g_primaryTaskbarProcess = 0;
-        GetWindowThreadProcessId(taskbar, &g_primaryTaskbarProcess);
-        g_primaryMoveCompletedAt = GetTickCount64();
     }
 }
 
@@ -2746,6 +2762,10 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
         RemoveAltTabProxyTarget(hwnd);
         std::erase_if(g_displacedPrimaryWindows,
             [hwnd](const auto& state) { return state.window == hwnd; });
+        if (g_displacedPrimaryWindows.empty()) {
+            g_primaryMoveStartedAt = 0;
+            g_primaryTaskbarProcess = 0;
+        }
         return;
     }
 
