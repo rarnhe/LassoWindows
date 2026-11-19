@@ -200,50 +200,106 @@ void run(const std::string& name) {
         SetWindowTextW(island, L"");
         constexpr int targetTop = 400;
         constexpr DWORD noOwnProcess = 0;
-        for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND}) {
-            CHECK(ParkPrimaryWindow(a, targetTop));
-            CHECK(ParkPrimaryWindow(b, targetTop));
-            DispatchPendingWindowMessages();
-            g_primaryMoveCompletedAt = GetTickCount64();
-            const auto time = static_cast<DWORD>(g_primaryMoveCompletedAt);
-            SetForegroundWindow(island);
-            CHECK(GetForegroundWindow() == island.h);
-            RestorePrimaryWindowsOnEvent(event, island, time + 1, noOwnProcess);
-            CHECK(g_displacedPrimaryWindows.size() == 2);
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
-            CHECK(g_displacedPrimaryWindows.size() == 2);
-            SetForegroundWindow(incoming);
-            CHECK(GetForegroundWindow() == incoming.h);
-            RestorePrimaryWindowsOnEvent(event, incoming, time, noOwnProcess);
-            CHECK(g_displacedPrimaryWindows.size() == 2);
-            RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, time + 1, noOwnProcess);
-            CHECK(g_displacedPrimaryWindows.size() == 2);
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1);
-            CHECK(g_displacedPrimaryWindows.size() == 2);
-            g_primaryTaskbarProcess = GetCurrentProcessId();
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
-            CHECK(g_displacedPrimaryWindows.size() == 2);
-            g_primaryTaskbarProcess = 0;
-            RestorePrimaryWindowsOnEvent(event, incoming, time + 1, noOwnProcess);
-            CHECK(g_displacedPrimaryWindows.empty());
-            DispatchPendingWindowMessages();
-        }
+
+        CHECK(ParkPrimaryWindow(a, targetTop));
+        CHECK(ParkPrimaryWindow(b, targetTop));
+        DispatchPendingWindowMessages();
+        g_primaryMoveStartedAt = GetTickCount64();
+        const DWORD started = static_cast<DWORD>(g_primaryMoveStartedAt);
+
+        // An untitled WASDK host, or a stale/mismatched foreground event,
+        // must never undo the parked positions.
+        SetForegroundWindow(island);
+        CHECK(GetForegroundWindow() == island.h);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, island, started + 1, noOwnProcess);
+        CHECK(g_displacedPrimaryWindows.size() == 2);
+        SetForegroundWindow(incoming);
+        CHECK(GetForegroundWindow() == incoming.h);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, a, started + 1, noOwnProcess);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, incoming, started, noOwnProcess);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, incoming, started - 1, noOwnProcess);
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_HIDE, incoming, started + 1, noOwnProcess);
+        CHECK(g_displacedPrimaryWindows.size() == 2);
+
+        // Keep self-process, taskbar auxiliary, and in-progress batch guards.
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, incoming, started + 1);
+        CHECK(g_displacedPrimaryWindows.size() == 2);
+        g_primaryTaskbarProcess = GetCurrentProcessId();
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, incoming, started + 1, noOwnProcess);
+        CHECK(g_displacedPrimaryWindows.size() == 2);
+        g_primaryTaskbarProcess = 0;
+        g_primaryPositionTransitioning = true;
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, incoming, started + 1, noOwnProcess);
+        CHECK(g_displacedPrimaryWindows.size() == 2);
+        g_primaryPositionTransitioning = false;
+
+        // Only a real, current foreground transition restores the batch.
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, incoming, started + 1, noOwnProcess);
+        CHECK(g_displacedPrimaryWindows.empty());
+        CHECK(!g_primaryMoveStartedAt && !g_primaryTaskbarProcess);
+        DispatchPendingWindowMessages();
+
         CHECK(ParkPrimaryWindow(a, targetTop));
         CHECK(ParkPrimaryWindow(b, targetTop));
         DispatchPendingWindowMessages();
         WinEventProc(nullptr, EVENT_OBJECT_DESTROY, a, OBJID_WINDOW, CHILDID_SELF, 0, 0);
         CHECK(g_displacedPrimaryWindows.size() == 1 && g_displacedPrimaryWindows.front().window == b.h);
         g_primaryTaskbarProcess = GetCurrentProcessId();
-        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, explorer, static_cast<DWORD>(GetTickCount64()), noOwnProcess);
+        SetForegroundWindow(explorer);
+        CHECK(GetForegroundWindow() == explorer.h);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, explorer,
+            static_cast<DWORD>(GetTickCount64() + 1), noOwnProcess);
         CHECK(g_displacedPrimaryWindows.empty() && !g_primaryTaskbarProcess);
         DispatchPendingWindowMessages();
+
         CHECK(ParkPrimaryWindow(b, targetTop));
         CHECK(SetWindowTextW(island, L"An ordinary titled window"));
-        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, island, static_cast<DWORD>(GetTickCount64()), noOwnProcess);
+        SetForegroundWindow(island);
+        CHECK(GetForegroundWindow() == island.h);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, island,
+            static_cast<DWORD>(GetTickCount64() + 1), noOwnProcess);
         CHECK(g_displacedPrimaryWindows.empty());
         DispatchPendingWindowMessages();
         RECT restored{};
         CHECK(GetWindowRect(b, &restored) && restored.top == 50);
+        return;
+    }
+    if (name == "primary_position_background_events") {
+        Window parked, background, active, hidden;
+        for (HWND h : {parked.h, background.h, active.h}) ShowWindow(h, SW_SHOWNOACTIVATE);
+        RECT original{};
+        CHECK(GetWindowRect(parked, &original));
+        constexpr int targetTop = 400;
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        DispatchPendingWindowMessages();
+        CHECK(IsWindowVisible(parked));
+        g_primaryMoveStartedAt = GetTickCount64();
+        const DWORD started = static_cast<DWORD>(g_primaryMoveStartedAt);
+        SetForegroundWindow(active);
+        CHECK(GetForegroundWindow() == active.h);
+
+        // CREATE/SHOW is never an activation signal: the parked title bar
+        // remains visible, and unrelated background windows can emit both.
+        for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW}) {
+            for (HWND window : {parked.h, background.h, active.h, hidden.h})
+                RestorePrimaryWindowsOnEvent(event, window, started + 1, 0);
+            WinEventProc(nullptr, event, active, OBJID_WINDOW, CHILDID_SELF, 0, started + 1);
+            CHECK(g_displacedPrimaryWindows.size() == 1);
+            RECT stillParked{};
+            CHECK(GetWindowRect(parked, &stillParked) && stillParked.top == targetTop);
+        }
+
+        // A foreground event queued before parking remains stale even if
+        // delivery takes longer than the former 1500 ms guard.
+        g_primaryMoveStartedAt = GetTickCount64() - 2000;
+        const DWORD staleTime = static_cast<DWORD>(g_primaryMoveStartedAt);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, active, staleTime, 0);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, active, staleTime + 2001, 0);
+        CHECK(g_displacedPrimaryWindows.empty());
+        DispatchPendingWindowMessages();
+        RECT restored{};
+        CHECK(GetWindowRect(parked, &restored) && EqualRect(&restored, &original));
         return;
     }
     if (name == "cascadia_switcher_close") {
