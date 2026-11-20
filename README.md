@@ -49,7 +49,7 @@ ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --outp
 
 用例覆盖配置解析、窗口筛选、封印与恢复、UWP 关闭请求、主任务栏“显示桌面”控件命中、任务栏样式保留与批量恢复、双标签桌面隔离、重复 Alt+Tab、按 EXE 分组的代理映射、去除 `.exe` 的原生代理标题、无重复 EXE 标题的 Z 序标题列表及其左对齐、按最宽标题和行数排版的透明缩略图，以及黑色 Alt+Tab 图标、强调色任务栏图标和资源恢复。跨桌面用例模拟 Windows 桌面归属与 Explorer 的会话级桌面 GUID，验证切换后只为当前虚拟桌面的封印窗口建立代理。
 
-`.github/workflows/test_cpp.yml` 在 `windows-latest` 上构建应用与测试，响应 main 推送、指向 main 的 PR 和手动触发。参考 [xlsx2md](https://github.com/rarnhe/xlsx2md) 的报告方式：
+`.github/workflows/test_cpp.yml` 在 `windows-latest` 上构建应用与测试，响应 main 推送、指向 main 的 PR 和手动触发。参考报告方式：
 
 - 每次运行将结果写入 Actions Summary，并上传 `test_report.md`、JUnit 和诊断日志为 artifact；失败阶段的退出码和末尾日志也会写入报告。
 - main 推送运行会自动提交根目录 `test_report.md`，仅报告变化不会再次触发流水线。仓库需允许 Actions 写入内容；分支保护若禁止机器人直接推送，报告提交步骤会失败，artifact 仍保留。
