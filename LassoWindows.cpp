@@ -2825,8 +2825,10 @@ static bool ShouldNotifyTaskView(DWORD event, HWND window, LONG child) {
         window == g_taskViewWindow) {
         // A Task View window can briefly disappear or be replaced while the
         // same session is opening. Re-arm only after it is truly closed.
-        if ((event == EVENT_OBJECT_DESTROY || !IsWindowVisible(window)) &&
-            g_hLassoCoordinator)
+        // The WinEvent can be delivered before visibility queries settle.
+        // Always schedule a delayed check; the timer only re-arms when no
+        // Task View window remains visible.
+        if (g_hLassoCoordinator)
             SetTimer(g_hLassoCoordinator, TIMER_ID_TASKVIEW_CLOSE, 300, nullptr);
         return false;
     }
