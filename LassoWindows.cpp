@@ -12,6 +12,7 @@
 #include <UIAutomation.h>
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
 #include <iterator>
 #include <algorithm>
 #include <memory>
@@ -2423,6 +2424,12 @@ static std::vector<PrimaryWindowPosition> g_displacedPrimaryWindows;
 // Record when parking begins, not when asynchronous SetWindowPos requests finish.
 static ULONGLONG g_primaryMoveStartedAt = 0;
 static DWORD g_primaryTaskbarProcess = 0;
+// Foreground activity on a secondary display must not restore parked primary windows.
+static HMONITOR g_primaryParkMonitor = nullptr;
+static HWND g_primaryForegroundAtPark = nullptr;
+// CREATE can precede WS_VISIBLE. Only SHOW for a window created in this parking
+// session may complete the deferred restoration; unrelated SHOWs are ignored.
+static std::unordered_set<HWND> g_primaryCreatedWindows;
 // Prevent reentrant foreground callbacks from restoring a half-parked batch.
 static bool g_primaryPositionTransitioning = false;
 
@@ -2463,6 +2470,9 @@ static void RestoreDisplacedPrimaryWindows() {
     if (g_displacedPrimaryWindows.empty()) {
         g_primaryMoveStartedAt = 0;
         g_primaryTaskbarProcess = 0;
+        g_primaryParkMonitor = nullptr;
+        g_primaryForegroundAtPark = nullptr;
+        g_primaryCreatedWindows.clear();
     }
     g_primaryPositionTransitioning = false;
 }
@@ -2478,30 +2488,64 @@ static bool IsUntitledWasdkHostOrOwnedWindow(HWND window) {
     return IsUntitledWasdkHost(window) || (owner != window && IsUntitledWasdkHost(owner));
 }
 
-static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
-                                         DWORD ownProcess = GetCurrentProcessId()) {
-    // Parked windows remain visible (their title bars sit above the taskbar).
-    // CREATE/SHOW events are not evidence of user activation and must not
-    // restore the entire batch; only an actual foreground transition may do so.
-    if (event != EVENT_SYSTEM_FOREGROUND || g_primaryPositionTransitioning ||
-        g_displacedPrimaryWindows.empty() || !IsWindow(h)) return;
-    const HWND foreground = GetForegroundWindow();
-    if (foreground != h || !IsWindowVisible(h) || GetAncestor(h, GA_ROOT) != h ||
-        !IsValidAppWindow(h) || IsSwitcherWindow(h) || IsIconic(h) ||
-        g_sealedWindowStates.contains(h) || IsUntitledWasdkHostOrOwnedWindow(h)) return;
-    DWORD process = 0;
-    GetWindowThreadProcessId(h, &process);
-    if (!process || process == ownProcess ||
-        (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
-    // Explorer auxiliary windows should not count as application activation.
-    if (process == g_primaryTaskbarProcess && !WindowClassIs(h, L"CabinetWClass")) return;
+static HMONITOR WindowMonitorForRestore(HWND window) {
+    return MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+}
 
-    // WinEvents are queued asynchronously. Reject stale foreground events
-    // regardless of how long delivery was delayed (DWORD tick wrap is safe
-    // while the parking session is younger than 2^31 milliseconds).
-    if (g_primaryMoveStartedAt &&
-        GetTickCount64() - g_primaryMoveStartedAt < 0x80000000ULL &&
-        static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveStartedAt)) <= 0) return;
+static bool IsPrimaryRestorationEventRecent(DWORD time) {
+    // Out-of-context WinEvents can be delivered long after their source event.
+    return !g_primaryMoveStartedAt ||
+        GetTickCount64() - g_primaryMoveStartedAt >= 0x80000000ULL ||
+        static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveStartedAt)) > 0;
+}
+
+static bool IsPrimaryRestorationApp(HWND window, DWORD ownProcess) {
+    if (!IsWindow(window) || GetAncestor(window, GA_ROOT) != window ||
+        GetWindow(window, GW_OWNER) != nullptr || !IsValidAppWindow(window) ||
+        IsSwitcherWindow(window) || FindAltTabProxyTarget(window) ||
+        g_sealedWindowStates.contains(window) ||
+        GetPropW(window, L"MTU_EXE_TAG") != nullptr ||
+        IsUntitledWasdkHostOrOwnedWindow(window) ||
+        (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return false;
+    DWORD process = 0;
+    GetWindowThreadProcessId(window, &process);
+    return process && process != ownProcess &&
+        (process != g_primaryTaskbarProcess || WindowClassIs(window, L"CabinetWClass"));
+}
+
+static void RestorePrimaryWindowsOnEvent(
+    DWORD event, HWND window, DWORD time, DWORD ownProcess = GetCurrentProcessId(),
+    HMONITOR (*monitorForWindow)(HWND) = WindowMonitorForRestore) {
+    if ((event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_CREATE &&
+         event != EVENT_OBJECT_SHOW) ||
+        g_primaryPositionTransitioning || g_displacedPrimaryWindows.empty() ||
+        !IsPrimaryRestorationEventRecent(time) ||
+        !IsPrimaryRestorationApp(window, ownProcess)) return;
+
+    if (event == EVENT_OBJECT_CREATE) {
+        // Do not treat an existing parked window as a newly launched app.
+        if (std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
+            [window](const auto& state) { return state.window == window; })) return;
+        // Hidden background helper windows must not be promoted to app launches.
+        const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+        const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if (!(style & WS_CAPTION) && !(exStyle & WS_EX_APPWINDOW)) return;
+        g_primaryCreatedWindows.insert(window);
+    } else if (event == EVENT_OBJECT_SHOW) {
+        // SHOW is only a continuation of a qualifying CREATE in this session.
+        if (!g_primaryCreatedWindows.contains(window)) return;
+    } else {
+        if (GetForegroundWindow() != window ||
+            // Re-announcing the already-active window is not a new activation.
+            window == g_primaryForegroundAtPark) return;
+    }
+
+    // CREATE often fires before the window is shown; its matching SHOW event
+    // completes the decision after the window has a real monitor placement.
+    if (!IsWindowVisible(window) || IsIconic(window)) return;
+    const HMONITOR primary = g_primaryParkMonitor ? g_primaryParkMonitor :
+        MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (!primary || monitorForWindow(window) != primary) return;
     RestoreDisplacedPrimaryWindows();
 }
 
@@ -2552,6 +2596,9 @@ static void TogglePrimaryWindows() {
     g_displacedPrimaryWindows.reserve(candidates.size());
     g_primaryPositionTransitioning = true;
     g_primaryMoveStartedAt = GetTickCount64();
+    g_primaryParkMonitor = primary;
+    g_primaryForegroundAtPark = GetForegroundWindow();
+    g_primaryCreatedWindows.clear();
     g_primaryTaskbarProcess = 0;
     GetWindowThreadProcessId(taskbar, &g_primaryTaskbarProcess);
     for (HWND window : candidates) ParkPrimaryWindow(window, top);
@@ -2559,6 +2606,9 @@ static void TogglePrimaryWindows() {
     if (g_displacedPrimaryWindows.empty()) {
         g_primaryMoveStartedAt = 0;
         g_primaryTaskbarProcess = 0;
+        g_primaryParkMonitor = nullptr;
+        g_primaryForegroundAtPark = nullptr;
+        g_primaryCreatedWindows.clear();
     }
 }
 
@@ -2746,14 +2796,66 @@ static void RestoreSealedApplicationOnEvent(DWORD event, HWND window, DWORD time
 }
 
 static HWND g_taskViewWindow = nullptr;
+static bool g_taskViewNotificationShown = false;
+static constexpr UINT_PTR TIMER_ID_TASKVIEW_CLOSE = 1002;
+
+static bool IsTaskViewWindow(HWND window) {
+    if (!IsWindowVisible(window) ||
+        !WindowClassIs(window, L"XamlExplorerHostIslandWindow")) return false;
+    wchar_t title[256]{};
+    if (!GetWindowTextW(window, title, static_cast<int>(std::size(title))) ||
+        wcscmp(title, L"任务视图") != 0) return false;
+    RECT bounds{};
+    return GetPhysicalRect(window, &bounds) && bounds.right - bounds.left >= 500;
+}
+
+static bool AnyVisibleTaskViewWindow() {
+    bool found = false;
+    EnumWindows([](HWND window, LPARAM data) -> BOOL {
+        if (!IsTaskViewWindow(window)) return TRUE;
+        *reinterpret_cast<bool*>(data) = true;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+static bool ShouldNotifyTaskView(DWORD event, HWND window, LONG child) {
+    if (child != CHILDID_SELF) return false;
+    if ((event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY) &&
+        window == g_taskViewWindow) {
+        // A Task View window can briefly disappear or be replaced while the
+        // same session is opening. Re-arm only after it is truly closed.
+        if ((event == EVENT_OBJECT_DESTROY || !IsWindowVisible(window)) &&
+            g_hLassoCoordinator)
+            SetTimer(g_hLassoCoordinator, TIMER_ID_TASKVIEW_CLOSE, 300, nullptr);
+        return false;
+    }
+    if ((event != EVENT_OBJECT_SHOW && event != EVENT_SYSTEM_FOREGROUND) ||
+        !IsTaskViewWindow(window)) return false;
+    g_taskViewWindow = window;
+    if (g_hLassoCoordinator)
+        KillTimer(g_hLassoCoordinator, TIMER_ID_TASKVIEW_CLOSE);
+    if (g_taskViewNotificationShown) return false;
+    g_taskViewNotificationShown = true;
+    return true;
+}
+
+static void OnTaskViewCloseTimer(HWND coordinator) {
+    if (coordinator) KillTimer(coordinator, TIMER_ID_TASKVIEW_CLOSE);
+    if (AnyVisibleTaskViewWindow()) return;
+    g_taskViewWindow = nullptr;
+    g_taskViewNotificationShown = false;
+}
 
 static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
     if (idC == CHILDID_SELF) WatchCascadiaSwitcher(hwnd, event, dwM);
+    if (ShouldNotifyTaskView(event, hwnd, idC))
+        ShowWin11NativeNotification(L"待完成", L"Win+Tab可完成窗口转移");
     if (event == EVENT_OBJECT_NAMECHANGE || event == EVENT_OBJECT_HIDE) return;
     if (event == EVENT_OBJECT_DESTROY && idC == CHILDID_SELF) {
-        if (g_taskViewWindow == hwnd) g_taskViewWindow = nullptr;
+        g_primaryCreatedWindows.erase(hwnd);
         // A HWND can be recycled after destruction; never restore stale state
         // onto a different window that later receives the same handle value.
         DiscardWindowSealedIcon(hwnd);
@@ -2765,6 +2867,9 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
         if (g_displacedPrimaryWindows.empty()) {
             g_primaryMoveStartedAt = 0;
             g_primaryTaskbarProcess = 0;
+            g_primaryParkMonitor = nullptr;
+            g_primaryForegroundAtPark = nullptr;
+            g_primaryCreatedWindows.clear();
         }
         return;
     }
@@ -2856,19 +2961,8 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 	// --- 3. 全局压制逻辑 ---
 	// 只要窗口显示且不在任务视图中，就检查是否持有标记
 	SuppressHiddenWindows(hwnd, event);
-    // Win+Tab's notification is independent of the Alt+Tab preview session.
-    const bool isTaskViewWindow = className == L"XamlExplorerHostIslandWindow" &&
-        windowTitle == L"任务视图";
-    if (isTaskViewWindow && idC == CHILDID_SELF &&
-        (event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_FOREGROUND)) {
-        RECT rc{};
-        if (g_taskViewWindow != hwnd && GetPhysicalRect(hwnd, &rc) && rc.right - rc.left >= 500) {
-            g_taskViewWindow = hwnd;
-            ShowWin11NativeNotification(L"待完成", L"Win+Tab可完成窗口转移");
-        }
-    } else if (event == EVENT_SYSTEM_FOREGROUND) {
-        g_taskViewWindow = nullptr;
-    }
+    // Task View notifications are latched per visible session above. Unrelated
+    // foreground events must never reset the latch while Win+Tab is open.
 }
 
 // A message-only window on a separate worker thread serializes COM, WinEvent,
@@ -2952,8 +3046,13 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
             OnCollectTimer(hwnd, wp);
             return 0;
         }
+        if (wp == TIMER_ID_TASKVIEW_CLOSE) {
+            OnTaskViewCloseTimer(hwnd);
+            return 0;
+        }
         break;
     case WM_CLOSE:
+        KillTimer(hwnd, TIMER_ID_TASKVIEW_CLOSE);
         ExecuteCollectRestore();
         RestoreDisplacedPrimaryWindows();
         RestoreAllSealedWindows();
