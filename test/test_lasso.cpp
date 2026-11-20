@@ -284,16 +284,16 @@ void run(const std::string& name) {
         SetForegroundWindow(active);
         CHECK(GetForegroundWindow() == active.h);
 
-        // CREATE/SHOW is never an activation signal: the parked title bar
-        // remains visible, and unrelated background windows can emit both.
-        for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW}) {
-            for (HWND window : {parked.h, background.h, active.h, hidden.h})
-                RestorePrimaryWindowsOnEvent(event, window, started + 1, 0);
-            WinEventProc(nullptr, event, active, OBJID_WINDOW, CHILDID_SELF, 0, started + 1);
-            CHECK(g_displacedPrimaryWindows.size() == 1);
-            RECT stillParked{};
-            CHECK(GetWindowRect(parked, &stillParked) && stillParked.top == targetTop);
-        }
+        // SHOW of an existing window is not a new-app signal; a hidden CREATE
+        // must wait for its own later SHOW before restoring.
+        for (HWND window : {parked.h, background.h, active.h, hidden.h})
+            RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, window, started + 1, 0);
+        WinEventProc(nullptr, EVENT_OBJECT_SHOW, active, OBJID_WINDOW, CHILDID_SELF, 0, started + 1);
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_CREATE, hidden, started + 1, 0);
+        CHECK(g_primaryCreatedWindows.contains(hidden.h));
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        RECT stillParked{};
+        CHECK(GetWindowRect(parked, &stillParked) && stillParked.top == targetTop);
 
         // A foreground event queued before parking remains stale even if
         // delivery takes longer than the former 1500 ms guard.
