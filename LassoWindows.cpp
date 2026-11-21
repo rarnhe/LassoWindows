@@ -12,10 +12,12 @@
 #include <UIAutomation.h>
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
 #include <iterator>
 #include <algorithm>
 #include <memory>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 
 // WinRT 通知相关
@@ -2175,6 +2177,7 @@ static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
 #define WM_LASSO_ALT_UP       (WM_APP + 14)
 #define WM_LASSO_ESCAPE       (WM_APP + 16)
 #define WM_LASSO_TOGGLE_PRIMARY (WM_APP + 17)
+#define WM_LASSO_PRIMARY_CLICK (WM_APP + 18)
 
 static LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
@@ -2423,8 +2426,72 @@ static std::vector<PrimaryWindowPosition> g_displacedPrimaryWindows;
 // Record when parking begins, not when asynchronous SetWindowPos requests finish.
 static ULONGLONG g_primaryMoveStartedAt = 0;
 static DWORD g_primaryTaskbarProcess = 0;
+// Foreground activity on a secondary display must not restore parked primary windows.
+static HMONITOR g_primaryParkMonitor = nullptr;
+static HWND g_primaryForegroundAtPark = nullptr;
+// CREATE can precede WS_VISIBLE. Only SHOW for a window created in this parking
+// session may complete the deferred restoration; unrelated SHOWs are ignored.
+static std::unordered_set<HWND> g_primaryCreatedWindows;
 // Prevent reentrant foreground callbacks from restoring a half-parked batch.
 static bool g_primaryPositionTransitioning = false;
+
+// WH_MOUSE_LL runs on the hook thread, while the coordinator owns the parked
+// window vector. The hook only publishes an HWND; it never reads that vector.
+struct PrimaryMouseClickState {
+    HWND pressed = nullptr;
+    POINT start{};
+    bool dragged = false;
+};
+static PrimaryMouseClickState g_primaryMouseClick;
+static std::atomic<HWND> g_primaryMouseActivationTarget{nullptr};
+static std::atomic<ULONGLONG> g_primaryMouseActivationUntil{0};
+static constexpr UINT_PTR TIMER_ID_PRIMARY_CLICK_RESTORE = 1003;
+static constexpr UINT PRIMARY_CLICK_RESTORE_DELAY_MS = 60;
+static HWND g_primaryClickRestoreWindow = nullptr;
+static ULONGLONG g_primaryClickRestoreStartedAt = 0;
+
+static bool IsParkedPrimaryWindow(HWND window) {
+    return std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
+        [window](const auto& state) { return state.window == window; });
+}
+
+static bool PrimaryMouseMovedPastDragThreshold(POINT start, POINT current) {
+    const auto dx = std::llabs(static_cast<long long>(current.x) - start.x);
+    const auto dy = std::llabs(static_cast<long long>(current.y) - start.y);
+    return dx >= (std::max)(1, GetSystemMetrics(SM_CXDRAG)) ||
+        dy >= (std::max)(1, GetSystemMetrics(SM_CYDRAG));
+}
+
+static void CancelPrimaryMouseClick() {
+    g_primaryMouseClick = {};
+    g_primaryMouseActivationTarget.store(nullptr, std::memory_order_release);
+    g_primaryMouseActivationUntil.store(0, std::memory_order_release);
+}
+
+// Called exclusively from the low-level mouse hook. The returned HWND is a
+// click candidate, not permission to restore: the coordinator validates it.
+static HWND ObservePrimaryMouseClick(WPARAM message, POINT point, HWND root) {
+    if (message == WM_LBUTTONDOWN) {
+        g_primaryMouseClick = {root, point, false};
+        // Guard against the foreground event produced by this very mouse down.
+        // Keep the guard until shortly after release for delayed WinEvent delivery.
+        g_primaryMouseActivationUntil.store(GetTickCount64() + 30000, std::memory_order_release);
+        g_primaryMouseActivationTarget.store(root, std::memory_order_release);
+        return nullptr;
+    }
+    if (message == WM_MOUSEMOVE && g_primaryMouseClick.pressed) {
+        if (PrimaryMouseMovedPastDragThreshold(g_primaryMouseClick.start, point))
+            g_primaryMouseClick.dragged = true;
+        return nullptr;
+    }
+    if (message != WM_LBUTTONUP) return nullptr;
+    const HWND clicked = g_primaryMouseClick.pressed && !g_primaryMouseClick.dragged &&
+        !PrimaryMouseMovedPastDragThreshold(g_primaryMouseClick.start, point) &&
+        g_primaryMouseClick.pressed == root ? root : nullptr;
+    g_primaryMouseClick = {};
+    g_primaryMouseActivationUntil.store(GetTickCount64() + 250, std::memory_order_release);
+    return clicked;
+}
 
 static int GetTaskbarHeight(HWND taskbar) {
     RECT bounds{};
@@ -2442,9 +2509,7 @@ static bool SetPrimaryWindowRect(HWND window, const RECT& bounds, UINT flags = 0
 }
 
 static bool ParkPrimaryWindow(HWND window, int top) {
-    if (!IsWindowVisible(window) || IsIconic(window) ||
-        std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
-            [window](const auto& state) { return state.window == window; })) return false;
+    if (!IsWindowVisible(window) || IsIconic(window) || IsParkedPrimaryWindow(window)) return false;
     RECT bounds{};
     if (!GetWindowRect(window, &bounds) || bounds.top == top) return false;
     RECT moved = bounds;
@@ -2456,6 +2521,10 @@ static bool ParkPrimaryWindow(HWND window, int top) {
 
 static void RestoreDisplacedPrimaryWindows() {
     if (g_primaryPositionTransitioning) return;
+    if (g_hLassoCoordinator)
+        KillTimer(g_hLassoCoordinator, TIMER_ID_PRIMARY_CLICK_RESTORE);
+    g_primaryClickRestoreWindow = nullptr;
+    g_primaryClickRestoreStartedAt = 0;
     g_primaryPositionTransitioning = true;
     std::erase_if(g_displacedPrimaryWindows, [](const auto& state) {
         return !IsWindow(state.window) || SetPrimaryWindowRect(state.window, state.original);
@@ -2463,8 +2532,36 @@ static void RestoreDisplacedPrimaryWindows() {
     if (g_displacedPrimaryWindows.empty()) {
         g_primaryMoveStartedAt = 0;
         g_primaryTaskbarProcess = 0;
+        g_primaryParkMonitor = nullptr;
+        g_primaryForegroundAtPark = nullptr;
+        g_primaryCreatedWindows.clear();
     }
     g_primaryPositionTransitioning = false;
+}
+
+// Defer the position change until after the mouse-up is delivered to the app.
+// Moving the window inside WH_MOUSE_LL could redirect the original click.
+static void QueuePrimaryClickRestore(HWND coordinator, HWND clicked) {
+    if (!coordinator || !IsWindow(clicked) || g_primaryPositionTransitioning ||
+        !IsParkedPrimaryWindow(clicked)) return;
+    g_primaryClickRestoreWindow = clicked;
+    g_primaryClickRestoreStartedAt = g_primaryMoveStartedAt;
+    if (!SetTimer(coordinator, TIMER_ID_PRIMARY_CLICK_RESTORE,
+                  PRIMARY_CLICK_RESTORE_DELAY_MS, nullptr)) {
+        // A failed timer must not leave the window permanently parked.
+        RestoreDisplacedPrimaryWindows();
+    }
+}
+
+static void OnPrimaryClickRestoreTimer(HWND coordinator) {
+    KillTimer(coordinator, TIMER_ID_PRIMARY_CLICK_RESTORE);
+    const HWND clicked = g_primaryClickRestoreWindow;
+    const ULONGLONG session = g_primaryClickRestoreStartedAt;
+    g_primaryClickRestoreWindow = nullptr;
+    g_primaryClickRestoreStartedAt = 0;
+    if (clicked && IsWindow(clicked) && IsParkedPrimaryWindow(clicked) &&
+        g_primaryMoveStartedAt == session)
+        RestoreDisplacedPrimaryWindows();
 }
 
 static bool IsUntitledWasdkHost(HWND window) {
@@ -2478,30 +2575,69 @@ static bool IsUntitledWasdkHostOrOwnedWindow(HWND window) {
     return IsUntitledWasdkHost(window) || (owner != window && IsUntitledWasdkHost(owner));
 }
 
-static void RestorePrimaryWindowsOnEvent(DWORD event, HWND h, DWORD time,
-                                         DWORD ownProcess = GetCurrentProcessId()) {
-    // Parked windows remain visible (their title bars sit above the taskbar).
-    // CREATE/SHOW events are not evidence of user activation and must not
-    // restore the entire batch; only an actual foreground transition may do so.
-    if (event != EVENT_SYSTEM_FOREGROUND || g_primaryPositionTransitioning ||
-        g_displacedPrimaryWindows.empty() || !IsWindow(h)) return;
-    const HWND foreground = GetForegroundWindow();
-    if (foreground != h || !IsWindowVisible(h) || GetAncestor(h, GA_ROOT) != h ||
-        !IsValidAppWindow(h) || IsSwitcherWindow(h) || IsIconic(h) ||
-        g_sealedWindowStates.contains(h) || IsUntitledWasdkHostOrOwnedWindow(h)) return;
-    DWORD process = 0;
-    GetWindowThreadProcessId(h, &process);
-    if (!process || process == ownProcess ||
-        (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return;
-    // Explorer auxiliary windows should not count as application activation.
-    if (process == g_primaryTaskbarProcess && !WindowClassIs(h, L"CabinetWClass")) return;
+static HMONITOR WindowMonitorForRestore(HWND window) {
+    return MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+}
 
-    // WinEvents are queued asynchronously. Reject stale foreground events
-    // regardless of how long delivery was delayed (DWORD tick wrap is safe
-    // while the parking session is younger than 2^31 milliseconds).
-    if (g_primaryMoveStartedAt &&
-        GetTickCount64() - g_primaryMoveStartedAt < 0x80000000ULL &&
-        static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveStartedAt)) <= 0) return;
+static bool IsPrimaryRestorationEventRecent(DWORD time) {
+    // Out-of-context WinEvents can be delivered long after their source event.
+    return !g_primaryMoveStartedAt ||
+        GetTickCount64() - g_primaryMoveStartedAt >= 0x80000000ULL ||
+        static_cast<LONG>(time - static_cast<DWORD>(g_primaryMoveStartedAt)) > 0;
+}
+
+static bool IsPrimaryRestorationApp(HWND window, DWORD ownProcess) {
+    if (!IsWindow(window) || GetAncestor(window, GA_ROOT) != window ||
+        GetWindow(window, GW_OWNER) != nullptr || !IsValidAppWindow(window) ||
+        IsSwitcherWindow(window) || FindAltTabProxyTarget(window) ||
+        g_sealedWindowStates.contains(window) ||
+        GetPropW(window, L"MTU_EXE_TAG") != nullptr ||
+        IsUntitledWasdkHostOrOwnedWindow(window) ||
+        (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) return false;
+    DWORD process = 0;
+    GetWindowThreadProcessId(window, &process);
+    return process && process != ownProcess &&
+        (process != g_primaryTaskbarProcess || WindowClassIs(window, L"CabinetWClass"));
+}
+
+static void RestorePrimaryWindowsOnEvent(
+    DWORD event, HWND window, DWORD time, DWORD ownProcess = GetCurrentProcessId(),
+    HMONITOR (*monitorForWindow)(HWND) = WindowMonitorForRestore) {
+    if ((event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_CREATE &&
+         event != EVENT_OBJECT_SHOW) ||
+        g_primaryPositionTransitioning || g_displacedPrimaryWindows.empty() ||
+        !IsPrimaryRestorationEventRecent(time) ||
+        !IsPrimaryRestorationApp(window, ownProcess)) return;
+
+    if (event == EVENT_OBJECT_CREATE) {
+        // Do not treat an existing parked window as a newly launched app.
+        if (IsParkedPrimaryWindow(window)) return;
+        // Hidden background helper windows must not be promoted to app launches.
+        const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+        const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if (!(style & WS_CAPTION) && !(exStyle & WS_EX_APPWINDOW)) return;
+        g_primaryCreatedWindows.insert(window);
+    } else if (event == EVENT_OBJECT_SHOW) {
+        // SHOW is only a continuation of a qualifying CREATE in this session.
+        if (!g_primaryCreatedWindows.contains(window)) return;
+    } else {
+        if (GetForegroundWindow() != window ||
+            // Re-announcing the already-active window is not a new activation.
+            window == g_primaryForegroundAtPark) return;
+        // A click on a parked window can activate it on mouse-down. Let the
+        // mouse-up path restore it instead, after the native click is delivered.
+        if (IsParkedPrimaryWindow(window) &&
+            g_primaryMouseActivationTarget.load(std::memory_order_acquire) == window &&
+            GetTickCount64() <=
+                g_primaryMouseActivationUntil.load(std::memory_order_acquire)) return;
+    }
+
+    // CREATE often fires before the window is shown; its matching SHOW event
+    // completes the decision after the window has a real monitor placement.
+    if (!IsWindowVisible(window) || IsIconic(window)) return;
+    const HMONITOR primary = g_primaryParkMonitor ? g_primaryParkMonitor :
+        MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (!primary || monitorForWindow(window) != primary) return;
     RestoreDisplacedPrimaryWindows();
 }
 
@@ -2552,6 +2688,9 @@ static void TogglePrimaryWindows() {
     g_displacedPrimaryWindows.reserve(candidates.size());
     g_primaryPositionTransitioning = true;
     g_primaryMoveStartedAt = GetTickCount64();
+    g_primaryParkMonitor = primary;
+    g_primaryForegroundAtPark = GetForegroundWindow();
+    g_primaryCreatedWindows.clear();
     g_primaryTaskbarProcess = 0;
     GetWindowThreadProcessId(taskbar, &g_primaryTaskbarProcess);
     for (HWND window : candidates) ParkPrimaryWindow(window, top);
@@ -2559,6 +2698,9 @@ static void TogglePrimaryWindows() {
     if (g_displacedPrimaryWindows.empty()) {
         g_primaryMoveStartedAt = 0;
         g_primaryTaskbarProcess = 0;
+        g_primaryParkMonitor = nullptr;
+        g_primaryForegroundAtPark = nullptr;
+        g_primaryCreatedWindows.clear();
     }
 }
 
@@ -2570,6 +2712,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
     if (wParam == WM_LBUTTONUP && g_showDesktopPressedTaskbar) {
         const HWND taskbar = g_showDesktopPressedTaskbar;
         g_showDesktopPressedTaskbar = nullptr;
+        CancelPrimaryMouseClick();
         if (GetAncestor(WindowFromPoint(point), GA_ROOT) == taskbar &&
             PtInRect(&g_showDesktopPressedBounds, point))
             PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
@@ -2581,11 +2724,22 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         const bool click = wParam == WM_LBUTTONDOWN;
         RECT bounds{};
         if (FindShowDesktopClickBounds(taskbar, point, click, bounds) && click) {
+            CancelPrimaryMouseClick();
             g_showDesktopPressedTaskbar = taskbar;
             g_showDesktopPressedBounds = bounds;
             return 1;
         }
     }
+
+    // Do not inspect g_displacedPrimaryWindows from this hook thread. Instead
+    // forward a completed, non-drag click for validation on the coordinator.
+    HWND root = nullptr;
+    if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
+        root = GetAncestor(WindowFromPoint(point), GA_ROOT);
+    if (const HWND clicked = ObservePrimaryMouseClick(wParam, point, root))
+        PostMessageW(g_hLassoCoordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(clicked), 0);
+
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
 
@@ -2746,14 +2900,68 @@ static void RestoreSealedApplicationOnEvent(DWORD event, HWND window, DWORD time
 }
 
 static HWND g_taskViewWindow = nullptr;
+static bool g_taskViewNotificationShown = false;
+static constexpr UINT_PTR TIMER_ID_TASKVIEW_CLOSE = 1002;
+
+static bool IsTaskViewWindow(HWND window) {
+    if (!IsWindowVisible(window) ||
+        !WindowClassIs(window, L"XamlExplorerHostIslandWindow")) return false;
+    wchar_t title[256]{};
+    if (!GetWindowTextW(window, title, static_cast<int>(std::size(title))) ||
+        wcscmp(title, L"任务视图") != 0) return false;
+    RECT bounds{};
+    return GetPhysicalRect(window, &bounds) && bounds.right - bounds.left >= 500;
+}
+
+static bool AnyVisibleTaskViewWindow() {
+    bool found = false;
+    EnumWindows([](HWND window, LPARAM data) -> BOOL {
+        if (!IsTaskViewWindow(window)) return TRUE;
+        *reinterpret_cast<bool*>(data) = true;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+static bool ShouldNotifyTaskView(DWORD event, HWND window, LONG child) {
+    if (child != CHILDID_SELF) return false;
+    if ((event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY) &&
+        window == g_taskViewWindow) {
+        // A Task View window can briefly disappear or be replaced while the
+        // same session is opening. Re-arm only after it is truly closed.
+        // The WinEvent can be delivered before visibility queries settle.
+        // Always schedule a delayed check; the timer only re-arms when no
+        // Task View window remains visible.
+        if (g_hLassoCoordinator)
+            SetTimer(g_hLassoCoordinator, TIMER_ID_TASKVIEW_CLOSE, 300, nullptr);
+        return false;
+    }
+    if ((event != EVENT_OBJECT_SHOW && event != EVENT_SYSTEM_FOREGROUND) ||
+        !IsTaskViewWindow(window)) return false;
+    g_taskViewWindow = window;
+    if (g_hLassoCoordinator)
+        KillTimer(g_hLassoCoordinator, TIMER_ID_TASKVIEW_CLOSE);
+    if (g_taskViewNotificationShown) return false;
+    g_taskViewNotificationShown = true;
+    return true;
+}
+
+static void OnTaskViewCloseTimer(HWND coordinator) {
+    if (coordinator) KillTimer(coordinator, TIMER_ID_TASKVIEW_CLOSE);
+    if (AnyVisibleTaskViewWindow()) return;
+    g_taskViewWindow = nullptr;
+    g_taskViewNotificationShown = false;
+}
 
 static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG idO, LONG idC, DWORD dwT, DWORD dwM) {
 	// 基础过滤：只处理窗口对象
 	if (hwnd == NULL || idO != OBJID_WINDOW) return;
     if (idC == CHILDID_SELF) WatchCascadiaSwitcher(hwnd, event, dwM);
+    if (ShouldNotifyTaskView(event, hwnd, idC))
+        ShowWin11NativeNotification(L"待完成", L"Win+Tab可完成窗口转移");
     if (event == EVENT_OBJECT_NAMECHANGE || event == EVENT_OBJECT_HIDE) return;
     if (event == EVENT_OBJECT_DESTROY && idC == CHILDID_SELF) {
-        if (g_taskViewWindow == hwnd) g_taskViewWindow = nullptr;
+        g_primaryCreatedWindows.erase(hwnd);
         // A HWND can be recycled after destruction; never restore stale state
         // onto a different window that later receives the same handle value.
         DiscardWindowSealedIcon(hwnd);
@@ -2765,6 +2973,9 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
         if (g_displacedPrimaryWindows.empty()) {
             g_primaryMoveStartedAt = 0;
             g_primaryTaskbarProcess = 0;
+            g_primaryParkMonitor = nullptr;
+            g_primaryForegroundAtPark = nullptr;
+            g_primaryCreatedWindows.clear();
         }
         return;
     }
@@ -2856,19 +3067,8 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK h, DWORD event, HWND hwnd, LONG 
 	// --- 3. 全局压制逻辑 ---
 	// 只要窗口显示且不在任务视图中，就检查是否持有标记
 	SuppressHiddenWindows(hwnd, event);
-    // Win+Tab's notification is independent of the Alt+Tab preview session.
-    const bool isTaskViewWindow = className == L"XamlExplorerHostIslandWindow" &&
-        windowTitle == L"任务视图";
-    if (isTaskViewWindow && idC == CHILDID_SELF &&
-        (event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_FOREGROUND)) {
-        RECT rc{};
-        if (g_taskViewWindow != hwnd && GetPhysicalRect(hwnd, &rc) && rc.right - rc.left >= 500) {
-            g_taskViewWindow = hwnd;
-            ShowWin11NativeNotification(L"待完成", L"Win+Tab可完成窗口转移");
-        }
-    } else if (event == EVENT_SYSTEM_FOREGROUND) {
-        g_taskViewWindow = nullptr;
-    }
+    // Task View notifications are latched per visible session above. Unrelated
+    // foreground events must never reset the latch while Win+Tab is open.
 }
 
 // A message-only window on a separate worker thread serializes COM, WinEvent,
@@ -2947,13 +3147,26 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     case WM_LASSO_TOGGLE_PRIMARY:
         TogglePrimaryWindows();
         return 0;
+    case WM_LASSO_PRIMARY_CLICK:
+        QueuePrimaryClickRestore(hwnd, reinterpret_cast<HWND>(wp));
+        return 0;
     case WM_TIMER:
         if (wp == TIMER_ID_COLLECT) {
             OnCollectTimer(hwnd, wp);
             return 0;
         }
+        if (wp == TIMER_ID_TASKVIEW_CLOSE) {
+            OnTaskViewCloseTimer(hwnd);
+            return 0;
+        }
+        if (wp == TIMER_ID_PRIMARY_CLICK_RESTORE) {
+            OnPrimaryClickRestoreTimer(hwnd);
+            return 0;
+        }
         break;
     case WM_CLOSE:
+        KillTimer(hwnd, TIMER_ID_TASKVIEW_CLOSE);
+        KillTimer(hwnd, TIMER_ID_PRIMARY_CLICK_RESTORE);
         ExecuteCollectRestore();
         RestoreDisplacedPrimaryWindows();
         RestoreAllSealedWindows();

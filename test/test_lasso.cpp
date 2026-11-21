@@ -43,6 +43,12 @@ struct Ini {
 
 static std::unordered_map<HWND, GUID> g_testWindowDesktopIds;
 static UINT g_testDesktopReadCount = 0;
+// Simulate a secondary monitor even on single-monitor CI runners.
+static std::unordered_map<HWND, HMONITOR> g_testRestoreMonitors;
+static HMONITOR TestRestoreMonitor(HWND window) {
+    const auto it = g_testRestoreMonitors.find(window);
+    return it == g_testRestoreMonitors.end() ? nullptr : it->second;
+}
 
 static bool ReadTestWindowDesktop(HWND h, GUID& desktop, bool requireCurrent) {
     if (requireCurrent) return false;
@@ -278,16 +284,16 @@ void run(const std::string& name) {
         SetForegroundWindow(active);
         CHECK(GetForegroundWindow() == active.h);
 
-        // CREATE/SHOW is never an activation signal: the parked title bar
-        // remains visible, and unrelated background windows can emit both.
-        for (DWORD event : {EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW}) {
-            for (HWND window : {parked.h, background.h, active.h, hidden.h})
-                RestorePrimaryWindowsOnEvent(event, window, started + 1, 0);
-            WinEventProc(nullptr, event, active, OBJID_WINDOW, CHILDID_SELF, 0, started + 1);
-            CHECK(g_displacedPrimaryWindows.size() == 1);
-            RECT stillParked{};
-            CHECK(GetWindowRect(parked, &stillParked) && stillParked.top == targetTop);
-        }
+        // SHOW of an existing window is not a new-app signal; a hidden CREATE
+        // must wait for its own later SHOW before restoring.
+        for (HWND window : {parked.h, background.h, active.h, hidden.h})
+            RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, window, started + 1, 0);
+        WinEventProc(nullptr, EVENT_OBJECT_SHOW, active, OBJID_WINDOW, CHILDID_SELF, 0, started + 1);
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_CREATE, hidden, started + 1, 0);
+        CHECK(g_primaryCreatedWindows.contains(hidden.h));
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        RECT stillParked{};
+        CHECK(GetWindowRect(parked, &stillParked) && stillParked.top == targetTop);
 
         // A foreground event queued before parking remains stale even if
         // delivery takes longer than the former 1500 ms guard.
@@ -300,6 +306,243 @@ void run(const std::string& name) {
         DispatchPendingWindowMessages();
         RECT restored{};
         CHECK(GetWindowRect(parked, &restored) && EqualRect(&restored, &original));
+        return;
+    }
+    if (name == "primary_position_direct_click") {
+        Window parked, unrelated, coordinator;
+        ShowWindow(parked, SW_SHOWNOACTIVATE);
+        ShowWindow(unrelated, SW_SHOWNOACTIVATE);
+        RECT original{};
+        CHECK(GetWindowRect(parked, &original));
+        constexpr int targetTop = 400;
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        DispatchPendingWindowMessages();
+        g_primaryMoveStartedAt = GetTickCount64() - 1000;
+        g_primaryParkMonitor = MonitorFromWindow(parked, MONITOR_DEFAULTTONEAREST);
+        g_primaryForegroundAtPark = nullptr;
+        const POINT click{70, targetTop + 15};
+
+        // The target can already be foreground before the user clicks. The
+        // click must restore it without a preliminary click on the desktop.
+        SetForegroundWindow(parked);
+        CHECK(GetForegroundWindow() == parked.h);
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, click, parked));
+        CHECK(g_primaryMouseActivationTarget.load() == parked.h);
+        // Even if this click causes a foreground event, the mouse-up route
+        // owns the restoration so the native mouse press is not redirected.
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, parked,
+            static_cast<DWORD>(GetTickCount64() + 1), 0);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        CHECK(ObservePrimaryMouseClick(WM_LBUTTONUP, click, parked) == parked.h);
+        CoordinatorWndProc(coordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(parked.h), 0);
+        CHECK(g_primaryClickRestoreWindow == parked.h);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        RECT stillParked{};
+        CHECK(GetWindowRect(parked, &stillParked) && stillParked.top == targetTop);
+        OnPrimaryClickRestoreTimer(coordinator);
+        DispatchPendingWindowMessages();
+        CHECK(g_displacedPrimaryWindows.empty());
+        CHECK(!g_primaryClickRestoreWindow);
+        RECT restored{};
+        CHECK(GetWindowRect(parked, &restored) && EqualRect(&restored, &original));
+
+        // A new primary foreground window that is NOT parked must still
+        // restore the batch, even when the foreground came from a mouse click.
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        g_primaryMoveStartedAt = GetTickCount64() - 1000;
+        g_primaryParkMonitor = MonitorFromWindow(parked, MONITOR_DEFAULTTONEAREST);
+        g_primaryForegroundAtPark = parked.h;
+        SetForegroundWindow(unrelated);
+        CHECK(GetForegroundWindow() == unrelated.h);
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, click, unrelated));
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, unrelated,
+            static_cast<DWORD>(GetTickCount64() + 1), 0);
+        CHECK(g_displacedPrimaryWindows.empty());
+        CancelPrimaryMouseClick();
+        DispatchPendingWindowMessages();
+        return;
+    }
+    if (name == "primary_position_click_drag") {
+        Window parked, unrelated, coordinator;
+        ShowWindow(parked, SW_SHOWNOACTIVATE);
+        ShowWindow(unrelated, SW_SHOWNOACTIVATE);
+        constexpr int targetTop = 400;
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        DispatchPendingWindowMessages();
+        const POINT down{70, targetTop + 15};
+        const POINT drag{down.x + (std::max)(1, GetSystemMetrics(SM_CXDRAG)) + 8, down.y};
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, parked));
+        CHECK(!ObservePrimaryMouseClick(WM_MOUSEMOVE, drag, nullptr));
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONUP, drag, parked));
+        CHECK(!g_primaryClickRestoreWindow);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // A release over another root must not restore the pressed window.
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, parked));
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONUP, down, unrelated));
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        CHECK(!g_primaryClickRestoreWindow);
+
+        // Clicking a non-parked window is not a direct-click restoration.
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, unrelated));
+        CHECK(ObservePrimaryMouseClick(WM_LBUTTONUP, down, unrelated) == unrelated.h);
+        CoordinatorWndProc(coordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(unrelated.h), 0);
+        CHECK(!g_primaryClickRestoreWindow);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // A pending restore cannot fire for a different parking session.
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, parked));
+        CHECK(ObservePrimaryMouseClick(WM_LBUTTONUP, down, parked) == parked.h);
+        CoordinatorWndProc(coordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(parked.h), 0);
+        CHECK(g_primaryClickRestoreWindow == parked.h);
+        const auto previousSession = g_primaryMoveStartedAt;
+        g_primaryMoveStartedAt = previousSession + 1;
+        OnPrimaryClickRestoreTimer(coordinator);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        CHECK(!g_primaryClickRestoreWindow);
+        RestoreDisplacedPrimaryWindows();
+        DispatchPendingWindowMessages();
+        CancelPrimaryMouseClick();
+        CHECK(g_displacedPrimaryWindows.empty());
+        return;
+    }
+    if (name == "primary_position_multimonitor_create") {
+        Window parked, primary, secondary, existing, createdPrimary, createdSecondary,
+            helper(0, nullptr, L"STATIC", 50, 50, 100, 100, WS_POPUP);
+        for (HWND window : {parked.h, primary.h, secondary.h, existing.h})
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+        const HMONITOR mainMonitor = reinterpret_cast<HMONITOR>(1);
+        const HMONITOR otherMonitor = reinterpret_cast<HMONITOR>(2);
+        g_testRestoreMonitors = {{parked.h, mainMonitor}, {primary.h, mainMonitor},
+            {secondary.h, otherMonitor}, {existing.h, mainMonitor},
+            {createdPrimary.h, mainMonitor}, {createdSecondary.h, otherMonitor},
+            {helper.h, mainMonitor}};
+        constexpr int targetTop = 400;
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        DispatchPendingWindowMessages();
+        g_primaryParkMonitor = mainMonitor;
+        g_primaryForegroundAtPark = parked.h;
+        g_primaryMoveStartedAt = GetTickCount64() - 10;
+        const DWORD now = static_cast<DWORD>(GetTickCount64());
+        constexpr DWORD otherProcess = 0;
+
+        // Foreground activity on the secondary monitor cannot restore primary windows.
+        SetForegroundWindow(secondary);
+        CHECK(GetForegroundWindow() == secondary.h);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, secondary, now,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        // Repeated foreground notifications for the pre-park foreground are not
+        // evidence of a new activation.
+        SetForegroundWindow(parked);
+        CHECK(GetForegroundWindow() == parked.h);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, parked, now,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // A SHOW without CREATE must not restore, even on the primary monitor.
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, existing, now,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // A hidden auxiliary window cannot become a CREATE restoration candidate.
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_CREATE, helper, now,
+            otherProcess, TestRestoreMonitor);
+        CHECK(!g_primaryCreatedWindows.contains(helper.h));
+        ShowWindow(helper, SW_SHOWNOACTIVATE);
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, helper, now + 1,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // A newly created window on the secondary monitor is also irrelevant.
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_CREATE, createdSecondary, now,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_primaryCreatedWindows.contains(createdSecondary.h));
+        ShowWindow(createdSecondary, SW_SHOWNOACTIVATE);
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, createdSecondary, now + 1,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // CREATE normally precedes WS_VISIBLE. Remember it, then restore when
+        // that specific newly created primary-monitor window is shown.
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_CREATE, createdPrimary, now,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_primaryCreatedWindows.contains(createdPrimary.h));
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        ShowWindow(createdPrimary, SW_SHOWNOACTIVATE);
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_SHOW, createdPrimary, now + 1,
+            otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.empty());
+        CHECK(g_primaryCreatedWindows.empty() && !g_primaryParkMonitor &&
+            !g_primaryForegroundAtPark);
+        DispatchPendingWindowMessages();
+
+        // A genuinely new primary foreground app can also restore the batch.
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        g_primaryParkMonitor = mainMonitor;
+        g_primaryForegroundAtPark = parked.h;
+        g_primaryMoveStartedAt = GetTickCount64() - 10;
+        SetForegroundWindow(primary);
+        CHECK(GetForegroundWindow() == primary.h);
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, primary,
+            static_cast<DWORD>(GetTickCount64()), otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.empty());
+        DispatchPendingWindowMessages();
+
+        // CREATE itself restores immediately if the new app is already visible.
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        g_primaryParkMonitor = mainMonitor;
+        g_primaryMoveStartedAt = GetTickCount64() - 10;
+        Window visibleNew;
+        ShowWindow(visibleNew, SW_SHOWNOACTIVATE);
+        g_testRestoreMonitors[visibleNew.h] = mainMonitor;
+        RestorePrimaryWindowsOnEvent(EVENT_OBJECT_CREATE, visibleNew,
+            static_cast<DWORD>(GetTickCount64()), otherProcess, TestRestoreMonitor);
+        CHECK(g_displacedPrimaryWindows.empty());
+        g_testRestoreMonitors.clear();
+        DispatchPendingWindowMessages();
+        return;
+    }
+    if (name == "taskview_notification_session") {
+        RegisterFixtureClass(L"XamlExplorerHostIslandWindow");
+        Window taskView(WS_EX_APPWINDOW, nullptr, L"XamlExplorerHostIslandWindow",
+                50, 50, 900, 650),
+            replacement(WS_EX_APPWINDOW, nullptr, L"XamlExplorerHostIslandWindow",
+                50, 50, 900, 650),
+            unrelated;
+        SetWindowTextW(taskView, L"任务视图");
+        SetWindowTextW(replacement, L"任务视图");
+        ShowWindow(taskView, SW_SHOWNOACTIVATE);
+        ShowWindow(unrelated, SW_SHOWNOACTIVATE);
+        CHECK(!ShouldNotifyTaskView(EVENT_OBJECT_SHOW, taskView, 1));
+        CHECK(ShouldNotifyTaskView(EVENT_OBJECT_SHOW, taskView, CHILDID_SELF));
+        CHECK(g_taskViewNotificationShown && g_taskViewWindow == taskView.h);
+        CHECK(!ShouldNotifyTaskView(EVENT_SYSTEM_FOREGROUND, unrelated, CHILDID_SELF));
+        CHECK(!ShouldNotifyTaskView(EVENT_SYSTEM_FOREGROUND, taskView, CHILDID_SELF));
+        CHECK(!ShouldNotifyTaskView(EVENT_OBJECT_SHOW, taskView, CHILDID_SELF));
+
+        // Explorer may replace its Task View HWND without closing the session.
+        ShowWindow(replacement, SW_SHOWNOACTIVATE);
+        CHECK(!ShouldNotifyTaskView(EVENT_OBJECT_SHOW, replacement, CHILDID_SELF));
+        CHECK(g_taskViewWindow == replacement.h);
+        ShowWindow(taskView, SW_HIDE);
+        CHECK(!ShouldNotifyTaskView(EVENT_OBJECT_HIDE, taskView, CHILDID_SELF));
+        OnTaskViewCloseTimer(nullptr);
+        CHECK(g_taskViewNotificationShown);
+        ShowWindow(replacement, SW_HIDE);
+        CHECK(!ShouldNotifyTaskView(EVENT_OBJECT_HIDE, replacement, CHILDID_SELF));
+        OnTaskViewCloseTimer(nullptr);
+        CHECK(!g_taskViewNotificationShown && !g_taskViewWindow);
+        ShowWindow(replacement, SW_SHOWNOACTIVATE);
+        CHECK(ShouldNotifyTaskView(EVENT_OBJECT_SHOW, replacement, CHILDID_SELF));
+        CHECK(!ShouldNotifyTaskView(EVENT_OBJECT_SHOW, replacement, CHILDID_SELF));
+        ShowWindow(replacement, SW_HIDE);
+        CHECK(!ShouldNotifyTaskView(EVENT_OBJECT_DESTROY, replacement, CHILDID_SELF));
+        OnTaskViewCloseTimer(nullptr);
+        CHECK(!g_taskViewNotificationShown);
         return;
     }
     if (name == "cascadia_switcher_close") {
