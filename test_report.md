@@ -1,12 +1,12 @@
 # C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-20 02:13:56
-- 测试源码基准提交：90ef304de34fbd08698e315bcc92e71cf0e6a850
-- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/44659198228
+- 时间（UTC）：2026-11-21 05:37:50
+- 测试源码基准提交：86d7972ac6555f65e8ecfb525d561740cad9db49
+- 执行记录：https://github.com/rarnhe/LassoWindows/actions/runs/44871698529
 - 平台：Windows / MSVC / C++20 / Win32 + Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
-- 统计：通过 48 / 失败 0 / 跳过 0 / 共 48
+- 统计：通过 52 / 失败 0 / 跳过 0 / 共 52
 
 ## GitHub Actions 阶段状态
 
@@ -54,6 +54,10 @@
 | primary_position_roundtrip | 通过 |
 | primary_position_events | 通过 |
 | primary_position_background_events | 通过 |
+| primary_position_direct_click | 通过 |
+| primary_position_click_drag | 通过 |
+| primary_position_multimonitor_create | 通过 |
+| taskview_notification_session | 通过 |
 | cascadia_switcher_close | 通过 |
 | app_open_unseals_group | 通过 |
 | show_desktop_button_hit_test | 通过 |
