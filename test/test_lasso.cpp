@@ -371,7 +371,7 @@ void run(const std::string& name) {
         CHECK(ParkPrimaryWindow(parked, targetTop));
         DispatchPendingWindowMessages();
         const POINT down{70, targetTop + 15};
-        const POINT drag{down.x + std::max(1, GetSystemMetrics(SM_CXDRAG)) + 8, down.y};
+        const POINT drag{down.x + (std::max)(1, GetSystemMetrics(SM_CXDRAG)) + 8, down.y};
         CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, parked));
         CHECK(!ObservePrimaryMouseClick(WM_MOUSEMOVE, drag, nullptr));
         CHECK(!ObservePrimaryMouseClick(WM_LBUTTONUP, drag, parked));
