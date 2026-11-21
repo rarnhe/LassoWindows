@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <memory>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 
 // WinRT 通知相关
@@ -2176,6 +2177,7 @@ static bool BeginAltTabPreview(HWND coordinator, HWND foreground,
 #define WM_LASSO_ALT_UP       (WM_APP + 14)
 #define WM_LASSO_ESCAPE       (WM_APP + 16)
 #define WM_LASSO_TOGGLE_PRIMARY (WM_APP + 17)
+#define WM_LASSO_PRIMARY_CLICK (WM_APP + 18)
 
 static LRESULT CALLBACK LowLevelKeyProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
@@ -2433,6 +2435,64 @@ static std::unordered_set<HWND> g_primaryCreatedWindows;
 // Prevent reentrant foreground callbacks from restoring a half-parked batch.
 static bool g_primaryPositionTransitioning = false;
 
+// WH_MOUSE_LL runs on the hook thread, while the coordinator owns the parked
+// window vector. The hook only publishes an HWND; it never reads that vector.
+struct PrimaryMouseClickState {
+    HWND pressed = nullptr;
+    POINT start{};
+    bool dragged = false;
+};
+static PrimaryMouseClickState g_primaryMouseClick;
+static std::atomic<HWND> g_primaryMouseActivationTarget{nullptr};
+static std::atomic<ULONGLONG> g_primaryMouseActivationUntil{0};
+static constexpr UINT_PTR TIMER_ID_PRIMARY_CLICK_RESTORE = 1003;
+static constexpr UINT PRIMARY_CLICK_RESTORE_DELAY_MS = 60;
+static HWND g_primaryClickRestoreWindow = nullptr;
+static ULONGLONG g_primaryClickRestoreStartedAt = 0;
+
+static bool IsParkedPrimaryWindow(HWND window) {
+    return std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
+        [window](const auto& state) { return state.window == window; });
+}
+
+static bool PrimaryMouseMovedPastDragThreshold(POINT start, POINT current) {
+    const auto dx = std::llabs(static_cast<long long>(current.x) - start.x);
+    const auto dy = std::llabs(static_cast<long long>(current.y) - start.y);
+    return dx >= std::max(1, GetSystemMetrics(SM_CXDRAG)) ||
+        dy >= std::max(1, GetSystemMetrics(SM_CYDRAG));
+}
+
+static void CancelPrimaryMouseClick() {
+    g_primaryMouseClick = {};
+    g_primaryMouseActivationTarget.store(nullptr, std::memory_order_release);
+    g_primaryMouseActivationUntil.store(0, std::memory_order_release);
+}
+
+// Called exclusively from the low-level mouse hook. The returned HWND is a
+// click candidate, not permission to restore: the coordinator validates it.
+static HWND ObservePrimaryMouseClick(WPARAM message, POINT point, HWND root) {
+    if (message == WM_LBUTTONDOWN) {
+        g_primaryMouseClick = {root, point, false};
+        // Guard against the foreground event produced by this very mouse down.
+        // Keep the guard until shortly after release for delayed WinEvent delivery.
+        g_primaryMouseActivationUntil.store(GetTickCount64() + 30000, std::memory_order_release);
+        g_primaryMouseActivationTarget.store(root, std::memory_order_release);
+        return nullptr;
+    }
+    if (message == WM_MOUSEMOVE && g_primaryMouseClick.pressed) {
+        if (PrimaryMouseMovedPastDragThreshold(g_primaryMouseClick.start, point))
+            g_primaryMouseClick.dragged = true;
+        return nullptr;
+    }
+    if (message != WM_LBUTTONUP) return nullptr;
+    const HWND clicked = g_primaryMouseClick.pressed && !g_primaryMouseClick.dragged &&
+        !PrimaryMouseMovedPastDragThreshold(g_primaryMouseClick.start, point) &&
+        g_primaryMouseClick.pressed == root ? root : nullptr;
+    g_primaryMouseClick = {};
+    g_primaryMouseActivationUntil.store(GetTickCount64() + 250, std::memory_order_release);
+    return clicked;
+}
+
 static int GetTaskbarHeight(HWND taskbar) {
     RECT bounds{};
     return taskbar && GetWindowRect(taskbar, &bounds) ? bounds.bottom - bounds.top : 0;
@@ -2449,9 +2509,7 @@ static bool SetPrimaryWindowRect(HWND window, const RECT& bounds, UINT flags = 0
 }
 
 static bool ParkPrimaryWindow(HWND window, int top) {
-    if (!IsWindowVisible(window) || IsIconic(window) ||
-        std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
-            [window](const auto& state) { return state.window == window; })) return false;
+    if (!IsWindowVisible(window) || IsIconic(window) || IsParkedPrimaryWindow(window)) return false;
     RECT bounds{};
     if (!GetWindowRect(window, &bounds) || bounds.top == top) return false;
     RECT moved = bounds;
@@ -2463,6 +2521,10 @@ static bool ParkPrimaryWindow(HWND window, int top) {
 
 static void RestoreDisplacedPrimaryWindows() {
     if (g_primaryPositionTransitioning) return;
+    if (g_hLassoCoordinator)
+        KillTimer(g_hLassoCoordinator, TIMER_ID_PRIMARY_CLICK_RESTORE);
+    g_primaryClickRestoreWindow = nullptr;
+    g_primaryClickRestoreStartedAt = 0;
     g_primaryPositionTransitioning = true;
     std::erase_if(g_displacedPrimaryWindows, [](const auto& state) {
         return !IsWindow(state.window) || SetPrimaryWindowRect(state.window, state.original);
@@ -2475,6 +2537,31 @@ static void RestoreDisplacedPrimaryWindows() {
         g_primaryCreatedWindows.clear();
     }
     g_primaryPositionTransitioning = false;
+}
+
+// Defer the position change until after the mouse-up is delivered to the app.
+// Moving the window inside WH_MOUSE_LL could redirect the original click.
+static void QueuePrimaryClickRestore(HWND coordinator, HWND clicked) {
+    if (!coordinator || !IsWindow(clicked) || g_primaryPositionTransitioning ||
+        !IsParkedPrimaryWindow(clicked)) return;
+    g_primaryClickRestoreWindow = clicked;
+    g_primaryClickRestoreStartedAt = g_primaryMoveStartedAt;
+    if (!SetTimer(coordinator, TIMER_ID_PRIMARY_CLICK_RESTORE,
+                  PRIMARY_CLICK_RESTORE_DELAY_MS, nullptr)) {
+        // A failed timer must not leave the window permanently parked.
+        RestoreDisplacedPrimaryWindows();
+    }
+}
+
+static void OnPrimaryClickRestoreTimer(HWND coordinator) {
+    KillTimer(coordinator, TIMER_ID_PRIMARY_CLICK_RESTORE);
+    const HWND clicked = g_primaryClickRestoreWindow;
+    const ULONGLONG session = g_primaryClickRestoreStartedAt;
+    g_primaryClickRestoreWindow = nullptr;
+    g_primaryClickRestoreStartedAt = 0;
+    if (clicked && IsWindow(clicked) && IsParkedPrimaryWindow(clicked) &&
+        g_primaryMoveStartedAt == session)
+        RestoreDisplacedPrimaryWindows();
 }
 
 static bool IsUntitledWasdkHost(HWND window) {
@@ -2524,8 +2611,7 @@ static void RestorePrimaryWindowsOnEvent(
 
     if (event == EVENT_OBJECT_CREATE) {
         // Do not treat an existing parked window as a newly launched app.
-        if (std::any_of(g_displacedPrimaryWindows.begin(), g_displacedPrimaryWindows.end(),
-            [window](const auto& state) { return state.window == window; })) return;
+        if (IsParkedPrimaryWindow(window)) return;
         // Hidden background helper windows must not be promoted to app launches.
         const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
         const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
@@ -2538,6 +2624,12 @@ static void RestorePrimaryWindowsOnEvent(
         if (GetForegroundWindow() != window ||
             // Re-announcing the already-active window is not a new activation.
             window == g_primaryForegroundAtPark) return;
+        // A click on a parked window can activate it on mouse-down. Let the
+        // mouse-up path restore it instead, after the native click is delivered.
+        if (IsParkedPrimaryWindow(window) &&
+            g_primaryMouseActivationTarget.load(std::memory_order_acquire) == window &&
+            GetTickCount64() <=
+                g_primaryMouseActivationUntil.load(std::memory_order_acquire)) return;
     }
 
     // CREATE often fires before the window is shown; its matching SHOW event
@@ -2620,6 +2712,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
     if (wParam == WM_LBUTTONUP && g_showDesktopPressedTaskbar) {
         const HWND taskbar = g_showDesktopPressedTaskbar;
         g_showDesktopPressedTaskbar = nullptr;
+        CancelPrimaryMouseClick();
         if (GetAncestor(WindowFromPoint(point), GA_ROOT) == taskbar &&
             PtInRect(&g_showDesktopPressedBounds, point))
             PostMessageW(g_hLassoCoordinator, WM_LASSO_TOGGLE_PRIMARY, 0, 0);
@@ -2631,11 +2724,22 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         const bool click = wParam == WM_LBUTTONDOWN;
         RECT bounds{};
         if (FindShowDesktopClickBounds(taskbar, point, click, bounds) && click) {
+            CancelPrimaryMouseClick();
             g_showDesktopPressedTaskbar = taskbar;
             g_showDesktopPressedBounds = bounds;
             return 1;
         }
     }
+
+    // Do not inspect g_displacedPrimaryWindows from this hook thread. Instead
+    // forward a completed, non-drag click for validation on the coordinator.
+    HWND root = nullptr;
+    if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
+        root = GetAncestor(WindowFromPoint(point), GA_ROOT);
+    if (const HWND clicked = ObservePrimaryMouseClick(wParam, point, root))
+        PostMessageW(g_hLassoCoordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(clicked), 0);
+
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
 
@@ -3043,6 +3147,9 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     case WM_LASSO_TOGGLE_PRIMARY:
         TogglePrimaryWindows();
         return 0;
+    case WM_LASSO_PRIMARY_CLICK:
+        QueuePrimaryClickRestore(hwnd, reinterpret_cast<HWND>(wp));
+        return 0;
     case WM_TIMER:
         if (wp == TIMER_ID_COLLECT) {
             OnCollectTimer(hwnd, wp);
@@ -3052,9 +3159,14 @@ static LRESULT CALLBACK CoordinatorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
             OnTaskViewCloseTimer(hwnd);
             return 0;
         }
+        if (wp == TIMER_ID_PRIMARY_CLICK_RESTORE) {
+            OnPrimaryClickRestoreTimer(hwnd);
+            return 0;
+        }
         break;
     case WM_CLOSE:
         KillTimer(hwnd, TIMER_ID_TASKVIEW_CLOSE);
+        KillTimer(hwnd, TIMER_ID_PRIMARY_CLICK_RESTORE);
         ExecuteCollectRestore();
         RestoreDisplacedPrimaryWindows();
         RestoreAllSealedWindows();
