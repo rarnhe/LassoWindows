@@ -2458,8 +2458,8 @@ static bool IsParkedPrimaryWindow(HWND window) {
 static bool PrimaryMouseMovedPastDragThreshold(POINT start, POINT current) {
     const auto dx = std::llabs(static_cast<long long>(current.x) - start.x);
     const auto dy = std::llabs(static_cast<long long>(current.y) - start.y);
-    return dx >= std::max(1, GetSystemMetrics(SM_CXDRAG)) ||
-        dy >= std::max(1, GetSystemMetrics(SM_CYDRAG));
+    return dx >= (std::max)(1, GetSystemMetrics(SM_CXDRAG)) ||
+        dy >= (std::max)(1, GetSystemMetrics(SM_CYDRAG));
 }
 
 static void CancelPrimaryMouseClick() {
