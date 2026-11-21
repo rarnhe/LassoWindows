@@ -308,6 +308,107 @@ void run(const std::string& name) {
         CHECK(GetWindowRect(parked, &restored) && EqualRect(&restored, &original));
         return;
     }
+    if (name == "primary_position_direct_click") {
+        Window parked, unrelated, coordinator;
+        ShowWindow(parked, SW_SHOWNOACTIVATE);
+        ShowWindow(unrelated, SW_SHOWNOACTIVATE);
+        RECT original{};
+        CHECK(GetWindowRect(parked, &original));
+        constexpr int targetTop = 400;
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        DispatchPendingWindowMessages();
+        g_primaryMoveStartedAt = GetTickCount64() - 1000;
+        g_primaryParkMonitor = MonitorFromWindow(parked, MONITOR_DEFAULTTONEAREST);
+        g_primaryForegroundAtPark = nullptr;
+        const POINT click{70, targetTop + 15};
+
+        // The target can already be foreground before the user clicks. The
+        // click must restore it without a preliminary click on the desktop.
+        SetForegroundWindow(parked);
+        CHECK(GetForegroundWindow() == parked.h);
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, click, parked));
+        CHECK(g_primaryMouseActivationTarget.load() == parked.h);
+        // Even if this click causes a foreground event, the mouse-up route
+        // owns the restoration so the native mouse press is not redirected.
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, parked,
+            static_cast<DWORD>(GetTickCount64() + 1), 0);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        CHECK(ObservePrimaryMouseClick(WM_LBUTTONUP, click, parked) == parked.h);
+        CoordinatorWndProc(coordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(parked.h), 0);
+        CHECK(g_primaryClickRestoreWindow == parked.h);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        RECT stillParked{};
+        CHECK(GetWindowRect(parked, &stillParked) && stillParked.top == targetTop);
+        OnPrimaryClickRestoreTimer(coordinator);
+        DispatchPendingWindowMessages();
+        CHECK(g_displacedPrimaryWindows.empty());
+        CHECK(!g_primaryClickRestoreWindow);
+        RECT restored{};
+        CHECK(GetWindowRect(parked, &restored) && EqualRect(&restored, &original));
+
+        // A new primary foreground window that is NOT parked must still
+        // restore the batch, even when the foreground came from a mouse click.
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        g_primaryMoveStartedAt = GetTickCount64() - 1000;
+        g_primaryParkMonitor = MonitorFromWindow(parked, MONITOR_DEFAULTTONEAREST);
+        g_primaryForegroundAtPark = parked.h;
+        SetForegroundWindow(unrelated);
+        CHECK(GetForegroundWindow() == unrelated.h);
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, click, unrelated));
+        RestorePrimaryWindowsOnEvent(EVENT_SYSTEM_FOREGROUND, unrelated,
+            static_cast<DWORD>(GetTickCount64() + 1), 0);
+        CHECK(g_displacedPrimaryWindows.empty());
+        CancelPrimaryMouseClick();
+        DispatchPendingWindowMessages();
+        return;
+    }
+    if (name == "primary_position_click_drag") {
+        Window parked, unrelated, coordinator;
+        ShowWindow(parked, SW_SHOWNOACTIVATE);
+        ShowWindow(unrelated, SW_SHOWNOACTIVATE);
+        constexpr int targetTop = 400;
+        CHECK(ParkPrimaryWindow(parked, targetTop));
+        DispatchPendingWindowMessages();
+        const POINT down{70, targetTop + 15};
+        const POINT drag{down.x + std::max(1, GetSystemMetrics(SM_CXDRAG)) + 8, down.y};
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, parked));
+        CHECK(!ObservePrimaryMouseClick(WM_MOUSEMOVE, drag, nullptr));
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONUP, drag, parked));
+        CHECK(!g_primaryClickRestoreWindow);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // A release over another root must not restore the pressed window.
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, parked));
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONUP, down, unrelated));
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        CHECK(!g_primaryClickRestoreWindow);
+
+        // Clicking a non-parked window is not a direct-click restoration.
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, unrelated));
+        CHECK(ObservePrimaryMouseClick(WM_LBUTTONUP, down, unrelated) == unrelated.h);
+        CoordinatorWndProc(coordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(unrelated.h), 0);
+        CHECK(!g_primaryClickRestoreWindow);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+
+        // A pending restore cannot fire for a different parking session.
+        CHECK(!ObservePrimaryMouseClick(WM_LBUTTONDOWN, down, parked));
+        CHECK(ObservePrimaryMouseClick(WM_LBUTTONUP, down, parked) == parked.h);
+        CoordinatorWndProc(coordinator, WM_LASSO_PRIMARY_CLICK,
+            reinterpret_cast<WPARAM>(parked.h), 0);
+        CHECK(g_primaryClickRestoreWindow == parked.h);
+        const auto previousSession = g_primaryMoveStartedAt;
+        g_primaryMoveStartedAt = previousSession + 1;
+        OnPrimaryClickRestoreTimer(coordinator);
+        CHECK(g_displacedPrimaryWindows.size() == 1);
+        CHECK(!g_primaryClickRestoreWindow);
+        RestoreDisplacedPrimaryWindows();
+        DispatchPendingWindowMessages();
+        CancelPrimaryMouseClick();
+        CHECK(g_displacedPrimaryWindows.empty());
+        return;
+    }
     if (name == "primary_position_multimonitor_create") {
         Window parked, primary, secondary, existing, createdPrimary, createdSecondary,
             helper(0, nullptr, L"STATIC", 50, 50, 100, 100, WS_POPUP);
